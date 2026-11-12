@@ -1,7 +1,7 @@
 # P2-C 任务契约：Elo 引擎切片 A（账本基座 + 水位线 + 保底分）
 
 ## 上下文
-项目：数理自适应刷题 Harness。你负责 Phase 2 前置的双轨 Elo 切片 A（dev_plan §6.2 批准的跨阶段调整）：事件账本基座、模块分折叠读取、水位线门控、直接掌握结算、草稿子步保底。Escrow 冻结/兑现/衰减/Replay 属 Phase 3 切片 B，**不要实现**。
+项目：数理自适应刷题 Harness。你负责 Phase 2 前置的双轨 Elo 切片 A（dev_plan §6.2 批准的跨阶段调整）：事件账本基座、模块分折叠读取、水位线门控、直接掌握结算、草稿子步保底、**拆拐杖覆盖分结算与 Escrow 冻结**（P2-E 脚手架 STAGE_4→PENDING_RETEST 直接依赖，PM 批准一并前置）。盲测兑现/ forfeit / 超时衰减 / Replay 属 Phase 3 切片 B，**不要实现**。
 必读规格：`docs/designs/adaptive_practice_harness.md` 的 **§3.5（模块 5 全文，重点法则 1/2 与不变量）**、Target File **#11**、**#15** 的 Elo 测试条目、Alternative 3A（为什么不做原地标量）。设计文档是唯一权威规格。
 
 ## 你拥有的文件
@@ -53,6 +53,17 @@ def apply_draft_subgoal_floor(conn, question_uid: str, session_id: str, d_sub: i
 # 首次发放时创建 question_escrow_pool 行：initial_combat_elo_snapshot = 发放前 combat、
 #   floor_elo_applied = delta、escrow_status='FLOOR_ONLY'；重复调用（同幂等键）不重复发放；
 # 写 PARTIAL_DRAFT_SUBGOAL_FLOOR 事件
+
+def freeze_decrutch_escrow(conn, question_uid: str, session_id: str) -> LedgerEventResult: ...
+# 当场拆拐杖通过升入 PENDING_RETEST 时调用（设计 §3.5 法则 3）：
+# 1) 仅当 escrow 池 is_cov_settled==0 时结算一次覆盖分：
+#    cov_delta = K_COV * (1 - E(R_cov, D_orig))；cov += cov_delta；置 is_cov_settled=1；
+#    写 SCAFFOLD_COVER_GAIN 事件（combat 不变）
+# 2) 基于池内 initial_combat_elo_snapshot 计算 target = K_COMBAT * (1 - E(snapshot, D_orig))；
+#    escrow_combat_delta = max(0, target - floor_elo_applied)，100% 冻结（零当场预支）；
+#    escrow_status='FROZEN_PENDING_BLIND'
+# 3) 幂等：同键二次调用 applied=False，不重复结算覆盖分、不重复冻结
+# 4) 若池不存在（无保底发放的题）：先创建池，snapshot=当前 combat、floor=0、FLOOR_ONLY 再走上述流程
 ```
 
 ## 实现规格
@@ -70,6 +81,7 @@ def apply_draft_subgoal_floor(conn, question_uid: str, session_id: str, d_sub: i
 - record_mastered_init：高难题正增量、低难度题 gamma 衰减、远低于水位 gamma=0 不写事件；cov 同步上推
 - apply_draft_subgoal_floor：R_combat < d_sub 才发放；escrow 池快照正确（发放前 combat）；floor_elo_applied 记录
 - **幂等**：同 (question_uid, session_id, trigger) 二次调用 applied=False 且分数不变
+- **freeze_decrutch_escrow**：覆盖分只结算一次（is_cov_settled 熔断）；escrow_delta = max(0, target - floor)；有保底发放时 floor+escrow ≡ target（守恒）；无保底题 snapshot=当前 combat；冻结后 combat 不变且仍 ≤ cov；二次调用幂等
 - **不倒挂**：任意事件序列后 combat <= coverage（构造保底分把 combat 推过 cov 的场景验证 max 同步）
 - 解释条非空且含关键数值
 

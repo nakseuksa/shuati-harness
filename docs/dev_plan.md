@@ -181,3 +181,21 @@ flowchart LR
 ## 7. 启动建议
 
 评审通过后从 **Phase 1 任务 1.1** 开始：先落 `pyproject.toml` + 包骨架 + Schema + 难度引擎 + 测试向量，当天即可拿到 M1 绿灯。
+
+---
+
+## 8. 编排执行日志（PM 变更记录）
+
+| 日期 | 变更 | 原因 |
+| :--- | :--- | :--- |
+| 2026-11-13 | Phase 1 完成（M1，commit a733a58）：121 测试全绿 | p1-schema/p1-cas/p1-rubric 三 worker 并行，DDL token 级保真审计 + 12096 组 clamp 全遍历 |
+| 2026-11-13 | `freeze_decrutch_escrow` 从切片 B 前置到切片 A | P2-E 脚手架 STAGE_4→PENDING_RETEST 直接依赖，消除跨阶段接口桩 |
+| 2026-11-13 | 新增 `ingest_service.py`（P2-D） | 设计将落库隐含在 API_Ingest，独立成服务保持 Phase 4 路由轻薄 |
+| 2026-11-13 | P3-A（知识网）/P3-B（Elo 切片 B）提前与 Phase 2 尾部并行 | 依赖仅 Phase 1 基座 + 网关，文件所有权零交集，压缩关键路径 |
+| 2026-11-13 | 新增 `blind_drill_attempts` 表（P3-C，PM 批准 schema 追加） | 支撑变式曝光追踪与失败重训分流的作答日志，设计未显式定义 |
+| 2026-11-13 | 契约笔误修正：γ 在 D=R-500 处为 exp(-2) 而非 0 | p2-elo-a 按设计公式正确裁决，中段含左端点 |
+| 2026-11-13 | 多方程「消去中间变量比对解集」完全体延后 | P2-A 已实现切分+逐方程等价，完全体超出 Phase 2 范围，列入后续优化 |
+| 2026-11-13 | PM 集成修复：VLM 注册表测试改为子集断言 | P3-A 按契约追加 node_judge 与硬编码精确集合冲突；保留测试意图同时允许批准扩展 |
+| 2026-11-13 | Phase 3 切片 B 验收：155 门禁测试，四阶段守恒律 1e-9 精度证明 | p3-elo-b；forfeit 无账本事件（枚举无 trigger）、衰减四条件合取、replay 断链校验 |
+| 2026-11-13 | P3-D 集成完成：ingest 节点匹配升级 CanonicalNodeResolver（17 测试） | 复用裁决改由 AI 裁判，Mock 默认保守新建；满 15 自动 compaction 在录入事务内验证 |
+| 2026-11-13 | PM 决策：blind_drill_attempts 进 TABLE_DDLS（方案 B），授权 p3-drill 更新 test_schema.py 表数断言 9→10 | schema 单一来源优先；拒绝影子表方案 A，避免 init_db 与调度器 schema 分裂 |
