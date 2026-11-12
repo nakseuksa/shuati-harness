@@ -11,7 +11,10 @@
   超时 os.killpg 强杀整个进程组后返回 TIMEOUT；
 - ``verify_equation_equivalence``：parse_expr（隐式乘法 + convert_xor）+
   nsimplify(rational=True)，移项 / 相反数 / 非零常数比率三判据；同样在隔离
-  子进程内执行并带超时保护（parse_expr 内部会 eval，绝不在宿主进程执行）。
+  子进程内执行并带超时保护（parse_expr 内部会 eval，绝不在宿主进程执行）；
+- ``latex_to_plain`` / ``normalize_answer`` / ``answers_equivalent``：LaTeX 答案
+  规范化与等价判定共享栈（纯文本处理 + 等价判定，无服务依赖），供脚手架引擎
+  与每日盲测双重核验共用（P4-F：CUJ 3 原题回退分支支持真实 LaTeX 标准答案）。
 
 实现说明（与设计意图的对齐）：
 - 子进程入口采用 Popen + communicate(timeout=...)，即 subprocess.run(capture_output=True,
@@ -419,6 +422,11 @@ def _single_equivalent(e1, e2):
     try:
         if _simplify(e1 - e2) == 0:
             return True
+        # PM 批准修复（用户裁决 2026-11-13）：反号/常数比率属方程缩放语义（e 与 -e、c·e 同解集），
+        # 仅对含自由符号的表达式生效；纯数字答案要求严格数值相等（5≠7、5≠-5），
+        # 否则任意两个非零常数互判等价会放行错误数值答案。
+        if not (e1.free_symbols or e2.free_symbols):
+            return False
         if _simplify(e1 + e2) == 0:
             return True
         if e2 == 0:
@@ -475,8 +483,9 @@ def verify_equation_equivalence(user_expr_str: str, standard_expr_str: str) -> b
     """半程立式拆拐杖的代数等价判据（设计 §3.3 第 1 条）。
 
     含 ``=`` 移项为 lhs - rhs；多方程按 ``;`` 或换行切分后逐一匹配（顺序无关）。
-    单方程判据（任一成立即等价）：simplify(e1-e2)==0、simplify(e1+e2)==0（相反数）、
-    simplify(e1/e2).is_constant() 且非零（常数比率）。
+    单方程判据：simplify(e1-e2)==0 恒适用；反号 simplify(e1+e2)==0 与非零常数比率
+    simplify(e1/e2).is_constant() 属方程缩放语义（e 与 -e、c·e 同解集），仅对含自由符号的
+    表达式生效；纯数字答案要求严格数值相等（PM 批准修复：5≠7、5≠-5，防错误数值答案被放行）。
     解析失败 / 超时 / 任何异常一律返回 False，绝不向调用方抛异常。
     """
     try:
@@ -504,3 +513,76 @@ def verify_equation_equivalence(user_expr_str: str, standard_expr_str: str) -> b
         return bool(json.loads(line)["equivalent"])
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# 4. LaTeX 答案规范化与等价判定共享栈（scaffold_engine / blind_drill_scheduler 共用）
+# ---------------------------------------------------------------------------
+
+_IMPLICATION_SEPS = ("\\Rightarrow", "\\Longrightarrow", "\\implies", "⇒", "→")
+_TEXT_CMD_RE = re.compile(r"\\(?:text|mathrm|mbox|operatorname)\s*\{[^{}]*\}")
+_FRAC_RE = re.compile(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
+_SQRT_RE = re.compile(r"\\sqrt\s*\{([^{}]*)\}")
+_LEFT_RIGHT_RE = re.compile(r"\\(?:left|right)\b")
+_SUB_BRACE_RE = re.compile(r"_\{([^{}]*)\}")
+_SUP_BRACE_RE = re.compile(r"\^\{([^{}]*)\}")
+_SUB_CHAR_RE = re.compile(r"_([A-Za-z0-9])")
+_SPACING_RE = re.compile(r"\\[,;! ]")
+_COMMAND_RE = re.compile(r"\\([A-Za-z]+)")
+
+
+def latex_to_plain(text: str) -> str:
+    """将步骤/答案 LaTeX 规范化为 verify_equation_equivalence 可解析的纯文本。
+
+    去除单位（\\text{...}）、间距与 \\left/\\right；\\frac/\\sqrt 转函数式；
+    下标扁平化（v_{max} → vmax，封死下划线内省面）；上标保留 ^（convert_xor）。
+    """
+    s = _TEXT_CMD_RE.sub("", text)
+    for _ in range(8):  # 交替展开嵌套 \frac / \sqrt，直至不动点
+        expanded = _SQRT_RE.sub(r"sqrt(\1)", s)
+        expanded = _FRAC_RE.sub(r"((\1)/(\2))", expanded)
+        if expanded == s:
+            break
+        s = expanded
+    s = _LEFT_RIGHT_RE.sub("", s)
+    s = _SUB_BRACE_RE.sub(r"\1", s)
+    s = _SUP_BRACE_RE.sub(r"^(\1)", s)
+    s = _SUB_CHAR_RE.sub(r"\1", s)
+    s = s.replace(r"\cdot", "*").replace(r"\times", "*")
+    s = _SPACING_RE.sub("", s)
+    s = s.replace("~", " ")
+    s = _COMMAND_RE.sub(r"\1", s)  # 其余字母命令（\theta → theta 等）
+    s = s.replace("{", "(").replace("}", ")").replace("\\", "").replace("_", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"\s*=\s*", " = ", s).strip()
+
+
+def normalize_answer(text: str) -> str:
+    """规范化单条作答/标准式：蕴含链取结论段；链式等式 a=b=c 取首尾 a=c。"""
+    s = (text or "").strip()
+    for sep in _IMPLICATION_SEPS:
+        if sep in s:
+            s = s.split(sep)[-1].strip()
+    s = latex_to_plain(s)
+    if s.count("=") > 1 and ";" not in s and "\n" not in s:
+        parts = [p.strip() for p in s.split("=")]
+        s = f"{parts[0]} = {parts[-1]}"
+    return s.strip()
+
+
+def answers_equivalent(user_answer: str, standard: str) -> bool:
+    """代数等价判定：规范化字符串比对 → SymPy 沙盒等价 → 裸值对单方程右端。"""
+    user = normalize_answer(user_answer)
+    std = normalize_answer(standard)
+    if not user or not std:
+        return False
+    if user == std:
+        return True
+    if verify_equation_equivalence(user, std):
+        return True
+    # 标准答案为单方程 var=value 时，允许用户仅提交裸值（如 "20" 对 "vmax = 20"）
+    if "=" not in user and std.count("=") == 1:
+        rhs = std.split("=", 1)[1].strip()
+        if rhs and (user == rhs or verify_equation_equivalence(user, rhs)):
+            return True
+    return False

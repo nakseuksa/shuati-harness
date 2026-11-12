@@ -199,3 +199,10 @@ flowchart LR
 | 2026-11-13 | Phase 3 切片 B 验收：155 门禁测试，四阶段守恒律 1e-9 精度证明 | p3-elo-b；forfeit 无账本事件（枚举无 trigger）、衰减四条件合取、replay 断链校验 |
 | 2026-11-13 | P3-D 集成完成：ingest 节点匹配升级 CanonicalNodeResolver（17 测试） | 复用裁决改由 AI 裁判，Mock 默认保守新建；满 15 自动 compaction 在录入事务内验证 |
 | 2026-11-13 | PM 决策：blind_drill_attempts 进 TABLE_DDLS（方案 B），授权 p3-drill 更新 test_schema.py 表数断言 9→10 | schema 单一来源优先；拒绝影子表方案 A，避免 init_db 与调度器 schema 分裂 |
+| 2026-11-13 | M2 提交（44466d3）：Phase 2 全部 + Phase 3 引擎，446 测试 | 选择性提交排除在途文件；scaffold 28 测试全 FSM 边覆盖 |
+| 2026-11-13 | M3 提交（fa62e21）：Phase 3 完成，479 测试全绿 | p3-drill 33 测试 99% 覆盖；决策 B 精确执行（test_schema 仅 3 行）；P4-A/P4-B 并行组装期 |
+| 2026-11-13 | P4-A/P4-B 验收：515 测试全绿；PM 信封审计发现 3 处字段名不匹配 | l2_groups/每模块内嵌 metrics/pending_escrows 复数 |
+| 2026-11-13 | p4-frontend 召回会话因供应商 429 配额耗尽失败，PM 直接接手 4 处归一层修复 | 修复范围小且完全定位；真实 API JSON + node vm 冒烟验证三层树/metrics/事件/曲线/托管全部解析正确 |
+| 2026-11-13 | P4-C 验收：526 测试、覆盖率 96.77%、总门禁全绿；E2E 报告两个生产缺口 | 标红边无调用方（违 CUJ4）/盲测核验不认 LaTeX（违 CUJ3 原题回退）；立 P4-F 契约派发修复 |
+| 2026-11-13 | PM 裁决：批准 p4-fixes 扩大白名单纳入 test_e2e_cuj_flows.py（仅 CUJ4 标红边期望值） | 接线后 E2E 手动建边变重复递增；期望值须从 fixture 结构推导并注释，非盲目硬编码；其余断言不动 |
+| 2026-11-13 | PM 裁决：回滚断言采方案 C（compaction 前一刻全表快照+全表相等），拒绝子集语义 A/B | revert 不变量是精确恢复 compaction 前状态；快照时机修正属断言强化而非放宽，同时证明恢复与正交保留两方向 |

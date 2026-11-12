@@ -700,3 +700,149 @@ async def test_vlm_failure_leaves_no_rows(
         "compaction_audit_ledger",
     ):
         assert _count(tmp_db, table) == 0
+
+
+# ---------------------------------------------------------------------------
+# P4-F 缺口1：综合错题录入→跨考点标红边生长（CUJ 4）
+# ---------------------------------------------------------------------------
+
+
+def _edges(db_path: Path) -> list[sqlite3.Row]:
+    return _query(db_path, "SELECT * FROM concept_co_errors ORDER BY node_u_id, node_v_id")
+
+
+def _question_node_ids(db_path: Path, uid: str) -> set[str]:
+    return {
+        str(r["knowledge_node_id"])
+        for r in _query(
+            db_path,
+            "SELECT DISTINCT knowledge_node_id FROM question_steps WHERE question_uid=?",
+            (uid,),
+        )
+    }
+
+
+async def test_co_error_edges_grow_on_multi_node_wrong_question(
+    tmp_db: Path, cas_dir: Path, draft_image: Path
+) -> None:
+    """默认 Mock 诊断：3 步挂 3 个不同 L3 节点，错题录入 → C(3,2)=3 条 u<v 标红边。"""
+    card = await _ingest(tmp_db, draft_images=[draft_image])
+    nodes = _question_node_ids(tmp_db, card.question_uid)
+    assert len(nodes) == 3
+    edges = _edges(tmp_db)
+    assert len(edges) == 3  # 3 个不同节点两两建边
+    expected_pairs = {
+        (u, v) for u in nodes for v in nodes if u < v
+    }
+    assert {(e["node_u_id"], e["node_v_id"]) for e in edges} == expected_pairs
+    for e in edges:
+        assert e["node_u_id"] < e["node_v_id"]  # u<v 规范化
+        assert e["active_error_count"] == 1 and e["total_historical_count"] == 1
+        assert e["l1_module_u"] == "力学" and e["l1_module_v"] == "力学"
+        assert json.loads(e["source_question_uids_json"]) == [card.question_uid]
+
+
+async def test_single_node_question_creates_no_edges(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """所有步复用同一节点（1 个不同 resolve 节点）→ 不建边。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image])
+    target_id = str(
+        _query(
+            tmp_db,
+            "SELECT knowledge_node_id FROM question_steps WHERE question_uid=? AND step_index=1",
+            (first.question_uid,),
+        )[0]["knowledge_node_id"]
+    )
+    edges_before = _edges(tmp_db)
+    assert len(edges_before) == 3
+
+    async def fake_match(
+        conn: Any, l1: str, l2: str, cand: str, aliases: list[str]
+    ) -> tuple[str, bool]:
+        return target_id, True  # 全部步复用同一节点
+
+    monkeypatch.setattr(ingest_service, "match_or_create_l3_node", fake_match)
+    second = await _ingest(
+        tmp_db, stem_md=STEM_MD + "\n（单节点题。）", draft_images=[draft_image]
+    )
+    assert len(_question_node_ids(tmp_db, second.question_uid)) == 1
+    edges_after = _edges(tmp_db)
+    assert len(edges_after) == 3  # 不新增边
+    assert [dict(e) for e in edges_after] == [dict(e) for e in edges_before]  # 计数不动
+    for e in edges_after:
+        assert second.question_uid not in json.loads(e["source_question_uids_json"])
+
+
+async def test_already_mastered_initial_state_creates_no_edges(
+    tmp_db: Path, cas_dir: Path, draft_image: Path
+) -> None:
+    """initial_state='已掌握' → ALREADY_MASTERED，即使多节点也不建边。"""
+    await _ingest(tmp_db, draft_images=[draft_image], initial_state="已掌握")
+    assert _count(tmp_db, "knowledge_nodes") == 3  # 节点仍解析
+    assert _edges(tmp_db) == []  # 但不建标红边
+
+
+async def test_wrong_state_but_mastered_category_creates_no_edges(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """initial_state='错题' 但诊断结论 ALREADY_MASTERED → 不建边（条件第二子句）。"""
+    payload = _default_payload()
+    payload.alignment.error_category = "ALREADY_MASTERED"
+    payload.alignment.trap_taxonomy_tag = None
+    _install_payload(monkeypatch, payload)
+    card = await _ingest(tmp_db, draft_images=[draft_image], initial_state="错题")
+    assert card.error_category == "ALREADY_MASTERED"
+    assert _edges(tmp_db) == []
+
+
+async def test_reimport_does_not_double_increment_edges(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, tmp_path: Path
+) -> None:
+    """重入库（短路 + 新草稿两条路径）绝不重复递增标红边。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image])
+    uid = first.question_uid
+    snapshot = [dict(e) for e in _edges(tmp_db)]
+    assert len(snapshot) == 3 and all(e["active_error_count"] == 1 for e in snapshot)
+
+    # 同内容重入库（短路）
+    await _ingest(tmp_db, draft_images=[draft_image])
+    assert [dict(e) for e in _edges(tmp_db)] == snapshot
+    # 补充新草稿（新建会话路径）
+    new_draft = _make_image(tmp_path / "draft2.png", (0, 255, 0))
+    await _ingest(tmp_db, stem_md=_with_uid(uid, STEM_MD), draft_images=[new_draft])
+    edges = _edges(tmp_db)
+    assert [dict(e) for e in edges] == snapshot  # active/historical/uids 全不动
+    for e in edges:
+        assert json.loads(e["source_question_uids_json"]) == [uid]
+
+
+async def test_second_multi_node_question_increments_shared_edges(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """第二道多节点题复用相同 3 节点 → 重合边 active/historical +1、uids 并入。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image])
+    nodes_by_op = {
+        str(r["l3_operator"]): str(r["node_id"])
+        for r in _query(tmp_db, "SELECT node_id, l3_operator FROM knowledge_nodes")
+    }
+
+    async def fake_match(
+        conn: Any, l1: str, l2: str, cand: str, aliases: list[str]
+    ) -> tuple[str, bool]:
+        return nodes_by_op[cand], True  # 按算子名复用第一题的对应节点
+
+    monkeypatch.setattr(ingest_service, "match_or_create_l3_node", fake_match)
+    second = await _ingest(
+        tmp_db, stem_md=STEM_MD + "\n（第二道同考点综合题。）", draft_images=[draft_image]
+    )
+    assert _question_node_ids(tmp_db, second.question_uid) == _question_node_ids(
+        tmp_db, first.question_uid
+    )
+    edges = _edges(tmp_db)
+    assert len(edges) == 3  # 无新增边，全部重合累加
+    for e in edges:
+        assert e["active_error_count"] == 2 and e["total_historical_count"] == 2
+        assert json.loads(e["source_question_uids_json"]) == [
+            first.question_uid, second.question_uid
+        ]

@@ -17,6 +17,9 @@ Target File #5/#8；API 签名与落库流程按 PM 契约 docs/tasks/P2-D_inges
 - 知识点节点经 knowledge_graph.match_or_create_l3_node 解析（同父 L2 邻域 AI 裁判
   复用/新建，别名扩充与满阈值自动 Compaction 由该服务负责），
   question_steps.reused_existing_node 按其返回的 reused 标记落库；
+- 新错题（initial_state='错题' 且 error_category != 'ALREADY_MASTERED'）步骤落库后
+  同事务内调 knowledge_graph.record_co_error_edges 生长跨考点标红边（CUJ 4；
+  ≥2 不同 resolve 节点才建边由该服务内部判定）；重入库路径绝不重复调用；
 - 确认卡 steps 取会话 matched_branch_id 对应分支（一题多解时对齐索引针对该分支），
   该分支无步骤行时回退 canonical。
 """
@@ -40,7 +43,7 @@ from backend.services.difficulty_rubric import (
     calculate_base_elo,
     clamp_substep_difficulty,
 )
-from backend.services.knowledge_graph import match_or_create_l3_node
+from backend.services.knowledge_graph import match_or_create_l3_node, record_co_error_edges
 from backend.services.vlm_diagnosis import (
     DraftAlignmentResult,
     StepSkeletonItem,
@@ -92,7 +95,8 @@ async def ingest_question(
       本地配图改写为 cas:// URI；题干与草稿图片全部归档 CAS（设计 §3.1 第 1 条）；
     - uid 已存在走幂等重入库分支（见模块 docstring 不变量）；
     - 新题调用 ``analyze_question_and_draft`` 单次 VLM 诊断，确定性 rubric 定级，
-      经 knowledge_graph AI 裁判解析知识点节点后原子写入三表；
+      经 knowledge_graph AI 裁判解析知识点节点后原子写入三表；新错题同事务内
+      生长跨考点标红边（record_co_error_edges，CUJ 4）；
     - ``initial_state='已掌握'`` 时会话 error_category 强制 'ALREADY_MASTERED'
       （mastery_state 仍为 ACTIVE，结算推迟到 confirm-gate）。
 
@@ -223,6 +227,11 @@ async def _ingest_new_question(
     ).fetchone()
     assert question is not None  # 刚写入，同事务内必然可见
     session = _latest_session(conn, uid)
+    # CUJ 4：综合错题跨考点标红边生长（步骤落库后、同一事务内；
+    # ≥2 不同 resolve 节点才建边由 record_co_error_edges 内部判定）。
+    # 重入库路径不经过此处，天然不重复递增。
+    if initial_state == "错题" and session["error_category"] != "ALREADY_MASTERED":
+        record_co_error_edges(conn, uid)
     return _gate_card_from_db(conn, question, session, is_reimport=False)
 
 

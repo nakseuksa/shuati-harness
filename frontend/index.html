@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>刷题 Harness · 本地自适应工作台</title>
+  <meta name="description" content="数理自适应刷题与验证框架：多模态录入 · 三阶脚手架 · 每日盲测 · 知识网与双轨 Elo" />
+  <!-- KaTeX（CDN，零构建；离线时公式降级为原文显示，不阻塞核心交互） -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+        crossorigin="anonymous" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"
+          crossorigin="anonymous"></script>
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232743a6'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='white' font-family='Georgia'%3E%E2%88%91%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <!-- ======= 顶栏：品牌 + 四大视图页签 ======= -->
+  <header class="topbar">
+    <div class="brand" aria-label="刷题 Harness">
+      <span class="sigma" aria-hidden="true">∑</span>
+      刷题 Harness
+      <small>LOCAL · ADAPTIVE</small>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="四大视图">
+      <button class="tab-btn" role="tab" id="tab-ingest" data-tab="ingest"
+              aria-selected="true" aria-controls="view-ingest">📥 录入</button>
+      <button class="tab-btn" role="tab" id="tab-training" data-tab="training"
+              aria-selected="false" aria-controls="view-training">🧗 训练</button>
+      <button class="tab-btn" role="tab" id="tab-drill" data-tab="drill"
+              aria-selected="false" aria-controls="view-drill">🎯 每日盲测</button>
+      <button class="tab-btn" role="tab" id="tab-graph" data-tab="graph"
+              aria-selected="false" aria-controls="view-graph">🕸️ 知识网 · Elo</button>
+    </nav>
+    <div class="topbar-right">
+      <button class="icon-btn" id="theme-toggle" data-action="toggle-theme"
+              title="切换深色 / 浅色" aria-label="切换深色或浅色主题">🌙</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ======= ① 录入（CUJ 1） ======= -->
+    <section class="view" id="view-ingest" role="tabpanel" aria-labelledby="tab-ingest">
+      <div class="view-head">
+        <h1>多模态错题录入</h1>
+        <p class="sub">题干与手写草稿分槽粘贴 · VLM 一次性转录对齐 · 步骤微确认后才进入训练（防剧透门禁）</p>
+      </div>
+
+      <!-- 断点续传横幅（JS 注入） -->
+      <div id="resume-slot"></div>
+
+      <div class="grid-2">
+        <div class="stack">
+          <!-- 首页独立盲测入口 -->
+          <button class="due-entry" data-action="goto-drill" type="button">
+            <span class="due-icon" aria-hidden="true">🎯</span>
+            <span>
+              <span class="due-title">每日综合盲测（Due Drill）</span><br />
+              <span class="due-sub">无提示抽测 ≤3 道 · 隐藏来源与知识点标签 · 通过即销账兑现实战分</span>
+            </span>
+            <span class="due-arrow" aria-hidden="true">→</span>
+          </button>
+
+          <form class="card" id="ingest-form" novalidate>
+            <div class="card-title">📝 题干（Markdown + LaTeX）
+              <span class="hint">支持 $...$ / $$...$$ 公式与 cas:// 配图引用</span>
+            </div>
+            <label class="field-label" for="stem-input">题干文本</label>
+            <textarea id="stem-input" rows="7"
+              placeholder="粘贴题目 Markdown / LaTeX 文本；也可直接在下方「题干与配图槽」粘贴原题截图由系统 OCR 转写。&#10;例：带电粒子以 $v_0$ 垂直射入宽度为 $d$ 的条形匀强磁场……"></textarea>
+            <div class="btn-row" style="margin-top:8px">
+              <button class="btn btn-sm btn-ghost" type="button" data-action="toggle-preview">👁 预览渲染</button>
+              <span class="field-help" id="stem-count">0 字</span>
+            </div>
+            <div class="preview-box" id="stem-preview" hidden style="margin-top:8px"></div>
+
+            <div class="card-title" style="margin-top:16px">🖼️ 双槽分区上传
+              <span class="hint">两槽严格隔离，严禁混槽 · 点击槽位后 Ctrl/⌘+V 粘贴，或拖拽 / 点击选择图片</span>
+            </div>
+            <div class="slot-grid">
+              <div class="drop-slot slot-stem" id="slot-stem" tabindex="0" role="button"
+                   aria-label="题干与配图槽：点击聚焦后粘贴图片，或点击选择文件">
+                <div class="slot-head">🧾 题干与配图槽 <span class="slot-count" data-slot-count>0 张</span></div>
+                <div class="slot-tip">原题印刷体截图 / 配图。粘贴文本将并入题干。</div>
+                <div class="slot-thumbs" data-thumbs></div>
+                <input type="file" accept="image/*" multiple hidden data-file-input />
+              </div>
+              <div class="drop-slot slot-draft" id="slot-draft" tabindex="0" role="button"
+                   aria-label="手写草稿截图槽：点击聚焦后粘贴图片，或点击选择文件">
+                <div class="slot-head">✍️ 手写草稿截图槽 <span class="slot-count" data-slot-count>0 张</span></div>
+                <div class="slot-tip">纸质演算草稿拍照 / 截图，仅首轮 VLM 转录一次。</div>
+                <div class="slot-thumbs" data-thumbs></div>
+                <input type="file" accept="image/*" multiple hidden data-file-input />
+              </div>
+            </div>
+
+            <div class="meta-row" style="margin-top:16px">
+              <div>
+                <label class="field-label" for="grade-input">target_grade（学段学科）</label>
+                <input type="text" id="grade-input" value="高中物理-高二"
+                       placeholder="如：高中物理-高二 / 高中数学-高三" />
+              </div>
+              <div>
+                <label class="field-label" id="initial-state-label">初始状态</label>
+                <div class="seg" role="group" aria-labelledby="initial-state-label" id="initial-state-seg">
+                  <button type="button" data-action="set-initial-state" data-value="错题" aria-pressed="true">🔴 错题</button>
+                  <button type="button" data-action="set-initial-state" data-value="已掌握" aria-pressed="false">🟢 已掌握</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="btn-row" style="margin-top:18px">
+              <button class="btn btn-primary btn-lg" type="submit" id="ingest-submit">
+                🚀 提交入库并诊断
+              </button>
+              <span class="field-help">CAS 归档 → 四维 Rubric 定级 → 草稿对齐 → 弹出步骤确认卡</span>
+            </div>
+            <div class="field-error" id="ingest-error" hidden></div>
+          </form>
+        </div>
+
+        <div class="stack">
+          <!-- 步骤对齐微确认条（JS 渲染 GateCardDTO） -->
+          <div id="gate-slot">
+            <div class="card empty-state">
+              <div class="big" aria-hidden="true">🧭</div>
+              <h3>步骤对齐微确认条</h3>
+              <p>提交入库后，这里会展示 VLM 拆解的解题步骤骨架与卡点归因。核对无误后按 <kbd>Enter</kbd> 一键确认，才会进入训练流。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======= ② 训练（CUJ 2 / 3） ======= -->
+    <section class="view" id="view-training" role="tabpanel" aria-labelledby="tab-training" hidden>
+      <div class="view-head">
+        <h1>倒置三阶脚手架训练</h1>
+        <p class="sub">一阶条件遮罩盲探 → 二阶脱壳微母题 → 三阶原题贯通 → 四阶当场拆拐杖 · 全程防剧透</p>
+      </div>
+      <div id="training-root"></div>
+    </section>
+
+    <!-- ======= ③ 每日盲测（CUJ 3） ======= -->
+    <section class="view" id="view-drill" role="tabpanel" aria-labelledby="tab-drill" hidden>
+      <div class="view-head">
+        <h1>🎯 每日综合盲测（Due Drill）</h1>
+        <p class="sub">已剥离原题来源与知识点标签 · 回退原题时强制中间量 + 最终答案双重核验 · 通过即 🟡→🟢 销账</p>
+      </div>
+      <div class="drill-toolbar">
+        <div class="date-field">
+          <label class="field-label" for="drill-date">active_date（时间旅行调试）</label>
+          <input type="date" id="drill-date" />
+        </div>
+        <button class="btn" type="button" data-action="drill-refresh">🔄 刷新今日题单</button>
+        <span class="field-help">每日 ≤3 道 · 同日刷新幂等返回锁定题单</span>
+      </div>
+      <div id="drill-root"></div>
+    </section>
+
+    <!-- ======= ④ 知识网与 Elo 看板（CUJ 4） ======= -->
+    <section class="view" id="view-graph" role="tabpanel" aria-labelledby="tab-graph" hidden>
+      <div class="view-head">
+        <h1>三层知识网 · 双轨 Elo 看板</h1>
+        <p class="sub">L1 模块 / L2 实体定理 / L3 原子算子 · 同域并查集 Compaction 可一键回滚 · 覆盖分与实战分水分区可视化</p>
+      </div>
+      <div class="btn-row" style="margin-bottom:16px">
+        <button class="btn" type="button" data-action="graph-refresh">🔄 刷新知识网与账本</button>
+        <span class="chip">🔴 攻坚中</span>
+        <span class="chip">🟡 待复测</span>
+        <span class="chip">🟢 已掌握</span>
+      </div>
+      <div id="graph-root"></div>
+      <div id="elo-root" style="margin-top:18px"></div>
+    </section>
+  </main>
+
+  <footer class="site-foot">
+    刷题 Harness · Local-First 单机工作台 · SQLite + CAS 资产库 · 数据不出本机
+  </footer>
+
+  <!-- 统一错误重试条（设计 Risks 表：网关故障 / 网络波动） -->
+  <div class="retry-bar" id="retry-bar" hidden role="alert">
+    <span aria-hidden="true">⚠️</span>
+    <span class="retry-msg" id="retry-msg"></span>
+    <button class="btn btn-sm btn-danger" type="button" data-action="retry-last">重试</button>
+    <button class="btn btn-sm btn-ghost" type="button" data-action="retry-dismiss">关闭</button>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <div class="lightbox" id="lightbox" hidden data-action="close-lightbox">
+    <img id="lightbox-img" alt="配图放大预览" />
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

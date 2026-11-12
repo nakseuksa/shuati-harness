@@ -36,7 +36,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from backend.config import settings
-from backend.sandbox.sympy_verifier import verify_equation_equivalence
+from backend.sandbox.sympy_verifier import answers_equivalent
 from backend.services import elo_engine, knowledge_graph
 
 __all__ = [
@@ -454,7 +454,8 @@ def evaluate_blind_drill_submission(
     """提交盲测作答完成 🟡→🟢 销账或 🔴 重训分流，全程单事务。
 
     - 呈现题确定性重放：与排单共用 _build_item（同 active_date 同选择逻辑）；
-      答案一律经 verify_equation_equivalence 代数等价判定。
+      答案一律经 answers_equivalent（LaTeX 规范化 + 字符串快路径 + SymPy 代数等价，
+      与脚手架引擎共享 sympy_verifier 匹配栈）判定。
     - 回退原题：中间量（对曾卡壳步 step_formula_latex）与最终答案双正确才 pass；
       中间量缺失/错误 → fail（即使最终对）。变式只核最终答案。
     - pass → realize 兑现 escrow + MASTERED + 标红边递减 + 合规子题连带销账；
@@ -476,7 +477,7 @@ def evaluate_blind_drill_submission(
 
         item = _build_item(conn, question)  # 确定性重放呈现题
         drill = _load_question(conn, item.drill_question_uid)
-        final_ok = verify_equation_equivalence(final_answer, str(drill["standard_answer_latex"]))
+        final_ok = answers_equivalent(final_answer, str(drill["standard_answer_latex"]))
 
         session = _latest_session(conn, question_uid)
         step = _stalled_step(conn, question_uid, session)
@@ -485,7 +486,7 @@ def evaluate_blind_drill_submission(
             inter_ok = (
                 intermediate_sub_answer is not None
                 and step is not None
-                and verify_equation_equivalence(
+                and answers_equivalent(
                     intermediate_sub_answer, str(step["step_formula_latex"])
                 )
             )

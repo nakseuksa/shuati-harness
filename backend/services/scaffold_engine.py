@@ -38,6 +38,8 @@ from pydantic import BaseModel
 from backend.config import settings
 from backend.db.schema import get_db_connection
 from backend.sandbox.sympy_verifier import (
+    answers_equivalent,
+    normalize_answer,
     run_sympy_in_sandbox,
     validate_script_ast,
     verify_equation_equivalence,
@@ -137,91 +139,23 @@ class _GenResult:
 
 
 # ---------------------------------------------------------------------------
-# LaTeX → SymPy 可解析文本规范化（等价判据前置；沙盒判据本身见 sympy_verifier）
+# 答案匹配辅助（LaTeX 规范化 / 等价判定共享栈已迁至 sympy_verifier，P4-F）
 # ---------------------------------------------------------------------------
-
-_IMPLICATION_SEPS = ("\\Rightarrow", "\\Longrightarrow", "\\implies", "⇒", "→")
-_TEXT_CMD_RE = re.compile(r"\\(?:text|mathrm|mbox|operatorname)\s*\{[^{}]*\}")
-_FRAC_RE = re.compile(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
-_SQRT_RE = re.compile(r"\\sqrt\s*\{([^{}]*)\}")
-_LEFT_RIGHT_RE = re.compile(r"\\(?:left|right)\b")
-_SUB_BRACE_RE = re.compile(r"_\{([^{}]*)\}")
-_SUP_BRACE_RE = re.compile(r"\^\{([^{}]*)\}")
-_SUB_CHAR_RE = re.compile(r"_([A-Za-z0-9])")
-_SPACING_RE = re.compile(r"\\[,;! ]")
-_COMMAND_RE = re.compile(r"\\([A-Za-z]+)")
-
-
-def _latex_to_plain(text: str) -> str:
-    """将步骤/答案 LaTeX 规范化为 verify_equation_equivalence 可解析的纯文本。
-
-    去除单位（\\text{...}）、间距与 \\left/\\right；\\frac/\\sqrt 转函数式；
-    下标扁平化（v_{max} → vmax，封死下划线内省面）；上标保留 ^（convert_xor）。
-    """
-    s = _TEXT_CMD_RE.sub("", text)
-    for _ in range(8):  # 交替展开嵌套 \frac / \sqrt，直至不动点
-        expanded = _SQRT_RE.sub(r"sqrt(\1)", s)
-        expanded = _FRAC_RE.sub(r"((\1)/(\2))", expanded)
-        if expanded == s:
-            break
-        s = expanded
-    s = _LEFT_RIGHT_RE.sub("", s)
-    s = _SUB_BRACE_RE.sub(r"\1", s)
-    s = _SUP_BRACE_RE.sub(r"^(\1)", s)
-    s = _SUB_CHAR_RE.sub(r"\1", s)
-    s = s.replace(r"\cdot", "*").replace(r"\times", "*")
-    s = _SPACING_RE.sub("", s)
-    s = s.replace("~", " ")
-    s = _COMMAND_RE.sub(r"\1", s)  # 其余字母命令（\theta → theta 等）
-    s = s.replace("{", "(").replace("}", ")").replace("\\", "").replace("_", "")
-    s = re.sub(r"\s+", " ", s).strip()
-    return re.sub(r"\s*=\s*", " = ", s).strip()
-
-
-def _normalize_answer(text: str) -> str:
-    """规范化单条作答/标准式：蕴含链取结论段；链式等式 a=b=c 取首尾 a=c。"""
-    s = (text or "").strip()
-    for sep in _IMPLICATION_SEPS:
-        if sep in s:
-            s = s.split(sep)[-1].strip()
-    s = _latex_to_plain(s)
-    if s.count("=") > 1 and ";" not in s and "\n" not in s:
-        parts = [p.strip() for p in s.split("=")]
-        s = f"{parts[0]} = {parts[-1]}"
-    return s.strip()
-
-
-def _answers_equivalent(user_answer: str, standard: str) -> bool:
-    """代数等价判定：规范化字符串比对 → SymPy 沙盒等价 → 裸值对单方程右端。"""
-    user = _normalize_answer(user_answer)
-    std = _normalize_answer(standard)
-    if not user or not std:
-        return False
-    if user == std:
-        return True
-    if verify_equation_equivalence(user, std):
-        return True
-    # 标准答案为单方程 var=value 时，允许用户仅提交裸值（如 "20" 对 "vmax = 20"）
-    if "=" not in user and std.count("=") == 1:
-        rhs = std.split("=", 1)[1].strip()
-        if rhs and (user == rhs or verify_equation_equivalence(user, rhs)):
-            return True
-    return False
 
 
 def _probe_answer_matches(user_answer: str, step_formula_latex: str) -> bool:
     """一阶盲探判定：作答（可为多式）与卡点步公式的结论段代数等价。"""
-    target = _normalize_answer(step_formula_latex)
+    target = normalize_answer(step_formula_latex)
     if not target:
         return False
-    user = _normalize_answer(user_answer)
+    user = normalize_answer(user_answer)
     parts = [p.strip() for p in _EQUATION_SPLIT_RE.split(user) if p.strip()]
-    return any(_answers_equivalent(part, target) for part in parts)
+    return any(answers_equivalent(part, target) for part in parts)
 
 
 def _extract_allowed_symbols(standard: str) -> list[str]:
     """核心列式验证模式允许使用的符号集（标准式中的自由标识符，去函数名）。"""
-    tokens = set(_SYMBOL_TOKEN_RE.findall(_normalize_answer(standard)))
+    tokens = set(_SYMBOL_TOKEN_RE.findall(normalize_answer(standard)))
     return sorted(tokens - _FUNC_TOKENS)
 
 
@@ -868,7 +802,7 @@ async def _dual_blind_solve(stem: str) -> tuple[str, list[str]] | None:
         ),
     )
     a1, a2 = first.answer_latex, second.answer_latex
-    n1, n2 = _normalize_answer(a1), _normalize_answer(a2)
+    n1, n2 = normalize_answer(a1), normalize_answer(a2)
     if n1 and n1 == n2:
         return a1, [a1, a2]
     if await asyncio.to_thread(verify_equation_equivalence, n1, n2):
@@ -1069,7 +1003,7 @@ async def _submit_stage2(
     session_id = str(session["session_id"])
     scaffold = await _ensure_prewarm_question(session_id, "scaffold", db_path)
     correct = await asyncio.to_thread(
-        _answers_equivalent, user_answer, str(scaffold["standard_answer_latex"])
+        answers_equivalent, user_answer, str(scaffold["standard_answer_latex"])
     )
     if correct:
         _transition(
@@ -1087,7 +1021,7 @@ async def _submit_stage3(
     with get_db_connection(db_path) as conn:
         question = _load_question(conn, str(session["question_uid"]))
     correct = await asyncio.to_thread(
-        _answers_equivalent, user_answer, str(question["standard_answer_latex"])
+        answers_equivalent, user_answer, str(question["standard_answer_latex"])
     )
     if correct:
         await _ensure_prewarm_question(session_id, "variant", db_path)
@@ -1123,7 +1057,7 @@ async def _submit_stage4(
     with get_db_connection(db_path) as conn:
         variant_steps = _branch_steps(conn, str(variant["question_uid"]), "canonical")
     standard, mode = _stage4_standard(question, variant, variant_steps)
-    correct = await asyncio.to_thread(_answers_equivalent, user_answer, standard)
+    correct = await asyncio.to_thread(answers_equivalent, user_answer, standard)
 
     if correct:
         with get_db_connection(db_path) as conn:

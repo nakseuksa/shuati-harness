@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from backend.config import settings
 from backend.db.schema import get_db_connection
+from backend.sandbox.sympy_verifier import verify_equation_equivalence
 from backend.services import elo_engine, knowledge_graph
 from backend.services.blind_drill_scheduler import (
     BlindDrillItemDTO,
@@ -733,3 +734,85 @@ def test_missing_session_defaults(conn: sqlite3.Connection) -> None:
     retrain = _row(conn, "SELECT * FROM diagnostic_sessions WHERE question_uid='q-nosess'")
     assert retrain["error_category"] == "CONCEPT_BOTTLENECK"  # 无原会话时的默认诊断
     assert retrain["micro_stage"] == "STAGE_1_BLIND_PROBE"
+
+
+# ---------------------------------------------------------------------------
+# P4-F 缺口2：盲测双重核验支持 LaTeX（原题回退分支 CUJ 3）
+# ---------------------------------------------------------------------------
+
+LATEX_FINAL_STD = r"\frac{mv^2}{2} = qU"
+LATEX_INTER_STD = r"R = \frac{mv}{qB}"
+
+
+def _prepare_latex_original(
+    conn: sqlite3.Connection, uid: str, *, answer: str = LATEX_FINAL_STD
+) -> None:
+    """LaTeX 标准答案原题：最终答案 + 卡壳步中间量均为真实 LaTeX。"""
+    _prepare_original(conn, uid, answer=answer)
+    conn.execute(
+        "UPDATE question_steps SET step_formula_latex = ?"
+        " WHERE question_uid = ? AND step_index = 2",
+        (LATEX_INTER_STD, uid),
+    )
+
+
+def test_raw_equivalence_rejects_latex_motivating_shared_stack() -> None:
+    """缺口2 复现：裸 verify_equation_equivalence 的字符黑名单封禁反斜杠/花括号，
+    真实 LaTeX 标准答案永远无法通过——故需共享规范化栈 answers_equivalent。"""
+    assert verify_equation_equivalence(LATEX_FINAL_STD, LATEX_FINAL_STD) is False
+    assert verify_equation_equivalence(LATEX_INTER_STD, LATEX_INTER_STD) is False
+
+
+@pytest.mark.parametrize(
+    ("final", "inter"),
+    [
+        # 相同 LaTeX（规范化后字符串快路径）
+        (LATEX_FINAL_STD, LATEX_INTER_STD),
+        # 纯文本提交 vs LaTeX 标准答案（SymPy 代数等价）
+        ("mv^2/2 = qU", "R = mv/(qB)"),
+        # 代数等价的不同 LaTeX 写法（1/2 mv^2 ≡ mv^2/2）
+        (r"\frac{1}{2}mv^2 = qU", LATEX_INTER_STD),
+    ],
+)
+def test_original_latex_double_verification_passes(
+    conn: sqlite3.Connection, final: str, inter: str
+) -> None:
+    _prepare_latex_original(conn, "q-latex-pass")
+    outcome = evaluate_blind_drill_submission(conn, "q-latex-pass", final, inter, DAY)
+    assert outcome.passed and outcome.mastery_state == "MASTERED"
+    log = _attempt(conn, "q-latex-pass")
+    assert log["intermediate_correct"] == 1 and log["final_correct"] == 1 and log["passed"] == 1
+    assert _pool(conn, "q-latex-pass")["escrow_status"] == "REALIZED_MASTERED"
+
+
+def test_original_latex_intermediate_wrong_still_fails(conn: sqlite3.Connection) -> None:
+    """LaTeX 中间量错误仍须 fail（防过度宽松）：最终对但中间错 → STAGE_1。"""
+    _prepare_latex_original(conn, "q-latex-bad-inter")
+    outcome = evaluate_blind_drill_submission(
+        conn, "q-latex-bad-inter", LATEX_FINAL_STD, r"R = \frac{mv}{2qB}", DAY
+    )
+    assert not outcome.passed and outcome.retrain_stage == "STAGE_1_BLIND_PROBE"
+    log = _attempt(conn, "q-latex-bad-inter")
+    assert log["intermediate_correct"] == 0 and log["final_correct"] == 1
+
+
+def test_variant_latex_final_answer_passes(conn: sqlite3.Connection) -> None:
+    """变式呈现只核最终答案：LaTeX 标准答案 + 纯文本提交 → 通过。"""
+    _prepare_original(conn, "q-latex-var")
+    _insert_variant(conn, "v-latex", "q-latex-var", answer=LATEX_FINAL_STD)
+    _insert_relation(conn, "q-latex-var", "v-latex", "CLONE")
+    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    assert item.drill_question_uid == "v-latex"
+    outcome = evaluate_blind_drill_submission(conn, "q-latex-var", "mv^2/2 = qU", None, DAY)
+    assert outcome.passed and outcome.mastery_state == "MASTERED"
+    assert _attempt(conn, "q-latex-var")["intermediate_correct"] is None
+
+
+def test_original_latex_bare_value_final_passes(conn: sqlite3.Connection) -> None:
+    """共享栈裸值豁免 + 单位剔除：标准答案 v_{max}=20\\text{m/s}，提交裸值 20 → 通过。"""
+    _prepare_latex_original(conn, "q-latex-bare", answer=r"v_{max} = 20\ \text{m/s}")
+    outcome = evaluate_blind_drill_submission(
+        conn, "q-latex-bare", "20", LATEX_INTER_STD, DAY
+    )
+    assert outcome.passed and outcome.mastery_state == "MASTERED"
+    assert _attempt(conn, "q-latex-bare")["final_correct"] == 1
