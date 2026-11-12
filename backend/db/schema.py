@@ -1,4 +1,4 @@
-"""SQLite Schema 基座：9 张核心表与结构化索引的幂等初始化。
+"""SQLite Schema 基座：9 张核心表 + 1 张 PM 批准扩展表与结构化索引的幂等初始化。
 
 DDL 逐字段照抄设计文档 docs/designs/adaptive_practice_harness.md §2（唯一权威规格），
 仅按契约将 CREATE TABLE 改为 CREATE TABLE IF NOT EXISTS 以保证幂等。
@@ -229,9 +229,23 @@ CREATE TABLE IF NOT EXISTS elo_mutation_ledger (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """,
+    # PM 批准扩展（P3-C），见 docs/tasks/P3-C_blind_drill.md：
+    # 变式曝光追踪（"未曝光过"判据）+ 失败重训分流的作答日志。
+    "blind_drill_attempts": """
+CREATE TABLE IF NOT EXISTS blind_drill_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question_uid TEXT NOT NULL REFERENCES questions(question_uid) ON DELETE CASCADE,
+    drill_question_uid TEXT NOT NULL REFERENCES questions(question_uid),
+    active_date DATE NOT NULL,
+    intermediate_correct INTEGER,          -- NULL = 本题不要求中间量
+    final_correct INTEGER NOT NULL,
+    passed INTEGER NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+""",
 }
 
-# 9 张核心表名清单（与 DDL 定义顺序一致）
+# 表名清单：9 张核心表 + 1 张 PM 批准扩展表 blind_drill_attempts（与 DDL 定义顺序一致）
 TABLE_NAMES: tuple[str, ...] = tuple(TABLE_DDLS)
 
 # ---------------------------------------------------------------------------
@@ -253,11 +267,14 @@ INDEX_DDLS: tuple[str, ...] = (
     " ON elo_mutation_ledger(l1_module);",
     "CREATE INDEX IF NOT EXISTS idx_question_relations_target_type"
     " ON question_relations(target_question_uid, relation_type);",
+    # PM 批准扩展（P3-C）：变式曝光追踪按 (原题, 活跃日) 检索
+    "CREATE INDEX IF NOT EXISTS idx_blind_drill_attempts_question_date"
+    " ON blind_drill_attempts(question_uid, active_date);",
 )
 
 
 def init_db(db_path: Path | None = None) -> None:
-    """幂等初始化数据库：自动创建父目录并建立 9 张表与全部结构化索引。
+    """幂等初始化数据库：自动创建父目录并建立 9 张核心表 + 1 张 PM 批准扩展表与全部索引。
 
     db_path 缺省取 backend.config.settings.SQLITE_PATH；重复调用不报错、不丢数据。
     """

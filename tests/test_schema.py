@@ -50,14 +50,14 @@ def _insert_node(conn: sqlite3.Connection, node_id: str) -> None:
     conn.execute(_INSERT_NODE_SQL, (node_id,))
 
 
-def test_all_nine_tables_exist(tmp_db: Path) -> None:
-    """9 张核心表全部存在且无多余业务表。"""
+def test_all_core_and_extension_tables_exist(tmp_db: Path) -> None:
+    """9 张核心表 + 1 张 PM 批准扩展表 blind_drill_attempts 全部存在且无多余业务表。"""
     with get_db_connection(tmp_db) as conn:
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
     assert {row["name"] for row in rows} == set(TABLE_NAMES)
-    assert len(TABLE_NAMES) == 9
+    assert len(TABLE_NAMES) == 10
 
 
 def test_required_indexes_exist(tmp_db: Path) -> None:
