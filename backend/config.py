@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     SOLVER_LLM_MODEL_NAME: str = "gpt-4o-mini"
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_RETRIES: int = 2
+    LLM_TIMEOUT_SECONDS: float = 300.0
     USE_MOCK_LLM: bool = False
 
     # ---- 存储路径 ----

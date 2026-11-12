@@ -211,7 +211,7 @@ async def test_real_request_body_headers_and_timeout(
     assert body["messages"] == SIMPLE_MESSAGES
     assert body["response_format"] == {"type": "json_object"}
     assert body["temperature"] == settings.LLM_TEMPERATURE  # 缺省温度
-    assert client_kwargs[0]["timeout"] == httpx.Timeout(60.0)
+    assert client_kwargs[0]["timeout"] == httpx.Timeout(settings.LLM_TIMEOUT_SECONDS)
     assert sleep_delays == []
 
 

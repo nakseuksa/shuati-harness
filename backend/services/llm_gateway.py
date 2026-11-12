@@ -8,7 +8,8 @@ vlm_diagnosis / scaffold_engine / 双盲校验均复用本网关，禁止私自�
 - Mock 模式（``settings.USE_MOCK_LLM``）：按 purpose 路由 ``llm_mocks.MOCK_RESPONSES``，
   经 schema 校验后返回；未注册 purpose 显式抛 ``LLMGatewayError``（绝不静默）。
 - 真实模式：``httpx.AsyncClient`` POST ``{LLM_BASE_URL}/chat/completions``（Bearer 鉴权，
-  ``response_format={"type": "json_object"}``，Timeout 60s）；网络错误/5xx/429 指数退避
+  ``response_format={"type": "json_object"}``，Timeout 取 ``settings.LLM_TIMEOUT_SECONDS``，
+  默认 300s 适配推理模型思考窗口）；网络错误/5xx/429 指数退避
   （1s/2s）重试 ``settings.LLM_MAX_RETRIES`` 次；JSON 解析或 Pydantic 校验失败时附校验
   错误信息修复重试 1 次；所有异常最终收敛为 ``LLMGatewayError``。
 """
@@ -26,9 +27,6 @@ from backend.config import settings
 from backend.services import llm_mocks
 
 __all__ = ["LLMGatewayError", "chat_json", "image_path_to_data_url"]
-
-# 网关硬超时（契约实现规格 5）
-_REQUEST_TIMEOUT = httpx.Timeout(60.0)
 
 # 图片后缀 → MIME（CAS 入库统一 WebP；兼容常见原始格式）
 _MIME_BY_SUFFIX: dict[str, str] = {
@@ -89,7 +87,7 @@ async def chat_json(
         "response_format": {"type": "json_object"},
     }
     try:
-        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.LLM_TIMEOUT_SECONDS)) as client:
             content = await _post_with_retries(client, request_body, purpose)
             try:
                 return schema.model_validate(json.loads(content))
