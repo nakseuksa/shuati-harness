@@ -90,6 +90,7 @@ const state = {
   // 训练
   session: null,         // SessionStepResponse
   feedback: null,        // 提交后同阶段停留的反馈
+  prewarmPoll: null,     // 二阶/四阶题干未就绪时的轮询计时器
   // 盲测
   drill: { date: todayISO(), items: [], outcomes: {}, loaded: false },
   // 看板
@@ -343,6 +344,7 @@ function toast(message, kind = 'info', ms = 3400) {
 /* ---------------------------------------------------------------- 页签 */
 function switchTab(name) {
   state.tab = name;
+  if (name !== 'training') stopPrewarmPoll();
   $$('.tab-btn').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === name)));
   $$('.view').forEach((v) => { v.hidden = v.id !== `view-${name}`; });
   if (name === 'training') renderTraining();
@@ -683,6 +685,7 @@ function badgeHtml(map, key, fallbackLabel) {
 function fallbackBannerHtml(resp) {
   const v = resp.view_payload || {};
   const isFallback = resp.prewarm_status === 'READY_FALLBACK'
+    || stageQuestionView(v, resp.micro_stage).verificationStatus === 'DUAL_LLM_FALLBACK'
     || pick(v, 'verification_status') === 'DUAL_LLM_FALLBACK';
   if (!isFallback) return '';
   return `
@@ -693,6 +696,100 @@ function fallbackBannerHtml(resp) {
       <button class="btn btn-sm btn-warn" type="button" data-action="fallback-skip">跳过此题</button>
       <button class="btn btn-sm btn-warn" type="button" data-action="fallback-swap">🔄 换一题（重新热备）</button>
     </div>`;
+}
+
+/* 预热信封归一：后端将题干嵌套于 view_payload.micro_scaffold / variant（P2-E 契约），
+ * 兼容扁平字段与 JSON 字符串；返回 {stem, verificationStatus, prewarmFailed, questionUid}。 */
+function stageQuestionView(v, stage) {
+  const data = v || {};
+  const nestedKey = stage === 'STAGE_2_MICRO_SCAFFOLD' ? 'micro_scaffold'
+    : stage === 'STAGE_4_DECRUTCH_VARIANT' ? 'variant' : null;
+  let nested = nestedKey ? parseMaybeJson(data[nestedKey], null) : null;
+  if (nested && typeof nested !== 'object') nested = null;
+  const stem = (nested && pick(nested, 'stem_md', 'stem'))
+    || pick(data, 'stem_md', 'question_stem_md', 'original_stem_md', 'variant_stem_md', 'scaffold_stem_md', 'stem') || '';
+  const verificationStatus = (nested && pick(nested, 'verification_status')) || pick(data, 'verification_status') || '';
+  return {
+    stem,
+    verificationStatus,
+    prewarmFailed: data.prewarm_failed === true,
+    questionUid: (nested && pick(nested, 'question_uid')) || '',
+  };
+}
+
+/** 二阶/四阶题干就绪状态：ready（可作答）/ waiting（预热在途）/ failed（需重试）。
+ * 以 prewarm_status 为权威信号：后端 prewarm_failed 标志仅表示「产物尚缺」，
+ * RUNNING 期间也为 true，不能据此判失败。 */
+function prewarmWaitState(resp) {
+  const stage = resp && resp.micro_stage;
+  if (stage !== 'STAGE_2_MICRO_SCAFFOLD' && stage !== 'STAGE_4_DECRUTCH_VARIANT') return 'ready';
+  const q = stageQuestionView(resp.view_payload, stage);
+  if (q.stem) return 'ready';
+  if (resp.prewarm_status === 'FAILED') return 'failed';
+  if (resp.prewarm_status === 'READY_SYMPY' || resp.prewarm_status === 'READY_FALLBACK') return 'failed';
+  return 'waiting';
+}
+
+function prewarmCardHtml(resp, wait, kind) {
+  const label = kind === 'micro' ? '脱壳微母题' : '同构变式题';
+  const accent = kind === 'micro' ? 'var(--magenta)' : 'var(--amber)';
+  if (wait === 'failed') {
+    return `
+      <div class="prewarm-card failed" role="alert" style="--pw-accent:${accent}">
+        <div class="pw-icon" aria-hidden="true">🛠️</div>
+        <div class="pw-body">
+          <h4>预热未产出${label}</h4>
+          <p>沙盒验算失败或模型网关异常。可一键重试预热；反复失败请检查网关配置或稍后再试。</p>
+          <div class="btn-row">
+            <button class="btn btn-primary" type="button" data-action="retry-prewarm">🔄 重试预热</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="prewarm-card waiting" role="status" aria-live="polite" style="--pw-accent:${accent}">
+      <div class="pw-icon forge" aria-hidden="true">⚒️</div>
+      <div class="pw-body">
+        <h4>正在后台锻造${label}…</h4>
+        <ol class="pw-pipeline">
+          <li>检索本地题库可复用题目</li>
+          <li>内核先行生成（参数化题干 + 求解脚本）</li>
+          <li>AST 探针 + SymPy 沙盒验算</li>
+        </ol>
+        <div class="pw-shimmer" aria-hidden="true"><span></span></div>
+        <p class="pw-hint">每 2.5 秒自动刷新，无需操作；就绪后题干自动呈现并开放作答。</p>
+      </div>
+    </div>`;
+}
+
+function stopPrewarmPoll() {
+  if (state.prewarmPoll) { clearInterval(state.prewarmPoll); state.prewarmPoll = null; }
+}
+
+/** 题干未就绪时启动单例轮询；就绪/失败/离开训练页自动停止。 */
+function syncPrewarmPoll() {
+  const resp = state.session;
+  const need = state.tab === 'training' && resp && prewarmWaitState(resp) === 'waiting';
+  if (!need) { stopPrewarmPoll(); return; }
+  if (state.prewarmPoll) return;
+  state.prewarmPoll = setInterval(async () => {
+    const cur = state.session;
+    if (!cur || state.tab !== 'training' || prewarmWaitState(cur) !== 'waiting') { stopPrewarmPoll(); return; }
+    try {
+      const next = await apiFetch(`${API}/sessions/${encodeURIComponent(cur.session_id)}`);
+      if (!state.session || state.session.session_id !== next.session_id) return;
+      const changed = next.prewarm_status !== cur.prewarm_status
+        || JSON.stringify(next.view_payload) !== JSON.stringify(cur.view_payload);
+      if (!changed) return;
+      state.session = next;
+      persistSession();
+      renderTraining();
+      renderResumeBanner();
+      const w = prewarmWaitState(next);
+      if (w === 'ready') { stopPrewarmPoll(); toast('✅ 预热完成，题干已就绪', 'ok'); }
+      else if (w === 'failed') { stopPrewarmPoll(); toast('预热失败，可一键重试', 'warn'); }
+    } catch { /* 轮询静默容错：保持等待，下一 tick 重试 */ }
+  }, 2500);
 }
 
 function explainBarHtml(text) {
@@ -753,11 +850,12 @@ function renderTraining() {
         ${persisted ? '<button class="btn btn-primary" type="button" data-action="resume-training">▶️ 恢复暂存进度</button>'
           : '<button class="btn" type="button" data-action="goto-ingest">📥 去录入一道错题</button>'}
       </div>`;
+    stopPrewarmPoll();
     return;
   }
   const v = resp.view_payload || {};
   const stage = resp.micro_stage;
-  const stem = pick(v, 'stem_md', 'question_stem_md', 'original_stem_md', 'variant_stem_md', 'scaffold_stem_md', 'stem');
+  const stem = stageQuestionView(v, stage).stem;
   const [mCls, mLabel] = MASTERY_BADGE[resp.mastery_state] || ['badge-gray', resp.mastery_state];
   let body = '';
 
@@ -778,12 +876,14 @@ function renderTraining() {
       ${answerZoneHtml(resp)}
       ${extraPayloadHtml(v, ['masked_conditions', 'masked_conditions_json', 'conditions', 'probe_question_md', 'probe_md', 'probe', 'verification_mode', 'mode', 'allowed_symbols', 'symbols'])}`;
   } else if (stage === 'STAGE_2_MICRO_SCAFFOLD') {
+    const wait = prewarmWaitState(resp);
     body = `
       ${fallbackBannerHtml(resp)}
       <div class="mask-banner" style="border-left:5px solid var(--magenta)">🐣 二阶 · 脱壳微母题：已剥离原题背景，只练卡点那一步的原子转化</div>
-      <div class="drill-stem rich">${renderRich(stem || '（微母题题干缺失：预热可能仍在途，提交后将同步等待）')}</div>
-      ${answerZoneHtml(resp)}
-      ${extraPayloadHtml(v, ['stem_md', 'scaffold_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status'])}`;
+      ${wait === 'ready'
+        ? `<div class="drill-stem rich">${renderRich(stem)}</div>${answerZoneHtml(resp)}`
+        : prewarmCardHtml(resp, wait, 'micro')}
+      ${extraPayloadHtml(v, ['micro_scaffold', 'stem_md', 'scaffold_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status', 'verification_badge', 'prewarm_failed'])}`;
   } else if (stage === 'STAGE_3_REDO_ORIGINAL') {
     body = `
       <div class="mask-banner" style="border-left:5px solid var(--green)">🔓 三阶 · 无提示回原题：所有遮罩与微母题已撤去，请独立贯通完整原题</div>
@@ -792,12 +892,14 @@ function renderTraining() {
       ${extraPayloadHtml(v, ['stem_md', 'original_stem_md', 'question_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols'])}`;
   } else if (stage === 'STAGE_4_DECRUTCH_VARIANT') {
     const mode = pick(v, 'verification_mode', 'mode');
+    const wait = prewarmWaitState(resp);
     body = `
       ${fallbackBannerHtml(resp)}
       <div class="mask-banner" style="border-left:5px solid var(--amber)">🏗️ 四阶 · 当场拆拐杖同构变式${mode === 'equation_skeleton' ? '：半程立式，只考核心方程组列式' : '：提交最终答案'}</div>
-      <div class="drill-stem rich">${renderRich(stem || '（变式题干缺失：提交后将同步等待在途预热）')}</div>
-      ${answerZoneHtml(resp)}
-      ${extraPayloadHtml(v, ['stem_md', 'variant_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status'])}`;
+      ${wait === 'ready'
+        ? `<div class="drill-stem rich">${renderRich(stem)}</div>${answerZoneHtml(resp)}`
+        : prewarmCardHtml(resp, wait, 'variant')}
+      ${extraPayloadHtml(v, ['variant', 'stem_md', 'variant_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status', 'verification_badge', 'prewarm_failed'])}`;
   } else if (stage === 'STAGE_COOLDOWN_DEFERRED') {
     const mine = pick(v, 'user_answer', 'user_expr', 'user_equation', 'your_answer', 'submitted_answer');
     const std = pick(v, 'standard_answer_latex', 'standard_expr', 'standard_equation', 'expected_answer', 'answer_latex', 'standard_answer');
@@ -860,6 +962,7 @@ function renderTraining() {
       ${stage !== 'SESSION_COMPLETED' ? explainBarHtml(resp.explanation_text) : ''}
       ${body}
     </div>`;
+  syncPrewarmPoll();
 }
 
 async function submitStage(btn, selfAssessment) {
@@ -893,23 +996,46 @@ async function submitStage(btn, selfAssessment) {
 }
 
 async function swapFallbackQuestion(btn) {
-  // 换题 = 重新提交门禁确认 → 再次触发热备（P2-E：confirm 总是启动 prewarm）
-  const p = state.gateParams;
-  if (!p) {
-    toast('缺少门禁参数：请回录入页重新确认后再换题', 'warn');
-    return;
-  }
+  // 换一题 = 重试预热（retry-prewarm 端点；门禁不可重复确认，旧路径已废弃）
+  const resp = state.session;
+  if (!resp) { toast('无进行中的训练会话', 'warn'); return; }
   await runTask(btn, async () => {
-    const next = await apiFetch(`${API}/sessions/${encodeURIComponent(p.session_id)}/confirm-gate`, {
-      method: 'POST',
-      json: { stalled_step_index: p.stalled_step_index, error_category: p.error_category },
-    });
+    const next = await apiFetch(`${API}/sessions/${encodeURIComponent(resp.session_id)}/retry-prewarm`, { method: 'POST' });
     state.session = next;
     state.feedback = null;
     persistSession();
     renderTraining();
-    toast('🔄 已重新提交并触发热备，回到盲探起点', 'ok');
+    renderResumeBanner();
+    toast('🔄 已重新发起预热（换一题）', 'ok');
   });
+}
+
+async function retryPrewarm(btn) {
+  const resp = state.session;
+  if (!resp) return;
+  await runTask(btn, async () => {
+    const next = await apiFetch(`${API}/sessions/${encodeURIComponent(resp.session_id)}/retry-prewarm`, { method: 'POST' });
+    state.session = next;
+    state.feedback = null;
+    persistSession();
+    renderTraining();
+    renderResumeBanner();
+    toast('🔄 已重新发起预热，就绪后自动刷新', 'ok');
+  });
+}
+
+/** 断点续传：以服务端为真相源刷新缓存视图（离线时保留本地缓存）。 */
+async function refreshSessionFromServer() {
+  const resp = state.session;
+  if (!resp || resp.micro_stage === 'SESSION_COMPLETED') return;
+  try {
+    const next = await apiFetch(`${API}/sessions/${encodeURIComponent(resp.session_id)}`);
+    if (!state.session || state.session.session_id !== next.session_id) return;
+    state.session = next;
+    persistSession();
+    renderTraining();
+    renderResumeBanner();
+  } catch { /* 离线：保留本地缓存视图 */ }
 }
 
 /* ================================================================
@@ -1573,9 +1699,11 @@ function onDocumentClick(e) {
         if (persisted) { state.session = persisted.resp; state.gateParams = persisted.gateParams || null; }
       }
       switchTab('training');
+      refreshSessionFromServer();
       break;
     }
     case 'discard-session': {
+      stopPrewarmPoll();
       state.session = null;
       state.gateParams = null;
       persistSession();
@@ -1596,6 +1724,7 @@ function onDocumentClick(e) {
     case 'cooldown-resume': submitStage(el, 'RESUME'); break;
     case 'fallback-skip': submitStage(el, 'SKIP'); break;
     case 'fallback-swap': swapFallbackQuestion(el); break;
+    case 'retry-prewarm': retryPrewarm(el); break;
     case 'insert-symbol': insertSymbol(el); break;
     case 'drill-refresh': loadDrill(el); break;
     case 'drill-submit': submitDrill(el, el.dataset.uid); break;

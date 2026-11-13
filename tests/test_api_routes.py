@@ -917,9 +917,45 @@ def test_default_app_registers_all_contract_routes() -> None:
         "/api/v1/questions/ingest",
         "/api/v1/sessions/{session_id}/confirm-gate",
         "/api/v1/sessions/{session_id}/step-submit",
+        "/api/v1/sessions/{session_id}",
+        "/api/v1/sessions/{session_id}/retry-prewarm",
         "/api/v1/drills/daily",
         "/api/v1/knowledge-graph",
         "/api/v1/knowledge-graph/compaction/{batch_id}/revert",
         "/api/v1/elo/ledger",
         "/assets/{cas_hash}",
     } <= paths
+
+
+# ---------------------------------------------------------------------------
+# 会话视图刷新 / 预热重试端点（二阶题干死循环修复回归）
+# ---------------------------------------------------------------------------
+
+
+async def test_get_session_view_returns_nested_stem(client: AsyncClient) -> None:
+    card = await _ingest(client)
+    sid = card["session_id"]
+    await _confirm(client, sid, "CONCEPT_BOTTLENECK")
+    resp = await _submit(client, sid, STAGE1_WRONG)
+    assert resp["micro_stage"] == "STAGE_2_MICRO_SCAFFOLD"
+    r = await client.get(f"/api/v1/sessions/{sid}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["micro_stage"] == "STAGE_2_MICRO_SCAFFOLD"
+    scaffold = body["view_payload"]["micro_scaffold"]
+    assert scaffold is not None and str(scaffold["stem_md"]).strip()
+
+
+async def test_get_session_unknown_404(client: AsyncClient) -> None:
+    r = await client.get("/api/v1/sessions/no-such-session")
+    assert r.status_code == 404
+
+
+async def test_retry_prewarm_route_noop_and_unknown_404(client: AsyncClient) -> None:
+    card = await _ingest(client)
+    sid = card["session_id"]
+    await _confirm(client, sid, "CONCEPT_BOTTLENECK")
+    r = await client.post(f"/api/v1/sessions/{sid}/retry-prewarm")
+    assert r.status_code == 200, r.text
+    r = await client.post("/api/v1/sessions/no-such-session/retry-prewarm")
+    assert r.status_code == 404

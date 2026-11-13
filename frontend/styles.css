@@ -1182,3 +1182,40 @@ footer.site-foot {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+/* ================================================================
+ * 预热等待 / 失败卡（二阶微母题 / 四阶变式题干未就绪）
+ * 主题语言：稿纸网格 × 墨蓝 × 批改朱红；二阶品红 / 四阶琥珀
+ * ================================================================ */
+.prewarm-card {
+  display: flex; gap: 16px; align-items: flex-start;
+  padding: 20px 22px; margin: 14px 0;
+  border: 1.5px dashed var(--pw-accent, var(--line-strong));
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--pw-accent, var(--amber)) 6%, transparent);
+}
+.prewarm-card .pw-icon { font-size: 30px; line-height: 1.1; }
+.prewarm-card .pw-icon.forge { animation: pw-forge 1.6s ease-in-out infinite; transform-origin: 60% 80%; }
+@keyframes pw-forge {
+  0%, 100% { transform: rotate(-8deg) scale(1); }
+  50% { transform: rotate(10deg) scale(1.12); }
+}
+.prewarm-card .pw-body { flex: 1; min-width: 0; }
+.prewarm-card h4 { margin: 0 0 6px; font-size: 15px; color: var(--pw-accent, var(--ink)); }
+.prewarm-card p { margin: 6px 0 0; font-size: 12.5px; color: var(--ink-faint); }
+.pw-pipeline { margin: 8px 0 10px; padding-left: 20px; font-size: 12.5px; color: var(--ink-faint); }
+.pw-pipeline li { margin: 3px 0; }
+.pw-shimmer {
+  height: 6px; border-radius: 3px; overflow: hidden;
+  background: color-mix(in srgb, var(--pw-accent, var(--amber)) 15%, transparent);
+}
+.pw-shimmer span {
+  display: block; height: 100%; width: 38%; border-radius: 3px;
+  background: linear-gradient(90deg, transparent, var(--pw-accent, var(--amber)), transparent);
+  animation: pw-slide 1.4s linear infinite;
+}
+@keyframes pw-slide { from { transform: translateX(-120%); } to { transform: translateX(320%); } }
+.prewarm-card.failed { border-style: solid; }
+.pw-hint { font-style: italic; }
+@media (prefers-reduced-motion: reduce) {
+  .prewarm-card .pw-icon.forge, .pw-shimmer span { animation: none; }
+}

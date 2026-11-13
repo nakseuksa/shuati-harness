@@ -51,8 +51,10 @@ from backend.services.llm_gateway import chat_json
 __all__ = [
     "SessionStepResponse",
     "confirm_diagnostic_gate",
+    "get_session_view",
     "in_flight_prewarm_tasks",
     "prewarm_session_questions",
+    "retry_prewarm",
     "submit_stage_answer",
 ]
 
@@ -397,6 +399,40 @@ async def prewarm_session_questions(session_id: str, db_path: Path | None = None
             _write_session_fields(db_path, session_id, prewarm_status="FAILED")
         except Exception:
             logger.exception("预热失败状态回写亦失败 session=%s", session_id)
+
+
+async def get_session_view(session_id: str, db_path: Path | None = None) -> SessionStepResponse:
+    """只读刷新当前会话视图（前端轮询 / 断点续传刷新）。
+
+    不触发预热、不流转状态、不结算 Elo；预热在途时原样返回当前 prewarm_status，
+    由前端据此决定是否继续轮询。未知会话抛 ValueError（路由层前置 404）。
+    """
+    with get_db_connection(db_path) as conn:
+        _load_session(conn, session_id)
+    return _build_response(session_id, db_path)
+
+
+async def retry_prewarm(session_id: str, db_path: Path | None = None) -> SessionStepResponse:
+    """FAILED / 产物缺失时重试预热（前端「重试预热 / 换一题」入口）。
+
+    READY 且双产物齐全 → 幂等无操作返回当前视图；SESSION_COMPLETED → ValueError；
+    否则重启预热 Task（已有在途则复用），立即返回不 await，前端轮询 get_session_view。
+    """
+    with get_db_connection(db_path) as conn:
+        session = _load_session(conn, session_id)
+    if str(session["micro_stage"]) == "SESSION_COMPLETED":
+        raise ValueError("会话已完成，无需重试预热")
+    status = str(session["prewarm_status"])
+    has_both = (
+        session["prewarm_scaffold_uid"] is not None
+        and session["prewarm_variant_uid"] is not None
+    )
+    if status in ("READY_SYMPY", "READY_FALLBACK") and has_both:
+        return _build_response(session_id, db_path)
+    if status != "RUNNING":
+        _write_session_fields(db_path, session_id, prewarm_status="RUNNING")
+    _ensure_prewarm_task(session_id, db_path)
+    return _build_response(session_id, db_path)
 
 
 async def _prewarm_impl(session_id: str, db_path: Path | None) -> None:

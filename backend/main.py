@@ -45,6 +45,8 @@ from backend.services.llm_gateway import LLMGatewayError
 from backend.services.scaffold_engine import (
     SessionStepResponse,
     confirm_diagnostic_gate,
+    get_session_view,
+    retry_prewarm,
     submit_stage_answer,
 )
 
@@ -474,6 +476,18 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
     async def step_submit(session_id: str, body: StepSubmitRequest) -> SessionStepResponse:
         _require_session(session_id)
         return await submit_stage_answer(session_id, body.user_answer, body.self_assessment)
+
+    @app.get("/api/v1/sessions/{session_id}", response_model=SessionStepResponse)
+    async def get_session(session_id: str) -> SessionStepResponse:
+        """只读刷新会话视图：前端预热轮询与断点续传的服务端真相源。"""
+        _require_session(session_id)
+        return await get_session_view(session_id)
+
+    @app.post("/api/v1/sessions/{session_id}/retry-prewarm", response_model=SessionStepResponse)
+    async def retry_session_prewarm(session_id: str) -> SessionStepResponse:
+        """预热 FAILED / 产物缺失时重试；READY 幂等无操作。"""
+        _require_session(session_id)
+        return await retry_prewarm(session_id)
 
     # ---- CUJ 3：每日盲测题单 / 销账（active_date 注入贯穿，支持时间旅行） ----
     @app.get("/api/v1/drills/daily", response_model=list[BlindDrillItemDTO])

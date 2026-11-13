@@ -25,8 +25,10 @@ from backend.services.ingest_service import GateCardDTO, ingest_question
 from backend.services.scaffold_engine import (
     SessionStepResponse,
     confirm_diagnostic_gate,
+    get_session_view,
     in_flight_prewarm_tasks,
     prewarm_session_questions,
+    retry_prewarm,
     submit_stage_answer,
 )
 from backend.services.vlm_diagnosis import DiagnosisPayload
@@ -822,3 +824,105 @@ async def test_prewarm_relaunch_after_restart(tmp_db: Path, install_diagnosis: A
     assert resp.prewarm_status == "READY_SYMPY"
     assert resp.view_payload["micro_scaffold"] is not None
     await _drain(sid)
+
+
+# ---------------------------------------------------------------------------
+# 会话视图刷新与预热重试（二阶/四阶题干死循环修复回归）
+# ---------------------------------------------------------------------------
+
+
+async def test_get_session_view_ready_returns_nested_stem(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    """READY 后只读刷新视图：嵌套信封 micro_scaffold.stem_md 非空（前端渲染真相源）。"""
+    gate = await _concept_session(tmp_db, install_diagnosis)
+    sid = gate.session_id
+    await confirm_diagnostic_gate(sid, 2, "CONCEPT_BOTTLENECK", db_path=tmp_db)
+    await _drain(sid)
+    resp = await submit_stage_answer(sid, STAGE1_WRONG, db_path=tmp_db)
+    assert resp.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+    view = await get_session_view(sid, tmp_db)
+    assert view.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+    scaffold = view.view_payload["micro_scaffold"]
+    assert scaffold is not None
+    assert str(scaffold["stem_md"]).strip()
+    assert scaffold["question_uid"] == resp.view_payload["micro_scaffold"]["question_uid"]
+
+
+async def test_get_session_view_unknown_session_raises(tmp_db: Path) -> None:
+    with pytest.raises(ValueError, match="会话不存在"):
+        await get_session_view("no-such-session", tmp_db)
+
+
+async def test_get_session_view_failed_flags_missing_artifact(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    gate = await _concept_session(tmp_db, install_diagnosis)
+    sid = gate.session_id
+    await confirm_diagnostic_gate(sid, 2, "CONCEPT_BOTTLENECK", db_path=tmp_db)
+    await _drain(sid)
+    await submit_stage_answer(sid, STAGE1_WRONG, db_path=tmp_db)  # 先流转至二阶
+    _execute(
+        tmp_db,
+        "UPDATE diagnostic_sessions SET prewarm_status = 'FAILED', "
+        "prewarm_scaffold_uid = NULL, prewarm_variant_uid = NULL WHERE session_id = ?",
+        (sid,),
+    )
+    view = await get_session_view(sid, tmp_db)
+    assert view.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+    assert view.prewarm_status == "FAILED"
+    assert view.view_payload["micro_scaffold"] is None
+    assert view.view_payload["prewarm_failed"] is True
+
+
+async def test_retry_prewarm_failed_recovers_to_ready(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    """FAILED → 重试 → RUNNING → 预热完成 → 题干可渲染（死循环出口）。"""
+    gate = await _concept_session(tmp_db, install_diagnosis)
+    sid = gate.session_id
+    await confirm_diagnostic_gate(sid, 2, "CONCEPT_BOTTLENECK", db_path=tmp_db)
+    await _drain(sid)
+    await submit_stage_answer(sid, STAGE1_WRONG, db_path=tmp_db)  # 先流转至二阶
+    _execute(
+        tmp_db,
+        "UPDATE diagnostic_sessions SET prewarm_status = 'FAILED', "
+        "prewarm_scaffold_uid = NULL, prewarm_variant_uid = NULL WHERE session_id = ?",
+        (sid,),
+    )
+    resp = await retry_prewarm(sid, tmp_db)
+    assert resp.prewarm_status == "RUNNING"
+    await _drain(sid)
+    view = await get_session_view(sid, tmp_db)
+    assert view.prewarm_status in ("READY_SYMPY", "READY_FALLBACK")
+    assert view.view_payload["micro_scaffold"] is not None
+    assert str(view.view_payload["micro_scaffold"]["stem_md"]).strip()
+
+
+async def test_retry_prewarm_ready_is_idempotent_noop(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    gate = await _concept_session(tmp_db, install_diagnosis)
+    sid = gate.session_id
+    await confirm_diagnostic_gate(sid, 2, "CONCEPT_BOTTLENECK", db_path=tmp_db)
+    await _drain(sid)
+    sql = (
+        "SELECT prewarm_status, prewarm_scaffold_uid, prewarm_variant_uid "
+        "FROM diagnostic_sessions WHERE session_id = ?"
+    )
+    before = _one(tmp_db, sql, (sid,))
+    resp = await retry_prewarm(sid, tmp_db)
+    after = _one(tmp_db, sql, (sid,))
+    assert tuple(before) == tuple(after)
+    assert resp.prewarm_status == before["prewarm_status"]
+    assert sid not in in_flight_prewarm_tasks
+
+
+async def test_retry_prewarm_completed_rejected(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    gate = await _concept_session(tmp_db, install_diagnosis)
+    sid = gate.session_id
+    await confirm_diagnostic_gate(sid, 2, "ALREADY_MASTERED", db_path=tmp_db)
+    with pytest.raises(ValueError, match="会话已完成"):
+        await retry_prewarm(sid, tmp_db)
