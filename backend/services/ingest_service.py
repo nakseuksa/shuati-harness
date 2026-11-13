@@ -12,8 +12,12 @@ Target File #5/#8；API 签名与落库流程按 PM 契约 docs/tasks/P2-D_inges
   契约「相同 stem_hash 一律短路」与设计「补充新草稿即新建会话」冲突时以设计为准，
   故 stem_hash 相同但草稿有增量时仍新建会话）；
 - 重入库绝不触碰 mastery_state / 盲测字段 / Elo 相关数据；
-- 录入阶段不结算任何 Elo（保底/掌握结算发生在 confirm-gate，P2-E 负责），
-  本模块不写入 elo_mutation_ledger / question_escrow_pool；
+- 未掌握题录入阶段不结算 Elo（保底结算发生在 confirm-gate，P2-E 负责）；
+  已掌握题（P7-A：mastered_claim 勾选 / 作答「已掌握」类短文本 / 正确答案代数等价 /
+  initial_state='已掌握' 旧开关）在录入单事务内即结算：elo_engine.record_mastered_init
+  写 MASTERED_INIT 账本事件（水位线门控/幂等键等既有 Elo 规则不变），同事务置
+  mastery_state='MASTERED' + SESSION_COMPLETED + user_confirmed_gate=1 + 步骤全不阻断，
+  不启动预热、不进入门禁练习流；本模块不写入 question_escrow_pool；
 - 知识点节点经 knowledge_graph.match_or_create_l3_node 解析（同父 L2 邻域 AI 裁判
   复用/新建，别名扩充与满阈值自动 Compaction 由该服务负责），
   question_steps.reused_existing_node 按其返回的 reused 标记落库；
@@ -26,6 +30,7 @@ Target File #5/#8；API 签名与落库流程按 PM 契约 docs/tasks/P2-D_inges
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -37,6 +42,8 @@ from pydantic import BaseModel
 
 from backend.db.schema import get_db_connection
 from backend.observability import log_event
+from backend.sandbox.sympy_verifier import answers_equivalent
+from backend.services import elo_engine
 from backend.services.cas_store import (
     ingest_image_bytes,
     normalize_markdown_with_frontmatter,
@@ -58,6 +65,15 @@ logger = logging.getLogger(__name__)
 
 GateStatus = Literal["completed", "blocked", "untouched"]
 InitialState = Literal["错题", "已掌握"]
+
+# P7-A：「已掌握」类声明作答集合（strip 后长度 ≤12 且命中集合 → 直接判掌握）
+_MASTERED_TEXTS = frozenset({"已掌握", "我已掌握", "掌握了", "我会做"})
+
+
+def _is_mastered_text(text: str) -> bool:
+    """作答是否为「已掌握」类声明文本（strip 后长度 ≤12 且属于模块级常量集合）。"""
+    stripped = text.strip()
+    return len(stripped) <= 12 and stripped in _MASTERED_TEXTS
 
 
 class GateStepDTO(BaseModel):
@@ -82,6 +98,9 @@ class GateCardDTO(BaseModel):
     base_elo: int
     tier: str
     is_reimport: bool
+    # P7-A 录入即掌握：单事务结算标记 + record_mastered_init 账本解释条（向后兼容默认值）
+    auto_mastered: bool = False
+    mastery_explanation: str | None = None
 
 
 async def ingest_question(
@@ -92,6 +111,8 @@ async def ingest_question(
     initial_state: InitialState = "错题",
     base_dir: Path | None = None,
     db_path: Path | None = None,
+    user_answer: str = "",
+    mastered_claim: bool = False,
 ) -> GateCardDTO:
     """录入一道错题/已掌握题：CAS 归档 → 幂等检查 → 诊断 → 单事务落库 → 确认卡。
 
@@ -101,8 +122,13 @@ async def ingest_question(
     - 新题调用 ``analyze_question_and_draft`` 单次 VLM 诊断，确定性 rubric 定级，
       经 knowledge_graph AI 裁判解析知识点节点后原子写入三表；新错题同事务内
       生长跨考点标红边（record_co_error_edges，CUJ 4）；
-    - ``initial_state='已掌握'`` 时会话 error_category 强制 'ALREADY_MASTERED'
-      （mastery_state 仍为 ACTIVE，结算推迟到 confirm-gate）。
+    - 掌握判定（P7-A，诊断产出标准答案后）：``mastered_claim`` 勾选 /
+      ``initial_state='已掌握'`` / ``user_answer`` 为「已掌握」类短文本 /
+      ``user_answer`` 与标准答案代数等价（asyncio.to_thread 沙盒判定，
+      判定异常按未掌握处理并 logger.warning，绝不击穿录入）任一命中 →
+      error_category='ALREADY_MASTERED'，录入单事务内 record_mastered_init 结算，
+      返回 auto_mastered=True + mastery_explanation 账本解释条，跳过门禁练习流；
+    - 未掌握路径行为与既有完全一致；重入库幂等短路/增量逻辑不变，不重复结算。
 
     Raises:
         LLMGatewayError: VLM 诊断失败（事务回滚，无残留）。
@@ -126,6 +152,8 @@ async def ingest_question(
         stem_excerpt=normalized_md,  # 内容字段经观测层统一截断 <= 120 字符
         stem_image_count=len(stem_images),
         draft_image_count=len(draft_images),
+        mastered_claim=mastered_claim,
+        user_answer=user_answer,
     )
 
     with get_db_connection(db_path) as conn:
@@ -154,6 +182,8 @@ async def ingest_question(
             draft_uris=draft_uris,
             target_grade=target_grade,
             initial_state=initial_state,
+            user_answer=user_answer,
+            mastered_claim=mastered_claim,
         )
 
 
@@ -173,8 +203,13 @@ async def _ingest_new_question(
     draft_uris: list[str],
     target_grade: str,
     initial_state: InitialState,
+    user_answer: str,
+    mastered_claim: bool,
 ) -> GateCardDTO:
-    """新题全链路：L1/L2 树注入 → VLM 诊断 → rubric 定级 → 三表原子写入。"""
+    """新题全链路：L1/L2 树注入 → VLM 诊断 → rubric 定级 → 三表原子写入。
+
+    P7-A 掌握判定命中时，落库后同事务内 record_mastered_init 结算（录入即掌握）。
+    """
     tree = _build_l1_l2_tree(conn)
     payload = await analyze_question_and_draft(
         normalized_md, stem_images, draft_images, target_grade, tree
@@ -183,6 +218,21 @@ async def _ingest_new_question(
     alignment = payload.alignment
     if not trace.steps:
         raise ValueError("诊断 trace.steps 不能为空")
+
+    # P7-A 掌握判定：勾选 / 旧开关 / 「已掌握」类短文本 → 直接掌握；
+    # 否则非空作答走沙盒代数等价判定（to_thread 避免阻塞事件循环；
+    # 判定异常不得击穿录入 → 按未掌握处理并 warning）。
+    mastered = mastered_claim or initial_state == "已掌握" or _is_mastered_text(user_answer)
+    if not mastered and user_answer.strip():
+        try:
+            mastered = await asyncio.to_thread(
+                answers_equivalent, user_answer, trace.standard_answer_latex
+            )
+        except Exception:
+            logger.warning(
+                "答案等价判定异常，按未掌握处理: question_uid=%s", uid, exc_info=True
+            )
+            mastered = False
 
     rubric = calculate_base_elo(trace.c_score, trace.s_score, trace.t_score, trace.l_score)
     base_elo = int(rubric["base_elo"])
@@ -248,7 +298,38 @@ async def _ingest_new_question(
                 alignment.stalled_step_index,
             )
 
-    _insert_session(conn, uid, draft_uris, alignment, initial_state)
+    session_id = _insert_session(
+        conn, uid, draft_uris, alignment, initial_state, mastered=mastered
+    )
+    mastery_explanation: str | None = None
+    if mastered:
+        # 录入即结算（单事务）：参照 scaffold_engine.confirm_diagnostic_gate
+        # ALREADY_MASTERED 分支；水位线门控/幂等键等既有 Elo 规则不变。
+        result = elo_engine.record_mastered_init(conn, uid, session_id)
+        mastery_explanation = result.explanation_text
+        conn.execute(
+            "UPDATE questions SET mastery_state = 'MASTERED', "
+            "updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
+            (uid,),
+        )
+        conn.execute(
+            "UPDATE diagnostic_sessions SET micro_stage = 'SESSION_COMPLETED', "
+            "user_confirmed_gate = 1, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+            (session_id,),
+        )
+        conn.execute(
+            "UPDATE question_steps SET is_blocked_step = 0 WHERE question_uid = ?",
+            (uid,),
+        )
+        log_event(
+            logger,
+            "ingest.auto_mastered",
+            question_uid=uid,
+            session_id=session_id,
+            mastered_claim=mastered_claim,
+            initial_state=initial_state,
+            applied=result.applied,
+        )
     question = conn.execute(
         "SELECT * FROM questions WHERE question_uid = ?", (uid,)
     ).fetchone()
@@ -267,8 +348,16 @@ async def _ingest_new_question(
         base_elo=base_elo,
         tier=tier,
         is_reimport=False,
+        auto_mastered=mastered,
     )
-    return _gate_card_from_db(conn, question, session, is_reimport=False)
+    return _gate_card_from_db(
+        conn,
+        question,
+        session,
+        is_reimport=False,
+        auto_mastered=mastered,
+        mastery_explanation=mastery_explanation,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -446,14 +535,18 @@ def _insert_session(
     draft_uris: list[str],
     alignment: DraftAlignmentResult,
     initial_state: InitialState,
+    *,
+    mastered: bool = False,
 ) -> str:
     """新建诊断会话：STAGE_0_CONFIRM_GATE / prewarm IDLE / 门禁未确认。
 
-    initial_state='已掌握' 时强制 error_category='ALREADY_MASTERED'（标签置空），
-    否则取 alignment 结论。返回 session_id。
+    initial_state='已掌握' 或 P7-A 掌握判定命中（mastered）时强制
+    error_category='ALREADY_MASTERED'（标签置空），否则取 alignment 结论。
+    掌握会话的 SESSION_COMPLETED / user_confirmed_gate=1 由调用方同事务结算写入。
+    返回 session_id。
     """
     session_id = str(uuid.uuid4())
-    if initial_state == "已掌握":
+    if initial_state == "已掌握" or mastered:
         error_category = "ALREADY_MASTERED"
         trap_tag: str | None = None
     else:
@@ -522,8 +615,14 @@ def _gate_card_from_db(
     session: sqlite3.Row,
     *,
     is_reimport: bool,
+    auto_mastered: bool = False,
+    mastery_explanation: str | None = None,
 ) -> GateCardDTO:
-    """由落库行组装确认卡：steps 取 matched 分支（缺失回退 canonical）。"""
+    """由落库行组装确认卡：steps 取 matched 分支（缺失回退 canonical）。
+
+    auto_mastered（P7-A 录入即结算）时步骤全 completed、floor_preview_elo=None；
+    重入库路径不传该标记，组装行为与既有完全一致（零漂移）。
+    """
     uid = question["question_uid"]
     branch_id = session["matched_branch_id"]
     step_rows = _fetch_branch_steps(conn, uid, branch_id)
@@ -536,13 +635,17 @@ def _gate_card_from_db(
         GateStepDTO(
             step_index=row["step_index"],
             step_goal_desc=row["step_goal_desc"],
-            status=_derive_status(row["step_index"], last_valid, stalled),
+            status=(
+                "completed"
+                if auto_mastered
+                else _derive_status(row["step_index"], last_valid, stalled)
+            ),
             sub_elo=row["sub_elo"],
         )
         for row in step_rows
     ]
     floor_preview: int | None = None
-    if last_valid >= 1:
+    if not auto_mastered and last_valid >= 1:
         floor_preview = next((s.sub_elo for s in steps if s.step_index == last_valid), None)
 
     return GateCardDTO(
@@ -555,4 +658,6 @@ def _gate_card_from_db(
         base_elo=question["base_elo"],
         tier=question["tier"],
         is_reimport=is_reimport,
+        auto_mastered=auto_mastered,
+        mastery_explanation=mastery_explanation,
     )

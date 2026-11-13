@@ -146,10 +146,16 @@ async def _ingest(
     *,
     initial_state: str | None = None,
     with_images: bool = False,
+    user_answer: str | None = None,
+    mastered_claim: bool | None = None,
 ) -> dict[str, Any]:
     data: dict[str, str] = {"stem_md": stem_md, "target_grade": GRADE}
     if initial_state is not None:
         data["initial_state"] = initial_state
+    if user_answer is not None:
+        data["user_answer"] = user_answer
+    if mastered_claim is not None:
+        data["mastered_claim"] = "true" if mastered_claim else "false"
     files = []
     if with_images:
         files = [
@@ -393,13 +399,23 @@ async def test_confirm_gate_trap_branch_direct_stage4(
 
 
 async def test_confirm_gate_mastered_branch(client: AsyncClient, install_diagnosis: Any) -> None:
+    """P7-A：initial_state='已掌握' 录入即结算；已 auto_mastered 会话不可重复确认（400）。"""
     install_diagnosis(_payload("ALREADY_MASTERED"))
     card = await _ingest(client, initial_state="已掌握")
-    resp = await _confirm(client, card["session_id"], "ALREADY_MASTERED")
-    assert resp["micro_stage"] == "SESSION_COMPLETED"
-    assert resp["mastery_state"] == "MASTERED"
-    assert resp["explanation_text"] and "已掌握" in resp["explanation_text"]
+    assert card["auto_mastered"] is True
+    assert card["mastery_explanation"] and "已掌握" in card["mastery_explanation"]
+    assert card["error_category"] == "ALREADY_MASTERED"
+    assert card["floor_preview_elo"] is None
+    assert _one("SELECT mastery_state FROM questions")["mastery_state"] == "MASTERED"
+    sess = _one("SELECT * FROM diagnostic_sessions")
+    assert sess["micro_stage"] == "SESSION_COMPLETED"
+    assert sess["user_confirmed_gate"] == 1
     assert _one("SELECT COUNT(*) AS n FROM elo_mutation_ledger")["n"] == 1
+    resp = await client.post(
+        f"/api/v1/sessions/{card['session_id']}/confirm-gate",
+        json={"stalled_step_index": 2, "error_category": "ALREADY_MASTERED"},
+    )
+    assert resp.status_code == 400  # 门禁已确认/会话已流转，不可重复确认
 
 
 async def test_confirm_gate_unknown_session_404(client: AsyncClient) -> None:
@@ -974,3 +990,65 @@ async def test_stage2_no_idea_descends_via_api(client: AsyncClient) -> None:
     assert resp["view_payload"]["micro_scaffold"]["question_uid"] != l0
     assert resp["view_payload"]["scaffold_depth"] == 1
     assert resp["view_payload"].get("notice")
+
+
+# ---------------------------------------------------------------------------
+# P7-A：录入答题区 multipart 新字段（user_answer / mastered_claim）
+# ---------------------------------------------------------------------------
+
+
+async def test_ingest_multipart_mastered_claim(client: AsyncClient) -> None:
+    """勾选「已掌握」（Form bool "true"）→ auto_mastered + 录入即结算。"""
+    card = await _ingest(client, mastered_claim=True)
+    assert card["auto_mastered"] is True
+    assert card["mastery_explanation"] and "已掌握" in card["mastery_explanation"]
+    assert card["error_category"] == "ALREADY_MASTERED"
+    assert card["floor_preview_elo"] is None
+    assert _one("SELECT mastery_state FROM questions")["mastery_state"] == "MASTERED"
+    sess = _one("SELECT * FROM diagnostic_sessions")
+    assert sess["micro_stage"] == "SESSION_COMPLETED"
+    assert sess["user_confirmed_gate"] == 1
+    assert (
+        _one(
+            "SELECT COUNT(*) AS n FROM elo_mutation_ledger "
+            "WHERE mutation_trigger='MASTERED_INIT'"
+        )["n"]
+        == 1
+    )
+    steps = _query("SELECT is_blocked_step FROM question_steps")
+    assert steps and all(s["is_blocked_step"] == 0 for s in steps)
+
+
+@pytest.mark.parametrize("answer", ["已掌握", "20"])
+async def test_ingest_multipart_user_answer_auto_mastered(
+    client: AsyncClient, answer: str
+) -> None:
+    """声明文本 / 正确答案（Mock 标准答案 v_{max}=20 m/s）→ auto_mastered。"""
+    card = await _ingest(client, user_answer=answer)
+    assert card["auto_mastered"] is True
+    assert card["mastery_explanation"] and "已掌握" in card["mastery_explanation"]
+    assert _one("SELECT mastery_state FROM questions")["mastery_state"] == "MASTERED"
+    assert _one("SELECT COUNT(*) AS n FROM elo_mutation_ledger")["n"] == 1
+
+
+async def test_ingest_multipart_wrong_answer_structure_unchanged(client: AsyncClient) -> None:
+    """错误答案 → 未掌握响应结构不变：auto_mastered=False + 默认门禁流程。"""
+    card = await _ingest(client, user_answer="x=999")
+    assert card["auto_mastered"] is False
+    assert card["mastery_explanation"] is None
+    assert card["error_category"] == "CONCEPT_BOTTLENECK"  # autouse 默认诊断
+    assert card["is_reimport"] is False
+    assert _one("SELECT mastery_state FROM questions")["mastery_state"] == "ACTIVE"
+    sess = _one("SELECT * FROM diagnostic_sessions")
+    assert sess["micro_stage"] == "STAGE_0_CONFIRM_GATE"
+    assert sess["user_confirmed_gate"] == 0
+    assert _one("SELECT COUNT(*) AS n FROM elo_mutation_ledger")["n"] == 0
+
+
+async def test_ingest_multipart_mastered_claim_false_string(client: AsyncClient) -> None:
+    """Form(bool) 接受 "false" → 未掌握默认流程零漂移。"""
+    card = await _ingest(client, mastered_claim=False)
+    assert card["auto_mastered"] is False
+    assert card["mastery_explanation"] is None
+    assert _one("SELECT mastery_state FROM questions")["mastery_state"] == "ACTIVE"
+    assert _one("SELECT COUNT(*) AS n FROM elo_mutation_ledger")["n"] == 0

@@ -211,7 +211,11 @@ async def _reach_stage4(db_path: Path, sid: str) -> SessionStepResponse:
 async def test_confirm_mastered_archives_and_settles_once(
     tmp_db: Path, install_diagnosis: Any
 ) -> None:
-    card = await _ingest(tmp_db, install_diagnosis, initial_state="已掌握")
+    # P7-A：initial_state='已掌握' 已改为录入即结算；门禁 ALREADY_MASTERED 分支
+    # 仍可达的前置构造：VLM 诊断判 ALREADY_MASTERED 但 initial_state=错题（默认）。
+    card = await _ingest(tmp_db, install_diagnosis, _payload("ALREADY_MASTERED"))
+    assert card.auto_mastered is False  # 录入未结算，结算仍发生在门禁
+    assert _ledger_events(tmp_db, "MASTERED_INIT") == []
     resp = await confirm_diagnostic_gate(card.session_id, 2, "ALREADY_MASTERED", db_path=tmp_db)
     assert resp.micro_stage == "SESSION_COMPLETED"
     assert resp.mastery_state == "MASTERED"

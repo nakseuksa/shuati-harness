@@ -77,8 +77,8 @@ const state = {
   tab: 'ingest',
   marked: null,
   // 录入
-  initialState: '错题',
   previewOn: false,
+  lastMastered: null,    // P7-B：已掌握成功卡对应的 GateCardDTO（marked 就绪后重渲染）
   slots: { stem: [], draft: [] },
   lastSlot: null,
   // 门禁
@@ -487,14 +487,30 @@ async function submitIngest(btn) {
     errEl.hidden = false;
     return;
   }
+  const userAnswer = $('#ingest-answer').value.trim();
+  const masteredClaim = $('#mastered-check').checked;
   const form = new FormData();
   form.append('stem_md', stemMd);
   form.append('target_grade', grade);
-  form.append('initial_state', state.initialState);
+  // P7-B：initial_state 恒为「错题」，掌握语义统一由 mastered_claim 承载（旧开关已移除）
+  form.append('initial_state', '错题');
+  form.append('user_answer', userAnswer);
+  form.append('mastered_claim', masteredClaim ? 'true' : 'false');
   for (const f of state.slots.stem) form.append('stem_images', f.file, f.file.name || 'stem.png');
   for (const f of state.slots.draft) form.append('draft_images', f.file, f.file.name || 'draft.png');
   await runTask(btn, async () => {
     const dto = await apiFetch(`${API}/questions/ingest`, { method: 'POST', form });
+    // P7-B：auto_mastered=true → 已掌握成功卡（不渲染门禁、不切训练页签、不写 LS_SESSION）
+    if (dto && dto.auto_mastered === true) {
+      state.gate = null;
+      state.gateConfirmed = false;
+      state.lastMastered = dto;
+      renderMasteredCard(dto);
+      toast('✅ 已掌握入库：知识点已提取，Elo 水位线已结算', 'ok');
+      $('#gate-slot').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      return;
+    }
+    state.lastMastered = null;
     state.gate = dto;
     state.gateConfirmed = false;
     const blocked = (dto.steps || []).find((s) => s.status === 'blocked');
@@ -504,6 +520,92 @@ async function submitIngest(btn) {
     toast(dto.is_reimport ? '♻️ 幂等重入库：历史盲测进度与 Elo 账本已保留' : '入库成功，请核对步骤对齐确认卡', 'ok');
     $('#gate-slot').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
+}
+
+/* ---------------- P7-B：已掌握成功卡 / 作答区互斥 / 表单清空 ---------------- */
+function renderMasteredCard(dto) {
+  const slot = $('#gate-slot');
+  const g = dto || {};
+  const explanation = g.mastery_explanation;
+  slot.innerHTML = `
+  <div class="card mastered-card" role="status" aria-live="polite">
+    <div class="mastered-hero">
+      <div class="mastered-seal" aria-hidden="true">✅</div>
+      <div class="mastered-head">
+        <h2 class="mastered-title">已掌握入库</h2>
+        <p class="mastered-sub">跳过脚手架练习 · 知识点已提取 · Elo 水位线已结算，归档为 🟢MASTERED</p>
+      </div>
+    </div>
+    <div class="gate-meta">
+      <span class="badge badge-blue">🎚️ 基础难度 ${esc(g.base_elo)}</span>
+      <span class="badge badge-gray">${esc(g.tier)}</span>
+      <span class="badge badge-green">🟢 MASTERED 已掌握</span>
+      ${g.is_reimport ? '<span class="badge badge-blue">♻️ 幂等重入库</span>' : ''}
+      <span class="badge badge-gray mono" style="font-size:11px">uid ${esc(shortUid(g.question_uid))}</span>
+    </div>
+    ${explanation
+      ? explainBarHtml(explanation)
+      : '<div class="gate-floor" style="background:var(--ok-bg);border-color:color-mix(in srgb,var(--ok) 35%,transparent)">🟢 已按「已掌握」直接归档结算（水位线门控），不进入脚手架训练。</div>'}
+    <div class="btn-row" style="margin-top:14px">
+      <button class="btn btn-primary btn-lg" type="button" data-action="mastered-next">📥 继续录入下一题</button>
+      <span class="field-help">清空表单，立即录入下一道题</span>
+    </div>
+  </div>`;
+}
+
+/** 勾选「已掌握」↔ 禁用置灰答案输入（语义互斥）；取消勾选恢复。 */
+function syncMasteredCheck() {
+  const chk = $('#mastered-check');
+  const ans = $('#ingest-answer');
+  if (!chk || !ans) return;
+  const on = chk.checked;
+  ans.disabled = on;
+  const zone = $('#ingest-answer-zone');
+  if (zone) zone.classList.toggle('mastered-on', on);
+  const label = chk.closest('.mastered-check');
+  if (label) label.classList.toggle('is-checked', on);
+  const hint = $('#mastered-hint');
+  if (hint) {
+    hint.textContent = on
+      ? '已勾选「已掌握」：答案输入已禁用（二者互斥），提交后直接入库并提取知识点。'
+      : '勾选后答案输入将禁用（二者互斥）；未勾选时按你填写的答案判定是否掌握。';
+  }
+}
+
+/** 「继续录入下一题」：清空表单 + 图片槽 + 预览，复位门禁槽为空态。不触碰训练会话 / LS_SESSION。 */
+function resetIngestForm() {
+  const stem = $('#stem-input');
+  if (stem) stem.value = '';
+  const count = $('#stem-count');
+  if (count) count.textContent = '0 字';
+  state.previewOn = false;
+  const pv = $('#stem-preview');
+  if (pv) { pv.hidden = true; pv.innerHTML = ''; }
+  const ans = $('#ingest-answer');
+  if (ans) ans.value = '';
+  const chk = $('#mastered-check');
+  if (chk) chk.checked = false;
+  syncMasteredCheck();
+  const grade = $('#grade-input');
+  if (grade) grade.value = grade.defaultValue;
+  for (const key of ['stem', 'draft']) {
+    for (const f of state.slots[key]) URL.revokeObjectURL(f.url);
+    state.slots[key] = [];
+    renderSlotThumbs(key);
+  }
+  const errEl = $('#ingest-error');
+  if (errEl) errEl.hidden = true;
+  state.gate = null;
+  state.gateConfirmed = false;
+  state.lastMastered = null;
+  $('#gate-slot').innerHTML = `
+    <div class="card empty-state">
+      <div class="big" aria-hidden="true">🧭</div>
+      <h3>步骤对齐微确认条</h3>
+      <p>提交入库后，这里会展示 VLM 拆解的解题步骤骨架与卡点归因。核对无误后按 <kbd>Enter</kbd> 一键确认，才会进入训练流。</p>
+    </div>`;
+  if (stem) stem.focus();
+  toast('表单已清空，可录入下一题', 'info', 2200);
 }
 
 /* ---------------- 步骤对齐微确认条（GateCardDTO） ---------------- */
@@ -1679,11 +1781,7 @@ function onDocumentClick(e) {
     case 'goto-ingest': switchTab('ingest'); break;
     case 'goto-training': switchTab('training'); break;
     case 'toggle-preview': togglePreview(); break;
-    case 'set-initial-state': {
-      state.initialState = el.dataset.value;
-      $$('#initial-state-seg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.value === state.initialState)));
-      break;
-    }
+    case 'mastered-next': resetIngestForm(); break;
     case 'thumb-remove': removeSlotFile(el.dataset.slot, el.dataset.id); break;
     case 'thumb-zoom': openLightbox(el.dataset.url); break;
     case 'gate-pick-step': {
@@ -1751,6 +1849,7 @@ function bindStaticEvents() {
     submitIngest($('#ingest-submit'));
   });
   $('#stem-input').addEventListener('input', onStemInput);
+  $('#mastered-check').addEventListener('change', syncMasteredCheck);
 
   const dateInput = $('#drill-date');
   dateInput.value = state.drill.date;
@@ -1811,6 +1910,7 @@ function init() {
   setupSlot('stem');
   setupSlot('draft');
   bindStaticEvents();
+  syncMasteredCheck();
   renderResumeBanner();
   renderTraining();
   loadMarked().then(() => {
@@ -1819,6 +1919,7 @@ function init() {
       const v = $('#stem-input').value;
       if (v) mountRich($('#stem-preview'), v);
     }
+    if (state.lastMastered) renderMasteredCard(state.lastMastered);
     if (state.gate) renderGate();
     if (state.tab === 'training') renderTraining();
     if (state.tab === 'drill' && state.drill.loaded) renderDrill();

@@ -8,8 +8,10 @@ docs/designs/adaptive_practice_harness.md CUJ 1、§3.1 第 1/4 条。
 默认保守判未命中（新建）；复用场景用 monkeypatch MOCK_RESPONSES['node_judge'] 构造。
 """
 
+import asyncio
 import copy
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -97,6 +99,8 @@ async def _ingest(
     draft_images: list[Path] | None = None,
     initial_state: str = "错题",
     base_dir: Path | None = None,
+    user_answer: str = "",
+    mastered_claim: bool = False,
 ) -> GateCardDTO:
     return await ingest_question(
         stem_md,
@@ -106,6 +110,8 @@ async def _ingest(
         initial_state=initial_state,  # type: ignore[arg-type]
         base_dir=base_dir,
         db_path=db_path,
+        user_answer=user_answer,
+        mastered_claim=mastered_claim,
     )
 
 
@@ -496,17 +502,12 @@ async def test_reimport_same_drafts_no_new_session(
 async def test_already_mastered_initial_state(
     tmp_db: Path, cas_dir: Path, draft_image: Path
 ) -> None:
+    """P7-A：initial_state='已掌握'（旧开关）统一走录入即结算 auto_mastered。"""
     card = await _ingest(tmp_db, draft_images=[draft_image], initial_state="已掌握")
+    _assert_auto_mastered(tmp_db, card)
     sess = _query(tmp_db, "SELECT * FROM diagnostic_sessions")[0]
-    assert sess["error_category"] == "ALREADY_MASTERED"
     assert sess["trap_taxonomy_tag"] is None
-    assert card.error_category == "ALREADY_MASTERED"
     assert card.trap_taxonomy_tag is None
-    # 掌握结算发生在 confirm-gate（P2-E）：录入阶段 mastery 仍 ACTIVE、Elo 零写入
-    q = _query(tmp_db, "SELECT * FROM questions")[0]
-    assert q["mastery_state"] == "ACTIVE"
-    assert _count(tmp_db, "elo_mutation_ledger") == 0
-    assert _count(tmp_db, "question_escrow_pool") == 0
 
 
 async def test_alt_branch_steps_persisted(
@@ -846,3 +847,231 @@ async def test_second_multi_node_question_increments_shared_edges(
         assert json.loads(e["source_question_uids_json"]) == [
             first.question_uid, second.question_uid
         ]
+
+
+# ---------------------------------------------------------------------------
+# P7-A：录入答题区与掌握判定（勾选/声明文本/正确答案 → 录入单事务即结算）
+# ---------------------------------------------------------------------------
+
+
+def _assert_auto_mastered(db_path: Path, card: GateCardDTO) -> None:
+    """录入即结算全量断言：卡标记 + 三表状态 + MASTERED_INIT 账本 + 步骤全不阻断。"""
+    assert card.auto_mastered is True
+    assert card.mastery_explanation and "已掌握" in card.mastery_explanation
+    assert card.error_category == "ALREADY_MASTERED"
+    assert card.trap_taxonomy_tag is None
+    assert card.floor_preview_elo is None
+    assert card.steps and [s.status for s in card.steps] == ["completed"] * len(card.steps)
+
+    q = _query(db_path, "SELECT * FROM questions")[0]
+    assert q["mastery_state"] == "MASTERED"
+    sess = _query(db_path, "SELECT * FROM diagnostic_sessions")[0]
+    assert sess["session_id"] == card.session_id
+    assert sess["micro_stage"] == "SESSION_COMPLETED"
+    assert sess["user_confirmed_gate"] == 1
+    assert sess["prewarm_status"] == "IDLE"  # 不启动预热
+    assert sess["error_category"] == "ALREADY_MASTERED"
+    steps = _query(db_path, "SELECT * FROM question_steps")
+    assert steps and all(s["is_blocked_step"] == 0 for s in steps)
+
+    events = _query(
+        db_path, "SELECT * FROM elo_mutation_ledger WHERE mutation_trigger='MASTERED_INIT'"
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event["idempotency_key"] == f"{card.question_uid}:{card.session_id}:MASTERED_INIT"
+    assert event["question_uid"] == card.question_uid
+    assert event["combat_elo_after"] > event["combat_elo_before"]
+    assert event["coverage_elo_after"] >= event["combat_elo_after"]
+    assert event["explanation_text"] == card.mastery_explanation
+    assert _count(db_path, "question_escrow_pool") == 0
+
+
+async def test_mastered_claim_auto_settles_on_ingest(
+    tmp_db: Path, cas_dir: Path, draft_image: Path
+) -> None:
+    """勾选「已掌握」→ 直接入库 + 提取知识点 + Elo 结算，跳过练习流程。"""
+    card = await _ingest(tmp_db, draft_images=[draft_image], mastered_claim=True)
+    _assert_auto_mastered(tmp_db, card)
+    assert _count(tmp_db, "knowledge_nodes") == 3  # 知识点照常提取
+    assert _edges(tmp_db) == []  # 掌握题不生长跨考点标红边
+    assert _count(tmp_db, "questions") == 1
+    assert _count(tmp_db, "diagnostic_sessions") == 1
+
+
+@pytest.mark.parametrize("answer", ["已掌握", "我已掌握", "掌握了", "我会做", "  已掌握  "])
+async def test_mastered_text_answer_auto_settles(
+    tmp_db: Path, cas_dir: Path, answer: str
+) -> None:
+    """回答「已掌握」类声明文本（含首尾 whitespace）→ 录入即结算。"""
+    card = await _ingest(tmp_db, user_answer=answer)
+    _assert_auto_mastered(tmp_db, card)
+
+
+@pytest.mark.parametrize("answer", ["20", "vmax = 20"])
+async def test_correct_answer_auto_mastered(tmp_db: Path, cas_dir: Path, answer: str) -> None:
+    """填入正确答案（Mock 标准答案 v_{max}=20 m/s，现有引擎等价能力）→ 录入即结算。"""
+    card = await _ingest(tmp_db, user_answer=answer)
+    _assert_auto_mastered(tmp_db, card)
+
+
+async def test_wrong_answer_keeps_default_flow(tmp_db: Path, cas_dir: Path) -> None:
+    """错误答案不改变默认流程：ACTIVE + 需门禁 + 无草稿默认 CONCEPT_BOTTLENECK。"""
+    card = await _ingest(tmp_db, user_answer="x=999")
+    assert card.auto_mastered is False
+    assert card.mastery_explanation is None
+    assert card.error_category == "CONCEPT_BOTTLENECK"
+    assert card.floor_preview_elo is None
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["mastery_state"] == "ACTIVE"
+    sess = _query(tmp_db, "SELECT * FROM diagnostic_sessions")[0]
+    assert sess["micro_stage"] == "STAGE_0_CONFIRM_GATE"
+    assert sess["user_confirmed_gate"] == 0
+    steps = _query(tmp_db, "SELECT * FROM question_steps ORDER BY step_index")
+    assert [s["is_blocked_step"] for s in steps] == [1, 1, 1]
+    assert _count(tmp_db, "elo_mutation_ledger") == 0
+
+
+@pytest.mark.parametrize("answer", ["", "   "])
+async def test_empty_answer_no_draft_zero_drift(
+    tmp_db: Path, cas_dir: Path, answer: str
+) -> None:
+    """空答案无草稿 → 默认行为零漂移（回归）。"""
+    card = await _ingest(tmp_db, user_answer=answer)
+    assert card.auto_mastered is False
+    assert card.mastery_explanation is None
+    assert card.error_category == "CONCEPT_BOTTLENECK"
+    assert [s.status for s in card.steps] == ["blocked", "untouched", "untouched"]
+    assert card.floor_preview_elo is None
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["mastery_state"] == "ACTIVE"
+    sess = _query(tmp_db, "SELECT * FROM diagnostic_sessions")[0]
+    assert sess["micro_stage"] == "STAGE_0_CONFIRM_GATE"
+    assert sess["user_confirmed_gate"] == 0
+    assert _count(tmp_db, "elo_mutation_ledger") == 0
+
+
+async def test_reimport_mastered_no_double_settlement(
+    tmp_db: Path, cas_dir: Path, draft_image: Path
+) -> None:
+    """重入库：同内容二次 ingest（即使再次勾选）不重复结算，账本事件数不变。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image], mastered_claim=True)
+    _assert_auto_mastered(tmp_db, first)
+    tables = (
+        "questions",
+        "question_steps",
+        "diagnostic_sessions",
+        "elo_mutation_ledger",
+        "knowledge_nodes",
+    )
+    counts = {t: _count(tmp_db, t) for t in tables}
+    second = await _ingest(tmp_db, draft_images=[draft_image], mastered_claim=True)
+    assert second.is_reimport is True
+    assert second.session_id == first.session_id
+    assert second.question_uid == first.question_uid
+    for table, n in counts.items():
+        assert _count(tmp_db, table) == n  # 不新增任何行，不重复结算
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["mastery_state"] == "MASTERED"
+
+
+async def test_equivalence_failure_does_not_break_ingest(
+    tmp_db: Path, cas_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """等价判定异常不得击穿录入：捕获 → 按未掌握处理 + logger.warning。"""
+
+    def boom(user_answer: str, standard: str) -> bool:
+        raise RuntimeError("沙盒判定故障")
+
+    monkeypatch.setattr(ingest_service, "answers_equivalent", boom)
+    with caplog.at_level(logging.WARNING, logger="backend.services.ingest_service"):
+        card = await _ingest(tmp_db, user_answer="20")
+    assert card.auto_mastered is False
+    assert card.mastery_explanation is None
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["mastery_state"] == "ACTIVE"
+    assert _count(tmp_db, "elo_mutation_ledger") == 0
+    assert any(
+        r.levelno == logging.WARNING and "答案等价判定异常" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_equivalence_check_runs_in_thread(
+    tmp_db: Path, cas_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """等价判定必须经 asyncio.to_thread（沙盒子进程阻塞不得卡事件循环）。"""
+    real_to_thread = asyncio.to_thread
+    calls: list[tuple[Any, ...]] = []
+
+    async def spy(func: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append((func, *args))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(ingest_service.asyncio, "to_thread", spy)
+    card = await _ingest(tmp_db, user_answer="20")
+    assert card.auto_mastered is True
+    assert len(calls) == 1
+    assert calls[0][0] is ingest_service.answers_equivalent
+    assert calls[0][1] == "20"
+
+
+async def test_mastered_claim_short_circuits_equivalence(
+    tmp_db: Path, cas_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """勾选优先：即使答案错误也直接掌握，不再调用等价判定。"""
+    calls: list[Any] = []
+
+    async def spy(func: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(func)
+        raise AssertionError("勾选命中时不应调用等价判定")
+
+    monkeypatch.setattr(ingest_service.asyncio, "to_thread", spy)
+    card = await _ingest(tmp_db, user_answer="x=999", mastered_claim=True)
+    assert card.auto_mastered is True
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("已掌握", True),
+        (" 我已掌握 ", True),
+        ("掌握了", True),
+        ("我会做", True),
+        ("", False),
+        ("已掌握了吗", False),
+        ("这道题我已经完全掌握了", False),
+        ("x=20", False),
+    ],
+)
+def test_is_mastered_text_boundaries(text: str, expected: bool) -> None:
+    assert ingest_service._is_mastered_text(text) is expected
+
+
+async def test_auto_mastered_observability_events(
+    tmp_db: Path, cas_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """观测：ingest.auto_mastered 标记事件 + record_mastered_init 内部 elo.event 埋点。"""
+    with caplog.at_level(logging.INFO):
+        card = await _ingest(tmp_db, mastered_claim=True)
+    auto = [
+        r for r in caplog.records if getattr(r, "event", None) == "ingest.auto_mastered"
+    ]
+    assert len(auto) == 1
+    fields = getattr(auto[0], "fields", {})
+    assert fields["question_uid"] == card.question_uid
+    assert fields["session_id"] == card.session_id
+    assert fields["mastered_claim"] is True
+    assert fields["applied"] is True
+    elo = [
+        r
+        for r in caplog.records
+        if getattr(r, "event", None) == "elo.event"
+        and getattr(r, "fields", {}).get("trigger") == "MASTERED_INIT"
+    ]
+    assert len(elo) == 1
+    persisted = [
+        r for r in caplog.records if getattr(r, "event", None) == "ingest.persisted"
+    ]
+    assert persisted and getattr(persisted[0], "fields", {})["auto_mastered"] is True

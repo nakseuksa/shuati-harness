@@ -73,6 +73,21 @@
             </div>
             <div class="preview-box" id="stem-preview" hidden style="margin-top:8px"></div>
 
+            <!-- P7-B 作答区：题干文本正下方、双槽上传区之前；可选文字答案 + 已掌握声明（语义互斥，默认展开） -->
+            <div class="ingest-answer" id="ingest-answer-zone">
+              <div class="card-title">✍️ 你的作答
+                <span class="hint">可选 · 填对答案或勾选「已掌握」→ 跳过练习直接入库</span>
+              </div>
+              <label class="field-label" for="ingest-answer">答案文本</label>
+              <textarea id="ingest-answer" rows="3"
+                placeholder="在此输入你的答案（可选）。填入正确答案或勾选下方选项，将按已掌握直接入库。"></textarea>
+              <label class="mastered-check" for="mastered-check">
+                <input type="checkbox" id="mastered-check" />
+                <span class="mastered-text">✅ 已掌握此题（跳过练习，直接入库并提取知识点）</span>
+              </label>
+              <div class="field-help" id="mastered-hint">勾选后答案输入将禁用（二者互斥）；未勾选时按你填写的答案判定是否掌握。</div>
+            </div>
+
             <div class="card-title" style="margin-top:16px">🖼️ 双槽分区上传
               <span class="hint">两槽严格隔离，严禁混槽 · 点击槽位后 Ctrl/⌘+V 粘贴，或拖拽 / 点击选择图片</span>
             </div>
@@ -98,13 +113,6 @@
                 <label class="field-label" for="grade-input">target_grade（学段学科）</label>
                 <input type="text" id="grade-input" value="高中物理-高二"
                        placeholder="如：高中物理-高二 / 高中数学-高三" />
-              </div>
-              <div>
-                <label class="field-label" id="initial-state-label">初始状态</label>
-                <div class="seg" role="group" aria-labelledby="initial-state-label" id="initial-state-seg">
-                  <button type="button" data-action="set-initial-state" data-value="错题" aria-pressed="true">🔴 错题</button>
-                  <button type="button" data-action="set-initial-state" data-value="已掌握" aria-pressed="false">🟢 已掌握</button>
-                </div>
               </div>
             </div>
 

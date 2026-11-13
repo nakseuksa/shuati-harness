@@ -776,7 +776,11 @@ async def test_ascent_step_event(
 async def test_gate_mastered_elo_event(
     tmp_db: Path, caplog: pytest.LogCaptureFixture, install_diagnosis: Any
 ) -> None:
-    card = await _ingest(tmp_db, install_diagnosis, initial_state="已掌握")
+    # P7-A：initial_state='已掌握' 已改为录入即结算；门禁分支仍可达的前置构造：
+    # VLM 诊断判 ALREADY_MASTERED 但 initial_state=错题（obs _ingest 固定 CONCEPT，故直构）。
+    install_diagnosis(_payload("ALREADY_MASTERED"))
+    card = await ingest_question(STEM_MD, [], [], GRADE, initial_state="错题", db_path=tmp_db)
+    assert card.auto_mastered is False
     caplog.clear()
     await confirm_diagnostic_gate(card.session_id, 1, "ALREADY_MASTERED", db_path=tmp_db)
     gate = _f(_one(caplog, "gate.confirmed"))

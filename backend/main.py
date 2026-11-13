@@ -512,6 +512,8 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
         stem_md: Annotated[str, Form()],
         target_grade: Annotated[str, Form()],
         initial_state: Annotated[InitialState, Form()] = "错题",
+        user_answer: Annotated[str, Form()] = "",
+        mastered_claim: Annotated[bool, Form()] = False,
         stem_images: Annotated[list[UploadFile] | None, File()] = None,
         draft_images: Annotated[list[UploadFile] | None, File()] = None,
     ) -> GateCardDTO:
@@ -526,6 +528,8 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
                 target_grade,
                 initial_state=initial_state,
                 base_dir=tmp_dir,
+                user_answer=user_answer,
+                mastered_claim=mastered_claim,
             )
 
     # ---- CUJ 1/2：门禁确认三分支 + 微观状态机作答 ----

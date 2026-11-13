@@ -1244,3 +1244,84 @@ footer.site-foot {
 .worked-example h4 { margin: 0 0 8px; font-size: 13.5px; color: var(--green); }
 .worked-example .rich { font-size: 15px; }
 @media (prefers-reduced-motion: reduce) { .notice-bar { animation: none; } }
+
+/* ================================================================
+ * P7-B · 录入作答区 + 已掌握成功卡
+ * 主题语言延续：稿纸网格 × 墨蓝 × 批改朱红；掌握态用酸绿
+ * 动效克制：仅成功卡入场 + 勾选态过渡（prefers-reduced-motion 全局降级）
+ * ================================================================ */
+.ingest-answer {
+  margin-top: 16px;
+  padding: 13px 15px;
+  border: 1px solid color-mix(in srgb, var(--electric) 30%, transparent);
+  border-left: 5px solid var(--electric);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--info-bg) 55%, var(--surface));
+  transition: border-color 0.2s, background 0.2s;
+}
+.ingest-answer.mastered-on {
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+  border-left-color: var(--ok);
+  background: color-mix(in srgb, var(--ok-bg) 55%, var(--surface));
+}
+.ingest-answer .card-title { margin-bottom: 8px; font-size: 14.5px; }
+.ingest-answer textarea { min-height: 84px; }
+.ingest-answer textarea:disabled {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink-faint);
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+.mastered-check {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 10px; padding: 10px 12px;
+  border: 1px solid var(--line-strong); border-radius: 10px;
+  background: var(--surface); cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.mastered-check:hover { border-color: var(--ok); }
+.mastered-check input[type="checkbox"] {
+  width: 18px; height: 18px; flex: none; margin: 0;
+  accent-color: var(--ok); cursor: pointer;
+}
+.mastered-check input[type="checkbox"]:focus-visible { outline: 2px solid var(--electric); outline-offset: 2px; }
+.mastered-check .mastered-text { font-size: 13.5px; font-weight: 600; line-height: 1.5; }
+.mastered-check.is-checked {
+  border-color: color-mix(in srgb, var(--ok) 55%, transparent);
+  background: var(--ok-bg);
+}
+.mastered-check.is-checked .mastered-text { color: var(--ok); }
+
+.mastered-card {
+  position: relative; overflow: hidden;
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+  animation: mastered-in 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.mastered-card::before {
+  content: ""; position: absolute; inset: 0 auto 0 0; width: 5px;
+  background: linear-gradient(180deg, var(--ok), var(--green));
+}
+@keyframes mastered-in {
+  from { opacity: 0; transform: translateY(12px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+.mastered-hero { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+.mastered-seal {
+  flex: none; width: 52px; height: 52px; border-radius: 14px;
+  display: grid; place-items: center; font-size: 28px;
+  background: var(--ok-bg);
+  border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+  box-shadow: var(--shadow);
+  animation: seal-pop 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+@keyframes seal-pop {
+  0% { transform: scale(0.6); opacity: 0; }
+  60% { transform: scale(1.06); }
+  100% { transform: scale(1); opacity: 1; }
+}
+.mastered-title { font-family: var(--font-display); font-size: 21px; color: var(--ok); margin: 0 0 2px; }
+.mastered-sub { margin: 0; font-size: 13px; color: var(--ink-soft); }
+@media (prefers-reduced-motion: reduce) {
+  .mastered-card, .mastered-seal { animation: none; }
+}
