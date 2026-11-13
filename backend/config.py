@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     SQLITE_PATH: Path = Path("./data/harness.db")
     CAS_ASSETS_DIR: Path = Path("./data/assets")
     CAS_MAX_IMAGE_SIDE: int = 1536
+    MAX_UPLOAD_IMAGE_BYTES: int = 20 * 1024 * 1024
 
     # ---- 受限沙盒配额 ----
     SYMPY_TIMEOUT_SECONDS: float = 5.0

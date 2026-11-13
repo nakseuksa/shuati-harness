@@ -1052,3 +1052,66 @@ async def test_ingest_multipart_mastered_claim_false_string(client: AsyncClient)
     assert card["mastery_explanation"] is None
     assert _one("SELECT mastery_state FROM questions")["mastery_state"] == "ACTIVE"
     assert _one("SELECT COUNT(*) AS n FROM elo_mutation_ledger")["n"] == 0
+
+
+async def test_retry_prewarm_force_swap_and_completed_escrow_route(client: AsyncClient) -> None:
+    """POST /retry-prewarm?force=true 重生变式且 SESSION_COMPLETED 回传 escrow_combat_delta。"""
+    card = await _ingest(client)
+    sid = card["session_id"]
+    await _confirm(client, sid, "CONCEPT_BOTTLENECK")
+    for task in list(scaffold_engine.in_flight_prewarm_tasks.values()):
+        await task
+    before = (await client.get(f"/api/v1/sessions/{sid}")).json()
+    assert before["prewarm_status"] == "READY_SYMPY"
+
+    r_force = await client.post(f"/api/v1/sessions/{sid}/retry-prewarm?force=true")
+    assert r_force.status_code == 200
+    assert r_force.json()["prewarm_status"] == "RUNNING"
+    for task in list(scaffold_engine.in_flight_prewarm_tasks.values()):
+        await task
+
+    await _submit(client, sid, STAGE1_WRONG)
+    await _submit(client, sid, "x = 5")
+    await _submit(client, sid, STAGE3_CORRECT)
+    done = await _submit(client, sid, STAGE4_CORE_EQUATION)
+    assert done["micro_stage"] == "SESSION_COMPLETED"
+    assert float(done["view_payload"]["escrow_combat_delta"]) > 0
+
+
+async def test_ingest_upload_exceeding_max_bytes_returns_400(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "MAX_UPLOAD_IMAGE_BYTES", 32)
+    resp = await client.post(
+        "/api/v1/questions/ingest",
+        data={"stem_md": "超限图测试", "target_grade": GRADE, "initial_state": "错题"},
+        files={"stem_images": ("big.png", b"x" * 64, "image/png")},
+    )
+    assert resp.status_code == 400
+    assert "上限" in resp.json()["detail"]
+
+
+async def test_drill_failure_returns_retrain_session_id_and_prewarms(
+    client: AsyncClient,
+) -> None:
+    _insert_drill_question("q-ret")
+    _insert_drill_scaffold("q-ret")
+    _insert_pool("q-ret", escrow=20.0)
+    resp = await client.post(
+        "/api/v1/drills/daily",
+        json={
+            "question_uid": "q-ret",
+            "final_answer": FINAL_WRONG,
+            "intermediate_sub_answer": INTERMEDIATE_WRONG,
+            "active_date": DAY.isoformat(),
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["passed"] is False
+    assert data["retrain_session_id"]
+    sess_resp = await client.get(f"/api/v1/sessions/{data['retrain_session_id']}")
+    assert sess_resp.status_code == 200
+    assert sess_resp.json()["micro_stage"] == "STAGE_1_BLIND_PROBE"
+    for task in list(scaffold_engine.in_flight_prewarm_tasks.values()):
+        await task

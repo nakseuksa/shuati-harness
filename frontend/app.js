@@ -163,11 +163,62 @@ function rewriteCas(text) {
   return String(text).replace(/cas:\/\/([a-f0-9]{64})/g, '/assets/$1');
 }
 
+function isSafeUrl(url, allowDataImage = false) {
+  const cleaned = String(url || '').replace(/[\u0000-\u0020\u007f]+/g, '').trim();
+  if (!cleaned) return false;
+  if (cleaned.startsWith('/') && !cleaned.startsWith('//')) return true;
+  if (cleaned.startsWith('#')) return true;
+  if (/^https?:\/\//i.test(cleaned)) return true;
+  if (!allowDataImage && /^mailto:/i.test(cleaned)) return true;
+  if (allowDataImage && /^data:image\/(?:png|jpe?g|webp|gif|bmp);base64,[A-Za-z0-9+/=]+$/i.test(cleaned)) {
+    return true;
+  }
+  return false;
+}
+
+const _UNSAFE_TAGS = 'script, style, iframe, object, embed, form, input, button, textarea, select, link, meta, base, svg, math';
+
+function sanitizeHtml(html) {
+  const raw = String(html || '');
+  if (typeof document === 'undefined') {
+    return raw
+      .replace(/<\s*(script|style|iframe|object|embed|form|svg|math)\b[\s\S]*?<\s*\/\s*\1\s*>/gi, '')
+      .replace(/<\s*(script|style|iframe|object|embed|form|input|button|textarea|select|link|meta|base|svg|math)\b[^>]*\/?>/gi, '')
+      .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+      .replace(/(href|src)\s*=\s*(["'])\s*(?:javascript:|vbscript:|data:(?!image\/(?:png|jpe?g|webp|gif|bmp);base64,))[^"']*\2/gi, '$1=$2#$2');
+  }
+  const tpl = document.createElement('template');
+  tpl.innerHTML = raw;
+  tpl.content.querySelectorAll(_UNSAFE_TAGS).forEach((node) => node.remove());
+  tpl.content.querySelectorAll('*').forEach((el) => {
+    for (const attr of Array.from(el.attributes)) {
+      const name = attr.name.toLowerCase();
+      if (name.startsWith('on') || name === 'srcdoc' || name === 'formaction') {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+      if (name === 'href' || name === 'xlink:href') {
+        if (!isSafeUrl(attr.value, false)) el.removeAttribute(attr.name);
+      } else if (name === 'src') {
+        if (!isSafeUrl(attr.value, el.tagName === 'IMG')) el.removeAttribute(attr.name);
+      }
+    }
+  });
+  return tpl.innerHTML;
+}
+
 function miniMarkdown(text) {
   // marked CDN 不可用时的降级渲染（保持核心可读，不阻塞交互）
+  const decodeAmp = (u) => String(u).replace(/&amp;/g, '&');
   const inline = (s) => esc(s)
-    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, '<img alt="$1" src="$2" />')
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, url) => (
+      isSafeUrl(decodeAmp(url), true) ? `<img alt="${alt}" src="${url}" />` : m
+    ))
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, url) => (
+      isSafeUrl(decodeAmp(url), false)
+        ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`
+        : label
+    ))
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
     .replace(/`([^`]+)`/g, '<code>$1</code>');
@@ -207,10 +258,10 @@ function miniMarkdown(text) {
 
 function markdownToHtml(text) {
   if (state.marked) {
-    try { return state.marked.parse(text, { gfm: true, breaks: true, async: false }); }
+    try { return sanitizeHtml(state.marked.parse(text, { gfm: true, breaks: true, async: false })); }
     catch { /* 落入降级 */ }
   }
-  return miniMarkdown(text);
+  return sanitizeHtml(miniMarkdown(text));
 }
 
 function renderMath(tex, displayMode) {
@@ -795,7 +846,7 @@ function fallbackBannerHtml(resp) {
       <span>⚠️ 未经符号沙盒强校验</span>
       <span class="field-help" style="color:inherit;font-weight:400">沙盒超时/非代数题，已降级双盲 LLM 交叉求解核对</span>
       <span class="spacer"></span>
-      <button class="btn btn-sm btn-warn" type="button" data-action="fallback-skip">跳过此题</button>
+      ${resp.micro_stage === 'STAGE_2_MICRO_SCAFFOLD' ? '<button class="btn btn-sm btn-warn" type="button" data-action="fallback-skip">跳过此题</button>' : ''}
       <button class="btn btn-sm btn-warn" type="button" data-action="fallback-swap">🔄 换一题（重新热备）</button>
     </div>`;
 }
@@ -995,34 +1046,43 @@ function renderTraining() {
       ${extraPayloadHtml(v, ['micro_scaffold', 'stem_md', 'scaffold_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status', 'verification_badge', 'prewarm_failed', 'notice', 'scaffold_depth', 'worked_example'])}`;
   } else if (stage === 'STAGE_3_REDO_ORIGINAL') {
     body = `
+      ${v.notice ? `<div class="notice-bar" role="status">${esc(v.notice)}</div>` : ''}
       <div class="mask-banner" style="border-left:5px solid var(--green)">🔓 三阶 · 无提示回原题：所有遮罩与微母题已撤去，请独立贯通完整原题</div>
       <div class="drill-stem rich">${renderRich(stem || '（原题题干缺失）')}</div>
       ${answerZoneHtml(resp)}
-      ${extraPayloadHtml(v, ['stem_md', 'original_stem_md', 'question_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols'])}`;
+      ${extraPayloadHtml(v, ['stem_md', 'original_stem_md', 'question_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'notice'])}`;
   } else if (stage === 'STAGE_4_DECRUTCH_VARIANT') {
     const mode = pick(v, 'verification_mode', 'mode');
     const wait = prewarmWaitState(resp);
     body = `
       ${fallbackBannerHtml(resp)}
+      ${v.notice ? `<div class="notice-bar" role="status">${esc(v.notice)}</div>` : ''}
       <div class="mask-banner" style="border-left:5px solid var(--amber)">🏗️ 四阶 · 当场拆拐杖同构变式${mode === 'equation_skeleton' ? '：半程立式，只考核心方程组列式' : '：提交最终答案'}</div>
       ${wait === 'ready'
         ? `<div class="drill-stem rich">${renderRich(stem)}</div>${answerZoneHtml(resp)}`
         : prewarmCardHtml(resp, wait, 'variant')}
-      ${extraPayloadHtml(v, ['variant', 'stem_md', 'variant_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status', 'verification_badge', 'prewarm_failed'])}`;
+      ${extraPayloadHtml(v, ['variant', 'stem_md', 'variant_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status', 'verification_badge', 'prewarm_failed', 'notice'])}`;
   } else if (stage === 'STAGE_COOLDOWN_DEFERRED') {
-    const mine = pick(v, 'user_answer', 'user_expr', 'user_equation', 'your_answer', 'submitted_answer');
-    const std = pick(v, 'standard_answer_latex', 'standard_expr', 'standard_equation', 'expected_answer', 'answer_latex', 'standard_answer');
+    const rawCard = parseMaybeJson(pick(v, 'skeleton_comparison_card'), null);
+    const card = (rawCard && typeof rawCard === 'object') ? rawCard : v;
+    const mine = pick(card, 'user_answer', 'user_expr', 'user_equation', 'your_answer', 'submitted_answer')
+      || pick(v, 'user_answer', 'user_expr', 'user_equation', 'your_answer', 'submitted_answer');
+    const std = pick(card, 'standard_skeleton', 'standard_answer_latex', 'standard_expr', 'standard_equation', 'expected_answer', 'answer_latex', 'standard_answer')
+      || pick(v, 'standard_skeleton', 'standard_answer_latex', 'standard_expr', 'standard_equation', 'expected_answer', 'answer_latex', 'standard_answer');
+    const variantStem = pick(card, 'variant_stem_md', 'stem_md') || '';
+    const retryPolicy = pick(card, 'retry_policy') || '对照骨架找出列式差异；明日再来点击下面按钮回到四阶重测。';
     body = `
       <div class="mask-banner" style="border-left:5px solid var(--info)">🧊 当场变式未通过：进入冷却顺延，次日冷却期满后可重测（不惩罚实战分基线）</div>
+      ${variantStem ? `<div class="drill-stem rich">${renderRich(variantStem)}</div>` : ''}
       <div class="skeleton-compare">
         <div class="subcard mine"><h4>你的列式 / 作答</h4><div class="rich">${renderRich(mine || '（未提供）')}</div></div>
         <div class="subcard std"><h4>标准骨架</h4><div class="rich">${renderRich(std || '（未提供）')}</div></div>
       </div>
-      <div class="field-help">对照骨架找出列式差异；明日再来点击下面按钮回到四阶重测。</div>
+      <div class="field-help">${esc(retryPolicy)}</div>
       <div class="btn-row" style="margin-top:12px">
         <button class="btn btn-primary" type="button" data-action="cooldown-resume">⏭️ 冷却期满，返回拆拐杖重测</button>
       </div>
-      ${extraPayloadHtml(v, ['user_answer', 'user_expr', 'user_equation', 'your_answer', 'submitted_answer', 'standard_answer_latex', 'standard_expr', 'standard_equation', 'expected_answer', 'answer_latex', 'standard_answer'])}`;
+      ${extraPayloadHtml(v, ['skeleton_comparison_card', 'user_answer', 'user_expr', 'user_equation', 'your_answer', 'submitted_answer', 'standard_skeleton', 'standard_answer_latex', 'standard_expr', 'standard_equation', 'expected_answer', 'answer_latex', 'standard_answer'])}`;
   } else if (stage === 'SESSION_COMPLETED') {
     const unlock = pick(v, 'blind_test_unlock_at', 'unlock_at');
     const due = pick(v, 'blind_test_due_at', 'due_at');
@@ -1093,6 +1153,7 @@ async function submitStage(btn, selfAssessment) {
     state.session = next;
     state.feedback = next.micro_stage === prevStage
       && ['STAGE_1_BLIND_PROBE', 'STAGE_2_MICRO_SCAFFOLD', 'STAGE_3_REDO_ORIGINAL', 'STAGE_4_DECRUTCH_VARIANT'].includes(next.micro_stage)
+      && !(next.view_payload && next.view_payload.notice)
       ? '❌ 未通过等价校验：再检查一下思路 / 列式，或请求铺垫。'
       : null;
     persistSession();
@@ -1105,11 +1166,11 @@ async function submitStage(btn, selfAssessment) {
 }
 
 async function swapFallbackQuestion(btn) {
-  // 换一题 = 重试预热（retry-prewarm 端点；门禁不可重复确认，旧路径已废弃）
+  // 换一题 = 强制重生成预热（retry-prewarm?force=true；门禁不可重复确认）
   const resp = state.session;
   if (!resp) { toast('无进行中的训练会话', 'warn'); return; }
   await runTask(btn, async () => {
-    const next = await apiFetch(`${API}/sessions/${encodeURIComponent(resp.session_id)}/retry-prewarm`, { method: 'POST' });
+    const next = await apiFetch(`${API}/sessions/${encodeURIComponent(resp.session_id)}/retry-prewarm?force=true`, { method: 'POST' });
     state.session = next;
     state.feedback = null;
     persistSession();
@@ -1201,6 +1262,10 @@ function drillCardHtml(item, idx) {
             ? `宏观状态 → ${esc(outcome.mastery_state || 'MASTERED')}（🟢），托管差额已解冻合入实战分，水分区收窄。`
             : `宏观状态 → ${esc(outcome.mastery_state || 'ACTIVE')}（🔴），托管差额已清空。${esc(retrainHint)}`}
         </p>
+        ${!passed && outcome.retrain_session_id ? `
+          <div style="margin-top:10px">
+            <button class="btn btn-primary" type="button" data-action="drill-retrain" data-session="${esc(outcome.retrain_session_id)}">🧗 立即进入重训会话</button>
+          </div>` : ''}
         ${cascades.length ? `
           <div class="cascade-list">
             <strong>🔗 上位母题连带销账 ${cascades.length} 道前置子题：</strong>
@@ -1301,6 +1366,22 @@ async function submitDrill(btn, uid) {
     state.drill.outcomes[uid] = outcome || { passed: false, mastery_state: 'ACTIVE' };
     renderDrill();
     toast(outcome && outcome.passed ? '🎯 盲测通过，销账兑现！' : '盲测未通过，已退回重训流', outcome && outcome.passed ? 'ok' : 'warn');
+  });
+}
+
+async function openRetrainSession(btn, sessionId) {
+  if (!sessionId) return;
+  await runTask(btn, async () => {
+    const next = await apiFetch(`${API}/sessions/${encodeURIComponent(sessionId)}`);
+    state.session = next;
+    state.gateParams = null;
+    state.feedback = null;
+    persistSession();
+    switchTab('training');
+    if (next && (next.prewarm_status === 'RUNNING' || next.prewarm_status === 'IDLE')) {
+      startPrewarmPoll();
+    }
+    renderResumeBanner();
   });
 }
 
@@ -1833,6 +1914,7 @@ function onDocumentClick(e) {
     case 'insert-symbol': insertSymbol(el); break;
     case 'drill-refresh': loadDrill(el); break;
     case 'drill-submit': submitDrill(el, el.dataset.uid); break;
+    case 'drill-retrain': openRetrainSession(el, el.dataset.session); break;
     case 'graph-refresh': loadGraphAndElo(el); break;
     case 'unmerge': unmergeBatch(el, el.dataset.batch); break;
     default: break;

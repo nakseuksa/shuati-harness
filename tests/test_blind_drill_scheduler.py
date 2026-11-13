@@ -815,4 +815,28 @@ def test_original_latex_bare_value_final_passes(conn: sqlite3.Connection) -> Non
         conn, "q-latex-bare", "20", LATEX_INTER_STD, DAY
     )
     assert outcome.passed and outcome.mastery_state == "MASTERED"
+    assert outcome.retrain_session_id is None
     assert _attempt(conn, "q-latex-bare")["final_correct"] == 1
+
+
+def test_variant_allowed_symbols_extracted_from_drill_not_original(
+    conn: sqlite3.Connection,
+) -> None:
+    _prepare_original(conn, "q-sym-var", l_score=2)
+    conn.execute(
+        "UPDATE questions SET stem_md = '求原题物理量 z_0 的取值' WHERE question_uid = 'q-sym-var'"
+    )
+    _insert_variant(conn, "v-sym", "q-sym-var", answer="k = 5")
+    conn.execute(
+        "UPDATE questions SET stem_md = '解关于 k 的方程：2k = 10' WHERE question_uid = 'v-sym'"
+    )
+    _insert_relation(conn, "q-sym-var", "v-sym", "ISOMORPHIC")
+
+    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    assert item.drill_question_uid == "v-sym"
+    assert "k" in item.allowed_symbols
+    assert "z0" not in item.allowed_symbols
+
+    fail_out = evaluate_blind_drill_submission(conn, "q-sym-var", "k = 999", None, DAY)
+    assert fail_out.passed is False
+    assert fail_out.retrain_session_id is not None

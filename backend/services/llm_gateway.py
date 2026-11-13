@@ -19,6 +19,7 @@ import base64
 import json
 import logging
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +30,45 @@ from backend.config import settings
 from backend.observability import log_event
 from backend.services import llm_mocks
 
-__all__ = ["LLMGatewayError", "chat_json", "image_path_to_data_url"]
+__all__ = ["LLMGatewayError", "aclose_shared_clients", "chat_json", "image_path_to_data_url"]
 
 logger = logging.getLogger(__name__)
+
+# 按事件循环复用 AsyncClient 连接池；同时校验 AsyncClient 类与超时，兼容测试 monkeypatch
+_SHARED_CLIENTS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, tuple[Any, float, httpx.AsyncClient]
+] = weakref.WeakKeyDictionary()
+
+
+async def _get_shared_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    timeout_s = float(settings.LLM_TIMEOUT_SECONDS)
+    factory = httpx.AsyncClient
+    cached = _SHARED_CLIENTS.get(loop)
+    if cached is not None:
+        cached_factory, cached_timeout, client = cached
+        if (
+            cached_factory is factory
+            and cached_timeout == timeout_s
+            and not getattr(client, "is_closed", False)
+        ):
+            return client
+        _SHARED_CLIENTS.pop(loop, None)
+        if not getattr(client, "is_closed", False):
+            await client.aclose()
+    client = factory(timeout=httpx.Timeout(timeout_s))
+    _SHARED_CLIENTS[loop] = (factory, timeout_s, client)
+    return client
+
+
+async def aclose_shared_clients() -> None:
+    """关闭当前事件循环关联的共享 httpx.AsyncClient（供 lifespan 退出清理）。"""
+    loop = asyncio.get_running_loop()
+    cached = _SHARED_CLIENTS.pop(loop, None)
+    if cached is not None:
+        client = cached[2]
+        if not getattr(client, "is_closed", False):
+            await client.aclose()
 
 # 图片后缀 → MIME（CAS 入库统一 WebP；兼容常见原始格式）
 _MIME_BY_SUFFIX: dict[str, str] = {
@@ -113,29 +150,29 @@ async def chat_json(
     start = time.perf_counter()
     stats: dict[str, Any] = {"attempts": 0}  # 仅计数，绝不记录请求体/头
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.LLM_TIMEOUT_SECONDS)) as client:
-            content = await _post_with_retries(client, request_body, purpose, stats)
+        client = await _get_shared_client()
+        content = await _post_with_retries(client, request_body, purpose, stats)
+        try:
+            result = schema.model_validate(json.loads(content))
+        except (json.JSONDecodeError, ValidationError) as first_exc:
+            # 附校验错误信息修复重试 1 次（契约实现规格）
+            repair_body = {
+                **request_body,
+                "messages": _build_repair_messages(messages, content, first_exc),
+            }
+            repaired = await _post_with_retries(client, repair_body, purpose, stats)
             try:
-                result = schema.model_validate(json.loads(content))
-            except (json.JSONDecodeError, ValidationError) as first_exc:
-                # 附校验错误信息修复重试 1 次（契约实现规格）
-                repair_body = {
-                    **request_body,
-                    "messages": _build_repair_messages(messages, content, first_exc),
-                }
-                repaired = await _post_with_retries(client, repair_body, purpose, stats)
-                try:
-                    result = schema.model_validate(json.loads(repaired))
-                except (json.JSONDecodeError, ValidationError) as second_exc:
-                    raise LLMGatewayError(
-                        f"purpose={purpose!r} 修复重试后仍未通过校验: {second_exc}",
-                        error_kind="REPAIR_VALIDATION_FAILED",
-                    ) from second_exc
-            _log_llm_request(
-                purpose, model, mock=False, attempt=int(stats["attempts"]), start=start,
-                ok=True, error_kind=None,
-            )
-            return result
+                result = schema.model_validate(json.loads(repaired))
+            except (json.JSONDecodeError, ValidationError) as second_exc:
+                raise LLMGatewayError(
+                    f"purpose={purpose!r} 修复重试后仍未通过校验: {second_exc}",
+                    error_kind="REPAIR_VALIDATION_FAILED",
+                ) from second_exc
+        _log_llm_request(
+            purpose, model, mock=False, attempt=int(stats["attempts"]), start=start,
+            ok=True, error_kind=None,
+        )
+        return result
     except LLMGatewayError as exc:
         _log_llm_request(
             purpose, model, mock=False, attempt=int(stats["attempts"]), start=start,

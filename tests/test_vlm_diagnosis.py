@@ -385,3 +385,84 @@ def test_mock_purpose_registry_complete() -> None:
     # diagnosis fixture 可被 DiagnosisPayload 直接校验（网关 Mock 路由前提）
     payload = DiagnosisPayload.model_validate(llm_mocks.MOCK_RESPONSES["diagnosis"])
     assert json.dumps(payload.model_dump(), ensure_ascii=False)
+
+
+async def test_alt_branch_clamps_stalled_step_and_validates_subscores(
+    images: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = default_payload()
+    alt_step = copy.deepcopy(payload["trace"]["steps"][0])
+    payload["alignment"]["matched_branch_id"] = "user_alt_1"
+    payload["alignment"]["alt_branch_steps"] = [alt_step]
+    payload["alignment"]["stalled_step_index"] = 3
+    install_payload(monkeypatch, payload)
+    stem, draft = images
+    result = await run_diagnosis([stem], [draft])
+    assert result.alignment.stalled_step_index == 1
+    assert result.alignment.last_valid_step_index == 0
+
+    bad = default_payload()
+    bad_alt = copy.deepcopy(bad["trace"]["steps"][0])
+    bad_alt["c_sub"] = 9
+    bad["alignment"]["matched_branch_id"] = "user_alt_1"
+    bad["alignment"]["alt_branch_steps"] = [bad_alt]
+    install_payload(monkeypatch, bad)
+    with pytest.raises(ValueError, match="alt_step"):
+        await run_diagnosis([stem], [draft])
+
+
+async def test_invalid_trap_taxonomy_tag_raises(
+    images: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = default_payload()
+    payload["alignment"]["error_category"] = "TRAP_OR_CALC_ERROR"
+    payload["alignment"]["trap_taxonomy_tag"] = "TRAP_NON_EXISTENT"
+    install_payload(monkeypatch, payload)
+    stem, draft = images
+    with pytest.raises(ValueError, match="trap_taxonomy_tag"):
+        await run_diagnosis([stem], [draft])
+
+
+async def test_large_png_is_resized_to_webp_for_vlm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import base64
+    import io
+
+    from PIL import Image
+
+    monkeypatch.setattr(settings, "CAS_MAX_IMAGE_SIDE", 128)
+    big_png = tmp_path / "big.png"
+    Image.new("RGB", (400, 200), (10, 80, 160)).save(big_png, format="PNG")
+    small_webp = tmp_path / "small.webp"
+    Image.new("RGB", (64, 32), (10, 80, 160)).save(small_webp, format="WEBP")
+
+    captured: list[dict[str, Any]] = []
+    real_chat = vlm_diagnosis.chat_json
+
+    async def spy_chat(
+        messages: list[dict[str, Any]],
+        schema: type[Any],
+        *,
+        model: str,
+        purpose: str,
+        temperature: float | None = None,
+    ) -> Any:
+        captured.append({"messages": messages})
+        return await real_chat(
+            messages, schema, model=model, purpose=purpose, temperature=temperature
+        )
+
+    monkeypatch.setattr(vlm_diagnosis, "chat_json", spy_chat)
+    await analyze_question_and_draft(STEM_MD, [big_png, small_webp], [], GRADE, TREE)
+
+    image_urls = [
+        p["image_url"]["url"]
+        for p in captured[0]["messages"][1]["content"]
+        if p.get("type") == "image_url"
+    ]
+    assert image_urls[0].startswith("data:image/webp;base64,")
+    decoded = base64.b64decode(image_urls[0].split(",", 1)[1])
+    with Image.open(io.BytesIO(decoded)) as sent_img:
+        assert max(sent_img.size) == 128
+    assert image_urls[1] == image_path_to_data_url(small_webp)

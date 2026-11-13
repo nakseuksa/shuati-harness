@@ -8,10 +8,13 @@ Token 经济学（NFR）：题干/草稿图片仅在本诊断首轮以 data URL 
 后续三阶脚手架所有轮次严禁重复携带原始图片 Base64（由下游遵守）。
 """
 
+import base64
+import io
 import json
 from pathlib import Path
 from typing import Any, Literal
 
+from PIL import Image
 from pydantic import BaseModel
 
 from backend.config import settings
@@ -143,6 +146,37 @@ async def analyze_question_and_draft(
     return result
 
 
+def _image_path_to_data_url(path: Path) -> str:
+    """将图片按 CAS_MAX_IMAGE_SIDE 等比缩放并转 WebP data URL；已是合尺寸 WebP 则零拷贝返回。"""
+    limit = settings.CAS_MAX_IMAGE_SIDE
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise LLMGatewayError(f"无法读取图片 {path}: {exc}") from exc
+    try:
+        with Image.open(io.BytesIO(raw)) as src:
+            src.load()
+            width, height = src.size
+            if src.format == "WEBP" and max(width, height) <= limit:
+                return image_path_to_data_url(path)
+            long_side = max(width, height)
+            img: Image.Image = src
+            if long_side > limit:
+                scale = limit / long_side
+                img = src.resize(
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="WEBP")
+            encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/webp;base64,{encoded}"
+    except Image.DecompressionBombError as exc:
+        raise ValueError(f"图片像素超限（疑似解压炸弹）: {exc}") from exc
+    except OSError:
+        return image_path_to_data_url(path)
+
+
 def _build_messages(
     stem_md: str,
     stem_images: list[Path],
@@ -167,7 +201,7 @@ def _build_messages(
             {"type": "text", "text": "【题干配图槽（与手写草稿分离，勿将涂改线误认为配图）】"}
         )
         user_parts.extend(
-            {"type": "image_url", "image_url": {"url": image_path_to_data_url(p)}}
+            {"type": "image_url", "image_url": {"url": _image_path_to_data_url(p)}}
             for p in stem_images
         )
     if draft_images:
@@ -181,7 +215,7 @@ def _build_messages(
             }
         )
         user_parts.extend(
-            {"type": "image_url", "image_url": {"url": image_path_to_data_url(p)}}
+            {"type": "image_url", "image_url": {"url": _image_path_to_data_url(p)}}
             for p in draft_images
         )
     else:
@@ -228,38 +262,42 @@ def _postprocess(payload: DiagnosisPayload) -> None:
     alignment = payload.alignment
     if not trace.steps:
         raise ValueError("诊断 trace.steps 不能为空")
-    step_count = len(trace.steps)
 
-    # 1) stalled_step_index ∈ [1, len(steps)]，越界修正
-    alignment.stalled_step_index = min(max(alignment.stalled_step_index, 1), step_count)
-    # 2) 0 ≤ last_valid_step_index < stalled_step_index
-    alignment.last_valid_step_index = max(
-        0, min(alignment.last_valid_step_index, alignment.stalled_step_index - 1)
-    )
-    # 3) error_category 与 trap_taxonomy_tag 一致性
-    if alignment.error_category == "TRAP_OR_CALC_ERROR":
-        if alignment.trap_taxonomy_tag is None:
-            raise ValueError("error_category=TRAP_OR_CALC_ERROR 时 trap_taxonomy_tag 必填")
-    else:
-        alignment.trap_taxonomy_tag = None
-    # 4) 一题多解：alt 分支缺失/为空 → 降级 canonical 并修正 payload
+    # 1) 一题多解：先归一分支，再按生效分支长度校验步数
     if alignment.matched_branch_id != "canonical":
         if not alignment.alt_branch_steps:
             alignment.matched_branch_id = "canonical"
             alignment.alt_branch_steps = None
     else:
         alignment.alt_branch_steps = None
+    active_steps = alignment.alt_branch_steps or trace.steps
+    step_count = len(active_steps)
 
-    # 5) 四维范围断言（深度 rubric/单调性校验交给下游 difficulty_rubric）
+    # 2) stalled_step_index ∈ [1, len(active_steps)]，越界修正；0 ≤ last_valid_step_index < stalled
+    alignment.stalled_step_index = min(max(alignment.stalled_step_index, 1), step_count)
+    alignment.last_valid_step_index = max(
+        0, min(alignment.last_valid_step_index, alignment.stalled_step_index - 1)
+    )
+    # 3) error_category 与 trap_taxonomy_tag 一致性及枚举合法性
+    if alignment.error_category == "TRAP_OR_CALC_ERROR":
+        if alignment.trap_taxonomy_tag is None:
+            raise ValueError("error_category=TRAP_OR_CALC_ERROR 时 trap_taxonomy_tag 必填")
+        if alignment.trap_taxonomy_tag not in TRAP_TAXONOMY:
+            raise ValueError(f"非法 trap_taxonomy_tag: {alignment.trap_taxonomy_tag!r}")
+    else:
+        alignment.trap_taxonomy_tag = None
+
+    # 4) 四维范围断言（主 trace 与替代分支一并校验）
     _assert_dim_range("c_score", trace.c_score, 4)
     _assert_dim_range("s_score", trace.s_score, 3)
     _assert_dim_range("t_score", trace.t_score, 3)
     _assert_dim_range("l_score", trace.l_score, 3)
-    for step in trace.steps:
-        _assert_dim_range(f"step{step.step_index}.c_sub", step.c_sub, 4)
-        _assert_dim_range(f"step{step.step_index}.s_sub", step.s_sub, 3)
-        _assert_dim_range(f"step{step.step_index}.t_sub", step.t_sub, 3)
-        _assert_dim_range(f"step{step.step_index}.l_sub", step.l_sub, 3)
+    for label, steps in (("step", trace.steps), ("alt_step", alignment.alt_branch_steps or [])):
+        for step in steps:
+            _assert_dim_range(f"{label}{step.step_index}.c_sub", step.c_sub, 4)
+            _assert_dim_range(f"{label}{step.step_index}.s_sub", step.s_sub, 3)
+            _assert_dim_range(f"{label}{step.step_index}.t_sub", step.t_sub, 3)
+            _assert_dim_range(f"{label}{step.step_index}.l_sub", step.l_sub, 3)
 
 
 def _assert_dim_range(name: str, value: int, upper: int) -> None:

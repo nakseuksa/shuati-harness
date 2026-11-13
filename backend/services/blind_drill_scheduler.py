@@ -80,6 +80,7 @@ class BlindDrillOutcomeDTO(BaseModel):
     passed: bool
     mastery_state: str
     retrain_stage: str | None  # 失败时新重训会话的起点
+    retrain_session_id: str | None = None
     cascaded_question_uids: list[str]  # 连带销账的子题
     explanation_text: str | None
 
@@ -276,16 +277,17 @@ def _build_item(conn: sqlite3.Connection, question: sqlite3.Row) -> BlindDrillIt
     )
     allowed_symbols: list[str] = []
     if mode == "equation_skeleton":
+        drill_uid = str(drill["question_uid"])
         formulas = [
             str(r["step_formula_latex"])
             for r in _query_all(
                 conn,
                 "SELECT step_formula_latex FROM question_steps WHERE question_uid = ?"
                 " ORDER BY solution_branch_id ASC, step_index ASC",
-                (orig_uid,),
+                (drill_uid,),
             )
         ]
-        allowed_symbols = _extract_symbols([str(question["stem_md"]), *formulas])
+        allowed_symbols = _extract_symbols([str(drill["stem_md"]), *formulas])
 
     return BlindDrillItemDTO(
         question_uid=orig_uid,
@@ -607,6 +609,7 @@ def evaluate_blind_drill_submission(
             passed=False,
             mastery_state="ACTIVE",
             retrain_stage=stage,
+            retrain_session_id=retrain_session_id,
             cascaded_question_uids=[],
             explanation_text=explanation,
         )

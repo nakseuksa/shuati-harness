@@ -1117,3 +1117,45 @@ def test_mock_fixture_registered_and_legacy_purposes_intact() -> None:
     verdict = NodeJudgeResult.model_validate(llm_mocks.MOCK_RESPONSES["node_judge"])
     assert verdict.match_node_id is None
     assert verdict.evidence
+
+
+def test_all_node_states_matches_node_state(conn: sqlite3.Connection) -> None:
+    _insert_node(conn, "M0")  # 无阻塞挂载 -> MASTERED
+    _insert_node(conn, "A1")
+    _insert_node(conn, "A1-sub", redirect="A1")
+    _insert_node(conn, "P1")
+    _insert_question(conn, "q-act", mastery="ACTIVE")
+    _insert_question(conn, "q-pen", mastery="PENDING_RETEST")
+    _insert_step(conn, "s1", "q-act", "A1-sub", blocked=1)
+    _insert_step(conn, "s2", "q-pen", "P1", blocked=1)
+    bulk = kg.all_node_states(conn)
+    for nid in ("M0", "A1", "P1"):
+        assert bulk[nid] == node_state(conn, nid)
+    assert bulk["M0"] == "MASTERED"
+    assert bulk["A1"] == "ACTIVE"
+    assert bulk["P1"] == "PENDING_RETEST"
+
+
+async def test_compaction_zero_merge_watermark_skips_rescan(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    kg._NO_MERGE_SCAN_WATERMARKS.clear()
+    names = [
+        "甲子", "乙丑", "丙寅", "丁卯", "戊辰",
+        "己巳", "庚午", "辛未", "壬申", "癸酉",
+        "戌亥", "子戌", "丑亥", "寅亥", "卯戌",
+        "辰巳", "午未", "申酉", "乾坤", "坎离",
+        "震巽", "艮兑", "风雷", "水火", "山泽",
+        "日月", "星辰", "天地", "玄黄", "宇宙",
+    ]
+    for name in names[:15]:
+        await match_or_create_l3_node(conn, "天文", "星象", f"定理{name}", [])
+    compactions_at_15 = len(judge.compaction_calls)
+    assert compactions_at_15 > 0
+
+    for name in names[15:29]:
+        await match_or_create_l3_node(conn, "天文", "星象", f"定理{name}", [])
+    assert len(judge.compaction_calls) == compactions_at_15
+
+    await match_or_create_l3_node(conn, "天文", "星象", f"定理{names[29]}", [])
+    assert len(judge.compaction_calls) > compactions_at_15

@@ -497,7 +497,55 @@ def test_p6_parse_quantity_values(text: str, expected: tuple[float, str]) -> Non
         "2t",
         "3h",
         "10s",
+        # 后续分段出现负号（非合法复合量）
+        "9小时-36分",
+        "-9小时-36分",
     ],
 )
 def test_p6_parse_quantity_rejects_non_quantity(text: str) -> None:
     assert sympy_verifier._parse_quantity(text) is None
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        (r"x = \dfrac{1}{2}", r"x = \frac{1}{2}", True),
+        (r"x = \tfrac{3}{4}", "x = 3/4", True),
+        (r"x = \sqrt[3]{8}", "x = 2", True),
+        (r"x = \frac12", "x = 0.5", True),
+        (r"x = a \div b", "x = a/b", True),
+        ("9小时-36分", _P6_STD_TIME, False),
+    ],
+)
+def test_p8_latex_extended_and_negative_segment(
+    user: str, standard: str, expected: bool
+) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+_CHICK_RABBIT_STD = r"\text{鸡 } 40 \text{ 只，兔 } 60 \text{ 只}"
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        ("鸡40，兔60", _CHICK_RABBIT_STD, True),
+        ("鸡 40 只，兔 60 只", _CHICK_RABBIT_STD, True),
+        ("鸡有40只，兔有60只", _CHICK_RABBIT_STD, True),
+        ("鸡：40，兔：60", _CHICK_RABBIT_STD, True),
+        ("鸡=40，兔=60", _CHICK_RABBIT_STD, True),
+        ("兔60，鸡40", _CHICK_RABBIT_STD, True),
+        ("鸡40兔60", _CHICK_RABBIT_STD, True),
+        ("40, 60", _CHICK_RABBIT_STD, True),
+        ("40 60", _CHICK_RABBIT_STD, True),
+        ("鸡60，兔40", _CHICK_RABBIT_STD, False),  # 实体数值对调必须拒绝
+        ("60, 40", _CHICK_RABBIT_STD, False),  # 裸数字顺序错误必须拒绝
+        ("鸡40，兔59", _CHICK_RABBIT_STD, False),
+        ("鸡40", _CHICK_RABBIT_STD, False),  # 缺项必须拒绝
+        ("x = 40, y = 60", _CHICK_RABBIT_STD, False),  # 未指明实体不得误放行
+        ("甲 12 个", r"\text{甲 } 12 \text{ 个}", True),
+        ("甲 15 个", r"\text{甲 } 12 \text{ 个}", False),
+    ],
+)
+def test_p8_labeled_chinese_answers(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected

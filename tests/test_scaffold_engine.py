@@ -1049,3 +1049,221 @@ async def test_stage2_wrong_math_answer_does_not_descend(
     assert str(resp.view_payload["micro_scaffold"]["question_uid"]) == l0_uid
     assert resp.view_payload.get("feedback")
     assert not resp.view_payload.get("worked_example")
+
+
+async def test_session_completed_includes_escrow_combat_delta_and_none_for_mastered(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    card = await _concept_session(tmp_db, install_diagnosis)
+    sid = card.session_id
+    await confirm_diagnostic_gate(sid, 2, "CONCEPT_BOTTLENECK", db_path=tmp_db)
+    await _drain(sid)
+    await _reach_stage4(tmp_db, sid)
+    done = await submit_stage_answer(sid, STAGE4_CORE_EQUATION, db_path=tmp_db)
+    assert done.micro_stage == "SESSION_COMPLETED"
+    pool = _one(tmp_db, "SELECT escrow_combat_delta FROM question_escrow_pool")
+    assert done.view_payload["escrow_combat_delta"] == pytest.approx(
+        float(pool["escrow_combat_delta"])
+    )
+    assert float(done.view_payload["escrow_combat_delta"]) > 0
+
+    m_card = await _ingest(
+        tmp_db, install_diagnosis, _payload(category="ALREADY_MASTERED"), stem_md="已掌握题"
+    )
+    m_done = await confirm_diagnostic_gate(
+        m_card.session_id, 2, "ALREADY_MASTERED", db_path=tmp_db
+    )
+    assert m_done.micro_stage == "SESSION_COMPLETED"
+    assert m_done.view_payload["escrow_combat_delta"] is None
+
+
+async def test_variant_equation_skeleton_persisted_for_l2_stage4(
+    tmp_db: Path, install_diagnosis: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mocks = copy.deepcopy(llm_mocks.MOCK_RESPONSES)
+    mocks["variant_kernel"]["equation_skeleton"] = r"2*(x + {b}) = {p}; \frac{2*(x+{b})}{2} = 8"
+    monkeypatch.setattr(llm_mocks, "MOCK_RESPONSES", mocks)
+
+    card = await _ingest(tmp_db, install_diagnosis, _payload(category="TRAP_OR_CALC_ERROR"))
+    resp = await confirm_diagnostic_gate(
+        card.session_id, 2, "TRAP_OR_CALC_ERROR", db_path=tmp_db
+    )
+    v_uid = str(resp.view_payload["variant"]["question_uid"])
+    step = _one(
+        tmp_db, "SELECT step_formula_latex FROM question_steps WHERE question_uid = ?", (v_uid,)
+    )
+    assert step["step_formula_latex"] == r"2*(x + 3) = 16; \frac{2*(x+3)}{2} = 8"
+    assert "x" in resp.view_payload["allowed_symbols"]
+
+
+async def test_fallback_skip_and_force_retry_prewarm(
+    tmp_db: Path, install_diagnosis: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mocks = copy.deepcopy(llm_mocks.MOCK_RESPONSES)
+    mocks["scaffold_kernel"] = {
+        "parametric_stem_tpl": "解关于 $x$ 的一元一次方程：$2x = 10$。",
+        "sympy_solver_code": (
+            "def solve_kernel(): return {'params': {}, 'answer_latex': 'x = 5'}"
+        ),
+        "constraints_check": "x = 5",
+    }
+    mocks["variant_kernel"] = {
+        "parametric_stem_tpl": "解关于 $x$ 的一元一次方程：$3x = 15$。",
+        "sympy_solver_code": (
+            "def solve_kernel(): return {'params': {}, 'answer_latex': 'x = 5'}"
+        ),
+        "constraints_check": "x = 5",
+    }
+    monkeypatch.setattr(llm_mocks, "MOCK_RESPONSES", mocks)
+    monkeypatch.setattr(settings, "SYMPY_MAX_RETRIES", 0)
+
+    card = await _concept_session(tmp_db, install_diagnosis)
+    sid = card.session_id
+    await confirm_diagnostic_gate(sid, 2, "CONCEPT_BOTTLENECK", db_path=tmp_db)
+    await _drain(sid)
+    s2 = await submit_stage_answer(sid, STAGE1_WRONG, db_path=tmp_db)
+    assert s2.prewarm_status == "READY_FALLBACK"
+    old_uid = str(s2.view_payload["micro_scaffold"]["question_uid"])
+
+    # force=True 换一题：生成新 UID 而非幂等复用旧题
+    mocks["scaffold_kernel"]["parametric_stem_tpl"] = "新方程：解 $4x = 20$。"
+    await retry_prewarm(sid, db_path=tmp_db, force=True)
+    await _drain(sid)
+    refreshed = await get_session_view(sid, db_path=tmp_db)
+    new_uid = str(refreshed.view_payload["micro_scaffold"]["question_uid"])
+    assert new_uid != old_uid
+
+    # 二阶 fallback SKIP → 跳过直入三阶
+    s3 = await submit_stage_answer(sid, "", "SKIP", db_path=tmp_db)
+    assert s3.micro_stage == "STAGE_3_REDO_ORIGINAL"
+    assert s3.view_payload.get("notice")
+
+    s4 = await submit_stage_answer(sid, STAGE3_CORRECT, db_path=tmp_db)
+    assert s4.micro_stage == "STAGE_4_DECRUTCH_VARIANT"
+    # 四阶 fallback SKIP → 不进入冷却，提示换一题或作答
+    s4_skip = await submit_stage_answer(sid, "", "SKIP", db_path=tmp_db)
+    assert s4_skip.micro_stage == "STAGE_4_DECRUTCH_VARIANT"
+    assert s4_skip.view_payload.get("notice")
+
+
+async def test_already_mastered_decrements_co_error_edges(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    card = await _ingest(tmp_db, install_diagnosis, _payload(category="CONCEPT_BOTTLENECK"))
+    with get_db_connection(tmp_db) as conn:
+        nodes = [
+            str(r["knowledge_node_id"])
+            for r in conn.execute(
+                "SELECT DISTINCT knowledge_node_id FROM question_steps"
+                " WHERE question_uid = ? ORDER BY knowledge_node_id ASC",
+                (card.question_uid,),
+            ).fetchall()
+        ]
+        assert len(nodes) >= 2
+        before = int(
+            conn.execute(
+                "SELECT active_error_count FROM concept_co_errors"
+                " WHERE node_u_id = ? AND node_v_id = ?",
+                (nodes[0], nodes[1]),
+            ).fetchone()["active_error_count"]
+        )
+        assert before >= 1
+
+    done = await confirm_diagnostic_gate(card.session_id, 2, "ALREADY_MASTERED", db_path=tmp_db)
+    assert done.micro_stage == "SESSION_COMPLETED"
+    after = int(
+        _one(
+            tmp_db,
+            "SELECT active_error_count FROM concept_co_errors"
+            " WHERE node_u_id = ? AND node_v_id = ?",
+            (nodes[0], nodes[1]),
+        )["active_error_count"]
+    )
+    assert after == before - 1
+
+
+async def test_dual_blind_solve_accepts_equivalent_composite_quantities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answers = iter(["9小时36分", "576分"])
+
+    async def fake_chat_json(
+        messages: list[dict[str, Any]],
+        schema: type[Any],
+        *,
+        model: str,
+        purpose: str,
+        temperature: float | None = None,
+    ) -> Any:
+        assert purpose == "solver_blind"
+        return schema(answer_latex=next(answers), reasoning_brief="composite equivalence")
+
+    monkeypatch.setattr(scaffold_engine, "chat_json", fake_chat_json)
+    res = await scaffold_engine._dual_blind_solve("某行程耗时多少？")
+    assert res == ("9小时36分", ["9小时36分", "576分"])
+
+
+async def test_shared_l0_scaffold_disambiguates_original_parent_chain(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    card_a = await _ingest(tmp_db, install_diagnosis, _payload(), stem_md="原题A")
+    card_b = await _ingest(tmp_db, install_diagnosis, _payload(), stem_md="原题B")
+    with get_db_connection(tmp_db) as conn:
+        for uid, stem, ans in (
+            ("shared-l0", "公共L0母题", "5"),
+            ("branch-a", "A支路L0", "5"),
+            ("branch-b", "B支路L0", "5"),
+            ("shared-l1", "公共L1脚手架", "5"),
+        ):
+            conn.execute(
+                "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
+                " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
+                " base_elo, tier, primary_l1_module, mastery_state)"
+                " VALUES (?, 'AI_SYNTHETIC_SCAFFOLD', ?, ?, ?, ?, 1, 1, 1, 1, 1100,"
+                " 'L1_基础夯实', '物理', 'ACTIVE')",
+                (uid, GRADE, stem, f"hash-{uid}", ans),
+            )
+        for src, dst in (
+            ("shared-l0", card_a.question_uid),
+            ("shared-l0", card_b.question_uid),
+            ("branch-a", card_a.question_uid),
+            ("branch-b", card_b.question_uid),
+            ("shared-l1", "branch-a"),
+            ("shared-l1", "branch-b"),
+        ):
+            conn.execute(
+                "INSERT INTO question_relations ("
+                " source_question_uid, target_question_uid, relation_type, is_directed,"
+                " target_step_index, surface_sim, skeleton_sim, containment_score,"
+                " trap_overlap, confidence_source"
+                ") VALUES (?, ?, 'SCAFFOLD_PRE', 1, 2, 0.5, 0.8, 0.9, 0.0, 'SYMPY_KERNEL_GEN')",
+                (src, dst),
+            )
+        conn.commit()
+        assert (
+            scaffold_engine._scaffold_parent_uid(conn, "shared-l0", card_b.question_uid)
+            == card_b.question_uid
+        )
+        assert (
+            scaffold_engine._scaffold_parent_uid(conn, "shared-l1", card_b.question_uid)
+            == "branch-b"
+        )
+        assert (
+            scaffold_engine._scaffold_parent_uid(conn, "shared-l1", card_a.question_uid)
+            == "branch-a"
+        )
+        assert scaffold_engine._scaffold_depth(conn, "shared-l1", card_b.question_uid) == 1
+
+        conn.execute(
+            "UPDATE diagnostic_sessions SET micro_stage = 'STAGE_2_MICRO_SCAFFOLD',"
+            " prewarm_scaffold_uid = 'shared-l1', prewarm_status = 'READY_SYMPY'"
+            " WHERE session_id = ?",
+            (card_b.session_id,),
+        )
+        conn.commit()
+
+    resp = await submit_stage_answer(card_b.session_id, "5", db_path=tmp_db)
+    assert resp.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+    assert resp.view_payload["micro_scaffold"]["question_uid"] == "branch-b"
+    resp2 = await submit_stage_answer(card_b.session_id, "5", db_path=tmp_db)
+    assert resp2.micro_stage == "STAGE_3_REDO_ORIGINAL"

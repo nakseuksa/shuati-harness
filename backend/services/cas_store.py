@@ -42,16 +42,19 @@ def ingest_image_bytes(raw_bytes: bytes, max_side: int | None = None) -> str:
     if limit < 1:
         raise ValueError(f"max_side 必须 >= 1，收到 {limit}")
 
-    with Image.open(io.BytesIO(raw_bytes)) as src:
-        src.load()
-        width, height = src.size
-        long_side = max(width, height)
-        img: Image.Image = src
-        if long_side > limit:
-            scale = limit / long_side
-            new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-            img = src.resize(new_size, Image.Resampling.LANCZOS)
-        rgb = img.convert("RGB")
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as src:
+            src.load()
+            width, height = src.size
+            long_side = max(width, height)
+            img: Image.Image = src
+            if long_side > limit:
+                scale = limit / long_side
+                new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                img = src.resize(new_size, Image.Resampling.LANCZOS)
+            rgb = img.convert("RGB")
+    except Image.DecompressionBombError as exc:
+        raise ValueError(f"图片像素超限（疑似解压炸弹）: {exc}") from exc
 
     buffer = io.BytesIO()
     rgb.save(buffer, format="WEBP")
@@ -116,17 +119,18 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], list[str], str]:
 def _rewrite_local_images(body: str, base_dir: Path | None) -> str:
     """将 base_dir 下可找到的本地相对路径配图改写为 cas:// URI。
 
-    已带 scheme（cas://、http(s):// 等）、绝对路径、找不到的本地路径一律保持原样。
+    已带 scheme（cas://、http(s):// 等）、绝对路径、越界路径、找不到的本地路径一律保持原样。
     """
     if base_dir is None:
         return body
+    base_resolved = base_dir.resolve()
 
     def _sub(match: re.Match[str]) -> str:
         alt, target, title = match.group(1), match.group(2), match.group(3) or ""
         if _SCHEME_RE.match(target) or Path(target).is_absolute():
             return match.group(0)
-        candidate = base_dir / target
-        if not candidate.is_file():
+        candidate = (base_resolved / target).resolve()
+        if not candidate.is_relative_to(base_resolved) or not candidate.is_file():
             return match.group(0)
         uri = ingest_image_bytes(candidate.read_bytes())
         return f"![{alt}]({uri}{title})"

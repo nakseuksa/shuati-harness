@@ -48,6 +48,7 @@ __all__ = [
     "CanonicalNodeResolver",
     "GraphMetricsDTO",
     "NodeJudgeResult",
+    "all_node_states",
     "compute_graph_metrics",
     "decrement_co_error_edges_on_mastery",
     "match_or_create_l3_node",
@@ -339,12 +340,25 @@ async def match_or_create_l3_node(
         node_id=new_id,
     )
     if _new_nodes_since_last_compaction(conn, l1, l2) >= settings.COMPACTION_BATCH_THRESHOLD:
-        run_scoped_compaction(conn, l1, l2)
+        if run_scoped_compaction is _ORIG_RUN_SCOPED_COMPACTION:
+            await _run_scoped_compaction_async(conn, l1, l2)
+        else:
+            run_scoped_compaction(conn, l1, l2)
     return new_id, False
 
 
-def _new_nodes_since_last_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> int:
-    """自上次该 L2 compaction 批次以来的新建节点数（无批次则全部计数）。"""
+# (db_key, l1, l2) -> (anchor_node_id, scanned_raw_count)：0 合并扫描后推进水位，防重复全扫
+_NO_MERGE_SCAN_WATERMARKS: dict[tuple[str, str, str], tuple[str, int]] = {}
+
+
+def _db_cache_key(conn: sqlite3.Connection) -> str:
+    row = conn.execute("PRAGMA database_list").fetchone()
+    db_file = str(row[2]) if row is not None and row[2] else ""
+    return db_file or f"mem:{id(conn)}"
+
+
+def _raw_nodes_since_last_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> int:
+    """自上次该 L2 compaction 批次以来的原始新建节点数（无批次则全部计数）。"""
     last_batch_at = conn.execute(
         "SELECT MAX(created_at) FROM compaction_audit_ledger WHERE l1_module = ? AND l2_entity = ?",
         (l1, l2),
@@ -363,9 +377,52 @@ def _new_nodes_since_last_compaction(conn: sqlite3.Connection, l1: str, l2: str)
     return int(row[0])
 
 
+def _new_nodes_since_last_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> int:
+    """自上次该 L2 compaction（含 0 合并扫描水位）以来的新建节点数。"""
+    raw_count = _raw_nodes_since_last_compaction(conn, l1, l2)
+    wm_key = (_db_cache_key(conn), l1, l2)
+    wm = _NO_MERGE_SCAN_WATERMARKS.get(wm_key)
+    if wm is None:
+        return raw_count
+    anchor_id, scanned_count = wm
+    exists = (
+        conn.execute("SELECT 1 FROM knowledge_nodes WHERE node_id = ?", (anchor_id,)).fetchone()
+        is not None
+    )
+    if not exists or raw_count < scanned_count:
+        _NO_MERGE_SCAN_WATERMARKS.pop(wm_key, None)
+        return raw_count
+    return raw_count - scanned_count
+
+
 # ---------------------------------------------------------------------------
 # 同域可逆并查集 Compaction
 # ---------------------------------------------------------------------------
+
+
+def _build_compaction_pairs(nodes: list[sqlite3.Row]) -> list[tuple[float, str, str]]:
+    grams = {str(row["node_id"]): _row_grams(row) for row in nodes}
+    pairs: list[tuple[float, str, str]] = []
+    for older, newer in combinations(nodes, 2):  # nodes 已按 (created_at, node_id) 排序
+        older_id, newer_id = str(older["node_id"]), str(newer["node_id"])
+        sim = _jaccard(grams[older_id], grams[newer_id])
+        if sim > 0.0:
+            pairs.append((-sim, older_id, newer_id))
+    pairs.sort()
+    return pairs
+
+
+def _record_compaction_watermark(
+    conn: sqlite3.Connection, l1: str, l2: str, nodes: list[sqlite3.Row], batch_id: str | None
+) -> None:
+    wm_key = (_db_cache_key(conn), l1, l2)
+    if batch_id is not None:
+        _NO_MERGE_SCAN_WATERMARKS.pop(wm_key, None)
+    elif nodes:
+        _NO_MERGE_SCAN_WATERMARKS[wm_key] = (
+            str(nodes[-1]["node_id"]),
+            _raw_nodes_since_last_compaction(conn, l1, l2),
+        )
 
 
 def run_scoped_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> str | None:
@@ -377,15 +434,9 @@ def run_scoped_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> str | N
     """
     nodes = _active_nodes(conn, l1, l2)
     if len(nodes) < 2:
+        _record_compaction_watermark(conn, l1, l2, nodes, None)
         return None
-    grams = {str(row["node_id"]): _row_grams(row) for row in nodes}
-    pairs: list[tuple[float, str, str]] = []
-    for older, newer in combinations(nodes, 2):  # nodes 已按 (created_at, node_id) 排序
-        older_id, newer_id = str(older["node_id"]), str(newer["node_id"])
-        sim = _jaccard(grams[older_id], grams[newer_id])
-        if sim > 0.0:
-            pairs.append((-sim, older_id, newer_id))
-    pairs.sort()
+    pairs = _build_compaction_pairs(nodes)
 
     batch_id: str | None = None
     for _neg_sim, to_id, from_id in pairs:
@@ -402,6 +453,38 @@ def run_scoped_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> str | N
         if batch_id is None:
             batch_id = str(uuid.uuid4())
         _merge_pair(conn, l1, l2, from_id, to_id, batch_id, verdict.evidence)
+    _record_compaction_watermark(conn, l1, l2, nodes, batch_id)
+    return batch_id
+
+
+_ORIG_RUN_SCOPED_COMPACTION = run_scoped_compaction
+
+
+async def _run_scoped_compaction_async(
+    conn: sqlite3.Connection, l1: str, l2: str
+) -> str | None:
+    """run_scoped_compaction 的原生协程版：直接 await _judge_nodes，避免阻塞事件循环。"""
+    nodes = _active_nodes(conn, l1, l2)
+    if len(nodes) < 2:
+        _record_compaction_watermark(conn, l1, l2, nodes, None)
+        return None
+    pairs = _build_compaction_pairs(nodes)
+
+    batch_id: str | None = None
+    for _neg_sim, to_id, from_id in pairs:
+        if _is_redirected(conn, to_id) or _is_redirected(conn, from_id):
+            continue
+        to_row, from_row = _node_row(conn, to_id), _node_row(conn, from_id)
+        payload = _judge_payload(
+            "scoped_compaction", l1, l2, _surface_names(from_row), [to_row]
+        )
+        verdict = await _judge_nodes(payload)
+        if verdict.match_node_id != to_id:
+            continue
+        if batch_id is None:
+            batch_id = str(uuid.uuid4())
+        _merge_pair(conn, l1, l2, from_id, to_id, batch_id, verdict.evidence)
+    _record_compaction_watermark(conn, l1, l2, nodes, batch_id)
     return batch_id
 
 
@@ -642,6 +725,24 @@ def _revert_single_merge(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
 # ---------------------------------------------------------------------------
 # 节点展示状态（派生值，不落库）
 # ---------------------------------------------------------------------------
+
+
+def all_node_states(conn: sqlite3.Connection) -> dict[str, str]:
+    """批量聚合所有活跃主节点展示状态（O(N+M) 单查询，消除接口 N+1 全表扫描）。"""
+    resolver = CanonicalNodeResolver(conn)
+    states: dict[str, str] = {
+        str(row[0]): "MASTERED"
+        for row in conn.execute("SELECT node_id FROM knowledge_nodes WHERE redirect_to_id IS NULL")
+    }
+    rows = conn.execute(
+        "SELECT s.knowledge_node_id, q.mastery_state FROM question_steps s"
+        " JOIN questions q ON q.question_uid = s.question_uid"
+        " WHERE q.origin_type = 'USER_CANONICAL' AND s.is_blocked_step = 1"
+    ).fetchall()
+    for row in rows:
+        root = resolver.resolve(str(row["knowledge_node_id"]))
+        states[root] = _pessimistic(states.get(root, "MASTERED"), str(row["mastery_state"]))
+    return states
 
 
 def node_state(conn: sqlite3.Connection, node_id: str) -> str:

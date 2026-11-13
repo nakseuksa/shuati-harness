@@ -28,6 +28,7 @@ import re
 import sqlite3
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version as _pkg_version
@@ -44,9 +45,8 @@ from backend.sandbox.sympy_verifier import (
     normalize_answer,
     run_sympy_in_sandbox,
     validate_script_ast,
-    verify_equation_equivalence,
 )
-from backend.services import elo_engine
+from backend.services import elo_engine, knowledge_graph
 from backend.services.difficulty_rubric import calculate_base_elo, clamp_substep_difficulty
 from backend.services.llm_gateway import chat_json
 
@@ -130,6 +130,7 @@ class _KernelPayload(BaseModel):
     parametric_stem_tpl: str
     sympy_solver_code: str
     constraints_check: str
+    equation_skeleton: str = ""
 
 
 class _BlindSolverPayload(BaseModel):
@@ -155,6 +156,7 @@ class _GenResult:
     answer_latex: str
     verification_status: Literal["SYMPY_VERIFIED", "DUAL_LLM_FALLBACK"]
     artifact: dict[str, Any]
+    equation_skeleton: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +342,7 @@ async def confirm_diagnostic_gate(
         )
 
         if confirmed_category == "ALREADY_MASTERED":
+            q_row = _load_question(conn, question_uid)
             result = elo_engine.record_mastered_init(conn, question_uid, session_id)
             explanation = result.explanation_text
             conn.execute(
@@ -347,6 +350,8 @@ async def confirm_diagnostic_gate(
                 "updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
                 (question_uid,),
             )
+            if str(q_row["mastery_state"]) != "MASTERED":
+                knowledge_graph.decrement_co_error_edges_on_mastery(conn, question_uid)
             new_stage = "SESSION_COMPLETED"
             new_prewarm_status = str(session["prewarm_status"])
         else:
@@ -421,12 +426,31 @@ async def confirm_diagnostic_gate(
 # ---------------------------------------------------------------------------
 
 
-def _ensure_prewarm_task(session_id: str, db_path: Path | None) -> asyncio.Task[None]:
+def _ensure_prewarm_task(
+    session_id: str,
+    db_path: Path | None,
+    *,
+    force_refresh: bool = False,
+    refresh_scaffold: bool = True,
+    refresh_variant: bool = True,
+    exclude_uids: set[str] | None = None,
+) -> asyncio.Task[None]:
     """登记并返回在途预热 Task；已存在且未完成则复用，否则（重）启动。"""
     existing = in_flight_prewarm_tasks.get(session_id)
-    if existing is not None and not existing.done():
+    if not force_refresh and existing is not None and not existing.done():
         return existing
-    task = asyncio.create_task(prewarm_session_questions(session_id, db_path))
+    if force_refresh and existing is not None and not existing.done():
+        existing.cancel()
+        in_flight_prewarm_tasks.pop(session_id, None)
+    task = asyncio.create_task(
+        prewarm_session_questions(
+            session_id,
+            db_path,
+            refresh_scaffold=refresh_scaffold,
+            refresh_variant=refresh_variant,
+            exclude_uids=exclude_uids,
+        )
+    )
     in_flight_prewarm_tasks[session_id] = task
 
     def _cleanup(finished: asyncio.Task[None]) -> None:
@@ -437,14 +461,30 @@ def _ensure_prewarm_task(session_id: str, db_path: Path | None) -> asyncio.Task[
     return task
 
 
-async def prewarm_session_questions(session_id: str, db_path: Path | None = None) -> None:
+async def prewarm_session_questions(
+    session_id: str,
+    db_path: Path | None = None,
+    *,
+    refresh_scaffold: bool = True,
+    refresh_variant: bool = True,
+    exclude_uids: set[str] | None = None,
+) -> None:
     """并发预热二阶微母题（SCAFFOLD_PRE）与四阶变式（ISOMORPHIC/SHARED_TRAP）。
 
     本地检索优先 → 内核先行 + AST/SymPy 沙盒 → 双盲 LLM 降级；落库用独立事务。
     任何异常收敛为 prewarm_status='FAILED'，绝不向调用方（前台）抛出。
     """
     try:
-        await _prewarm_impl(session_id, db_path)
+        if refresh_scaffold and refresh_variant and not exclude_uids:
+            await _prewarm_impl(session_id, db_path)
+        else:
+            await _prewarm_impl(
+                session_id,
+                db_path,
+                refresh_scaffold=refresh_scaffold,
+                refresh_variant=refresh_variant,
+                exclude_uids=exclude_uids,
+            )
     except Exception as exc:
         logger.exception("预热异常 session=%s", session_id)
         log_event(
@@ -470,36 +510,99 @@ async def get_session_view(session_id: str, db_path: Path | None = None) -> Sess
     return _build_response(session_id, db_path)
 
 
-async def retry_prewarm(session_id: str, db_path: Path | None = None) -> SessionStepResponse:
+async def retry_prewarm(
+    session_id: str,
+    db_path: Path | None = None,
+    *,
+    force: bool = False,
+) -> SessionStepResponse:
     """FAILED / 产物缺失时重试预热（前端「重试预热 / 换一题」入口）。
 
-    READY 且双产物齐全 → 幂等无操作返回当前视图；SESSION_COMPLETED → ValueError；
-    否则重启预热 Task（已有在途则复用），立即返回不 await，前端轮询 get_session_view。
+    force=False（默认）：READY 且双产物齐全 → 幂等无操作返回当前视图；
+    force=True：作废当前阶段目标产物（排除既有 UID）并强制重生成；
+    SESSION_COMPLETED → ValueError。
     """
     with get_db_connection(db_path) as conn:
         session = _load_session(conn, session_id)
-    if str(session["micro_stage"]) == "SESSION_COMPLETED":
+    stage = str(session["micro_stage"])
+    if stage == "SESSION_COMPLETED":
         raise ValueError("会话已完成，无需重试预热")
     status = str(session["prewarm_status"])
     has_both = (
         session["prewarm_scaffold_uid"] is not None
         and session["prewarm_variant_uid"] is not None
     )
-    if status in ("READY_SYMPY", "READY_FALLBACK") and has_both:
+    if not force and status in ("READY_SYMPY", "READY_FALLBACK") and has_both:
         return _build_response(session_id, db_path)
-    if status != "RUNNING":
-        _write_session_fields(db_path, session_id, prewarm_status="RUNNING")
-    _ensure_prewarm_task(session_id, db_path)
+
+    exclude_uids = {
+        str(uid)
+        for uid in (session["prewarm_scaffold_uid"], session["prewarm_variant_uid"])
+        if uid is not None
+    }
+    if force:
+        if stage == "STAGE_2_MICRO_SCAFFOLD":
+            refresh_scaffold, refresh_variant = True, False
+            _write_session_fields(
+                db_path, session_id, prewarm_scaffold_uid=None, prewarm_status="RUNNING"
+            )
+        elif stage == "STAGE_4_DECRUTCH_VARIANT":
+            refresh_scaffold, refresh_variant = False, True
+            _write_session_fields(
+                db_path, session_id, prewarm_variant_uid=None, prewarm_status="RUNNING"
+            )
+        else:
+            refresh_scaffold, refresh_variant = True, True
+            _write_session_fields(
+                db_path,
+                session_id,
+                prewarm_scaffold_uid=None,
+                prewarm_variant_uid=None,
+                prewarm_status="RUNNING",
+            )
+    else:
+        refresh_scaffold, refresh_variant = True, True
+        if status != "RUNNING":
+            _write_session_fields(db_path, session_id, prewarm_status="RUNNING")
+
+    _ensure_prewarm_task(
+        session_id,
+        db_path,
+        force_refresh=force,
+        refresh_scaffold=refresh_scaffold,
+        refresh_variant=refresh_variant,
+        exclude_uids=exclude_uids or None,
+    )
     return _build_response(session_id, db_path)
 
 
-async def _prewarm_impl(session_id: str, db_path: Path | None) -> None:
+def _existing_outcome(conn: sqlite3.Connection, uid: Any) -> _PrewarmOutcome | None:
+    if uid is None:
+        return None
+    row = _load_question(conn, str(uid))
+    return _PrewarmOutcome(str(uid), row["verification_status"] == "SYMPY_VERIFIED")
+
+
+async def _prewarm_impl(
+    session_id: str,
+    db_path: Path | None,
+    *,
+    refresh_scaffold: bool = True,
+    refresh_variant: bool = True,
+    exclude_uids: set[str] | None = None,
+) -> None:
     started = time.perf_counter()
     with get_db_connection(db_path) as conn:
         session = _load_session(conn, session_id)
         question = _load_question(conn, str(session["question_uid"]))
         steps = _branch_steps(
             conn, str(question["question_uid"]), str(session["matched_branch_id"])
+        )
+        existing_scaffold = None if refresh_scaffold else _existing_outcome(
+            conn, session["prewarm_scaffold_uid"]
+        )
+        existing_variant = None if refresh_variant else _existing_outcome(
+            conn, session["prewarm_variant_uid"]
         )
     question_uid = str(question["question_uid"])
     log_event(
@@ -522,12 +625,29 @@ async def _prewarm_impl(session_id: str, db_path: Path | None) -> None:
     stalled_step = _find_step(steps, int(session["stalled_step_index"]))
 
     _write_session_fields(db_path, session_id, prewarm_status="RUNNING")
-    scaffold_out, variant_out = await asyncio.gather(
-        _prepare_scaffold(question, stalled_step, db_path, session_id=session_id),
-        _prepare_variant(
-            question, str(session["error_category"]), db_path, session_id=session_id
-        ),
+
+    async def _keep(outcome: _PrewarmOutcome | None) -> _PrewarmOutcome | None:
+        return outcome
+
+    scaffold_coro = (
+        _prepare_scaffold(
+            question, stalled_step, db_path, session_id=session_id, exclude_uids=exclude_uids
+        )
+        if refresh_scaffold or existing_scaffold is None
+        else _keep(existing_scaffold)
     )
+    variant_coro = (
+        _prepare_variant(
+            question,
+            str(session["error_category"]),
+            db_path,
+            session_id=session_id,
+            exclude_uids=exclude_uids,
+        )
+        if refresh_variant or existing_variant is None
+        else _keep(existing_variant)
+    )
+    scaffold_out, variant_out = await asyncio.gather(scaffold_coro, variant_coro)
 
     fields: dict[str, Any] = {}
     if scaffold_out is not None:
@@ -558,12 +678,17 @@ async def _prepare_scaffold(
     stalled_step: sqlite3.Row,
     db_path: Path | None,
     session_id: str | None = None,
+    exclude_uids: set[str] | None = None,
 ) -> _PrewarmOutcome | None:
     """二阶脱壳微母题：本地 SCAFFOLD_PRE 检索 → 内核先行生成（针对卡点步）。"""
     try:
         parent_uid = str(question["question_uid"])
         with get_db_connection(db_path) as conn:
-            local = _search_local_scaffold(conn, question, stalled_step)
+            local = (
+                _search_local_scaffold(conn, question, stalled_step, exclude_uids=exclude_uids)
+                if exclude_uids
+                else _search_local_scaffold(conn, question, stalled_step)
+            )
             if local is not None:
                 _ensure_relation(
                     conn,
@@ -618,13 +743,18 @@ async def _prepare_variant(
     error_category: str,
     db_path: Path | None,
     session_id: str | None = None,
+    exclude_uids: set[str] | None = None,
 ) -> _PrewarmOutcome | None:
     """四阶拆拐杖变式：TRAP → SHARED_TRAP，否则 ISOMORPHIC（整题）。"""
     relation_type = "SHARED_TRAP" if error_category == "TRAP_OR_CALC_ERROR" else "ISOMORPHIC"
     try:
         parent_uid = str(question["question_uid"])
         with get_db_connection(db_path) as conn:
-            local = _search_local_variant(conn, question, relation_type)
+            local = (
+                _search_local_variant(conn, question, relation_type, exclude_uids=exclude_uids)
+                if exclude_uids
+                else _search_local_variant(conn, question, relation_type)
+            )
             if local is not None:
                 _ensure_relation(
                     conn,
@@ -678,50 +808,65 @@ async def _prepare_variant(
 
 
 def _search_local_scaffold(
-    conn: sqlite3.Connection, question: sqlite3.Row, stalled_step: sqlite3.Row
+    conn: sqlite3.Connection,
+    question: sqlite3.Row,
+    stalled_step: sqlite3.Row,
+    *,
+    exclude_uids: set[str] | None = None,
 ) -> sqlite3.Row | None:
     """SCAFFOLD_PRE：既有有向边优先；否则同主考点、步数<=2、D_orig-D_cand>=200。"""
+    excluded = exclude_uids or set()
     parent_uid = str(question["question_uid"])
-    row = conn.execute(
+    rows = conn.execute(
         "SELECT q.* FROM question_relations r "
         "JOIN questions q ON q.question_uid = r.source_question_uid "
-        "WHERE r.target_question_uid = ? AND r.relation_type = 'SCAFFOLD_PRE' LIMIT 1",
+        "WHERE r.target_question_uid = ? AND r.relation_type = 'SCAFFOLD_PRE'",
         (parent_uid,),
-    ).fetchone()
-    if row is not None:
-        return row
-    return conn.execute(
+    ).fetchall()
+    for row in rows:
+        if str(row["question_uid"]) not in excluded:
+            return row
+    candidates = conn.execute(
         "SELECT q.* FROM questions q WHERE q.question_uid <> ? AND q.base_elo <= ? "
         "AND (SELECT COUNT(*) FROM question_steps s WHERE s.question_uid = q.question_uid "
         "     AND s.solution_branch_id = 'canonical') BETWEEN 1 AND ? "
         "AND EXISTS (SELECT 1 FROM question_steps s WHERE s.question_uid = q.question_uid "
         "     AND s.knowledge_node_id = ?) "
-        "ORDER BY q.base_elo DESC LIMIT 1",
+        "ORDER BY q.base_elo DESC",
         (
             parent_uid,
             int(question["base_elo"]) - _SCAFFOLD_MIN_ELO_GAP,
             _SCAFFOLD_MAX_STEPS,
             str(stalled_step["knowledge_node_id"]),
         ),
-    ).fetchone()
+    ).fetchall()
+    for row in candidates:
+        if str(row["question_uid"]) not in excluded:
+            return row
+    return None
 
 
 def _search_local_variant(
-    conn: sqlite3.Connection, question: sqlite3.Row, relation_type: str
+    conn: sqlite3.Connection,
+    question: sqlite3.Row,
+    relation_type: str,
+    *,
+    exclude_uids: set[str] | None = None,
 ) -> sqlite3.Row | None:
     """ISOMORPHIC：同考点集且 |ΔD|<=150；SHARED_TRAP：trap_tags 交集非空。"""
+    excluded = exclude_uids or set()
     parent_uid = str(question["question_uid"])
     for sql in (
         "SELECT q.* FROM question_relations r "
         "JOIN questions q ON q.question_uid = r.source_question_uid "
-        "WHERE r.target_question_uid = ? AND r.relation_type = ? LIMIT 1",
+        "WHERE r.target_question_uid = ? AND r.relation_type = ?",
         "SELECT q.* FROM question_relations r "
         "JOIN questions q ON q.question_uid = r.target_question_uid "
-        "WHERE r.source_question_uid = ? AND r.relation_type = ? LIMIT 1",
+        "WHERE r.source_question_uid = ? AND r.relation_type = ?",
     ):
-        row = conn.execute(sql, (parent_uid, relation_type)).fetchone()
-        if row is not None:
-            return row
+        for row in conn.execute(sql, (parent_uid, relation_type)).fetchall():
+            if str(row["question_uid"]) not in excluded:
+                return row
 
     parent_elo = int(question["base_elo"])
     best: sqlite3.Row | None = None
@@ -733,6 +878,8 @@ def _search_local_variant(
             (parent_uid, parent_elo, _ISOMORPHIC_MAX_ELO_GAP),
         ).fetchall()
         for cand in candidates:
+            if str(cand["question_uid"]) in excluded:
+                continue
             if _node_id_set(conn, str(cand["question_uid"])) != parent_nodes:
                 continue
             gap = abs(int(cand["base_elo"]) - parent_elo)
@@ -747,6 +894,8 @@ def _search_local_variant(
         "SELECT * FROM questions WHERE question_uid <> ?", (parent_uid,)
     ).fetchall()
     for cand in candidates:
+        if str(cand["question_uid"]) in excluded:
+            continue
         if not parent_tags & _trap_tags(cand):
             continue
         gap = abs(int(cand["base_elo"]) - parent_elo)
@@ -807,11 +956,13 @@ def _ensure_relation(
 # ---- 内核先行生成 + AST/SymPy 沙盒 + 双盲降级 ----
 
 _KERNEL_SYSTEM_PROMPT = (
-    "你是数理题参数化内核生成器。仅输出 JSON 对象，含三个字段："
+    "你是数理题参数化内核生成器。仅输出 JSON 对象，含三个必填字段和可选字段："
     "parametric_stem_tpl（题干模板，用 str.format 占位符如 {a}，模板内不得出现其他花括号）、"
     "sympy_solver_code（必须定义 solve_kernel()，返回 "
     '{"params": dict[str, str|int|float], "answer_latex": str}）、'
-    "constraints_check（参数约束说明）。"
+    "constraints_check（参数约束说明）、"
+    "equation_skeleton（可选，多步推理/变式题的核心列式骨架 LaTeX 方程或分号分隔方程组，"
+    "供半程立式核验，占位符规则同上）。"
     "脚本仅允许 import sympy / math / fractions，必须包含真实符号求解调用"
     "（solve/solveset/Eq/simplify 等），禁止直接返回常量字面量。"
 )
@@ -865,6 +1016,22 @@ def _render_stem(tpl: str, params: dict[str, str | int | float] | None) -> str |
         return None
 
 
+def _render_optional_skeleton(
+    tpl: str, params: dict[str, str | int | float] | None
+) -> str | None:
+    """回填可选的核心列式骨架；兼容 LaTeX 花括号（如 \\frac{a}{b}）与 {param} 混用。"""
+    raw = (tpl or "").strip()
+    if not raw:
+        return None
+    formatted = _render_stem(raw, params)
+    if formatted is not None:
+        return formatted.strip() or None
+    text = raw
+    for key, val in (params or {}).items():
+        text = text.replace(f"{{{key}}}", str(val))
+    return text.strip() or None
+
+
 async def _generate_kernel_question(
     question: sqlite3.Row,
     *,
@@ -888,6 +1055,7 @@ async def _generate_kernel_question(
     last_error = "unknown"
     last_params: dict[str, str | int | float] | None = None
     tpl = ""
+    tpl_skeleton = ""
     code = ""
 
     for attempt in range(settings.SYMPY_MAX_RETRIES + 1):
@@ -899,6 +1067,7 @@ async def _generate_kernel_question(
             ),
         )
         tpl = kernel.parametric_stem_tpl
+        tpl_skeleton = kernel.equation_skeleton
         code = kernel.sympy_solver_code
         probe = validate_script_ast(code)
         sandbox_ok: bool | None = None
@@ -914,6 +1083,7 @@ async def _generate_kernel_question(
             if sandbox.ok and sandbox.answer_latex:
                 stem = _render_stem(tpl, sandbox.params)
                 if stem is not None:
+                    skeleton = _render_optional_skeleton(tpl_skeleton, sandbox.params)
                     artifact: dict[str, Any] = {
                         "method": "SYMPY_KERNEL",
                         "sympy_solver_code": code,
@@ -923,6 +1093,8 @@ async def _generate_kernel_question(
                         "attempts": attempt + 1,
                         "sympy_version": _pkg_version("sympy"),
                     }
+                    if skeleton is not None:
+                        artifact["equation_skeleton"] = skeleton
                     log_event(
                         logger,
                         "prewarm.kernel_attempt",
@@ -935,7 +1107,13 @@ async def _generate_kernel_question(
                         error_kind=None,
                         duration_ms=round((time.perf_counter() - attempt_start) * 1000, 2),
                     )
-                    return _GenResult(stem, sandbox.answer_latex, "SYMPY_VERIFIED", artifact)
+                    return _GenResult(
+                        stem,
+                        sandbox.answer_latex,
+                        "SYMPY_VERIFIED",
+                        artifact,
+                        equation_skeleton=skeleton,
+                    )
                 last_error = "题干模板参数回填失败"
                 error_kind = "RENDER_FAILED"
             else:
@@ -983,6 +1161,7 @@ async def _generate_kernel_question(
         logger.warning("双盲答案不一致 question=%s", question["question_uid"])
         return None
     answer, blind_answers = consensus
+    skeleton = _render_optional_skeleton(tpl_skeleton, last_params)
     artifact = {
         "method": "DUAL_LLM",
         "blind_answers": blind_answers,
@@ -991,11 +1170,15 @@ async def _generate_kernel_question(
         "last_error": last_error,
         "sympy_version": _pkg_version("sympy"),
     }
-    return _GenResult(stem, answer, "DUAL_LLM_FALLBACK", artifact)
+    if skeleton is not None:
+        artifact["equation_skeleton"] = skeleton
+    return _GenResult(
+        stem, answer, "DUAL_LLM_FALLBACK", artifact, equation_skeleton=skeleton
+    )
 
 
 async def _dual_blind_solve(stem: str) -> tuple[str, list[str]] | None:
-    """两次独立零上下文盲做，核对 answer_latex 一致性（等价引擎或规范化比对）。"""
+    """两次独立零上下文并发盲做，经 answers_equivalent 核对 answer_latex 一致性。"""
 
     def _fresh_messages() -> list[dict[str, Any]]:
         return [
@@ -1003,29 +1186,23 @@ async def _dual_blind_solve(stem: str) -> tuple[str, list[str]] | None:
             {"role": "user", "content": f"求解下题，给出最终答案：\n{stem}"},
         ]
 
-    first = cast(
-        _BlindSolverPayload,
-        await chat_json(
+    first, second = await asyncio.gather(
+        chat_json(
+            _fresh_messages(),
+            _BlindSolverPayload,
+            model=settings.SOLVER_LLM_MODEL_NAME,
+            purpose="solver_blind",
+        ),
+        chat_json(
             _fresh_messages(),
             _BlindSolverPayload,
             model=settings.SOLVER_LLM_MODEL_NAME,
             purpose="solver_blind",
         ),
     )
-    second = cast(
-        _BlindSolverPayload,
-        await chat_json(
-            _fresh_messages(),
-            _BlindSolverPayload,
-            model=settings.SOLVER_LLM_MODEL_NAME,
-            purpose="solver_blind",
-        ),
-    )
-    a1, a2 = first.answer_latex, second.answer_latex
-    n1, n2 = normalize_answer(a1), normalize_answer(a2)
-    if n1 and n1 == n2:
-        return a1, [a1, a2]
-    if await asyncio.to_thread(verify_equation_equivalence, n1, n2):
+    a1 = cast(_BlindSolverPayload, first).answer_latex
+    a2 = cast(_BlindSolverPayload, second).answer_latex
+    if await asyncio.to_thread(answers_equivalent, a1, a2):
         return a1, [a1, a2]
     return None
 
@@ -1099,6 +1276,11 @@ def _persist_synthetic(
                 json.dumps(gen.artifact, ensure_ascii=False),
             ),
         )
+        step_formula = (
+            gen.equation_skeleton or gen.answer_latex
+            if origin_type == "AI_SYNTHETIC_VARIANT"
+            else gen.answer_latex
+        )
         conn.execute(
             "INSERT INTO question_steps ("
             " step_id, question_uid, solution_branch_id, step_index, step_goal_desc,"
@@ -1109,7 +1291,7 @@ def _persist_synthetic(
                 uuid.uuid4().hex,
                 uid,
                 goal_desc,
-                gen.answer_latex,
+                step_formula,
                 node_id,
                 gen.stem_md,
                 *sub_cstl,
@@ -1160,7 +1342,7 @@ async def submit_stage_answer(
     if stage == "STAGE_3_REDO_ORIGINAL":
         return await _submit_stage3(session, user_answer, db_path)
     if stage == "STAGE_4_DECRUTCH_VARIANT":
-        return await _submit_stage4(session, user_answer, db_path)
+        return await _submit_stage4(session, user_answer, self_assessment, db_path)
     if stage == "STAGE_COOLDOWN_DEFERRED":
         return await _submit_cooldown(session, db_path)
     raise ValueError(f"非法微观阶段: {stage}")
@@ -1229,14 +1411,39 @@ async def _submit_stage1(
     return _build_response(session_id, db_path)
 
 
-def _scaffold_parent_uid(conn: sqlite3.Connection, uid: str) -> str | None:
-    """SCAFFOLD_PRE 有向边（source=子题 → target=母题）的直接上层。"""
-    row = conn.execute(
+def _direct_scaffold_parents(conn: sqlite3.Connection, uid: str) -> list[str]:
+    rows = conn.execute(
         "SELECT target_question_uid FROM question_relations "
-        "WHERE source_question_uid = ? AND relation_type = 'SCAFFOLD_PRE' LIMIT 1",
+        "WHERE source_question_uid = ? AND relation_type = 'SCAFFOLD_PRE' "
+        "ORDER BY rowid DESC",
         (uid,),
-    ).fetchone()
-    return str(row["target_question_uid"]) if row else None
+    ).fetchall()
+    return [str(row["target_question_uid"]) for row in rows]
+
+
+def _scaffold_parent_uid(
+    conn: sqlite3.Connection, uid: str, original_uid: str | None = None
+) -> str | None:
+    """SCAFFOLD_PRE 有向边（source=子题 → target=母题）的直接上层；优先锚定 original_uid 链。"""
+    parents = _direct_scaffold_parents(conn, uid)
+    if not parents:
+        return None
+    if original_uid is None or len(parents) == 1:
+        return parents[0]
+    if original_uid in parents:
+        return original_uid
+    # 若微母题被多道原题复用，沿有向父链 BFS 定位通往当前会话 original_uid 的分支前驱
+    queue: deque[tuple[str, str]] = deque((p, p) for p in parents)
+    seen = {uid, *parents}
+    while queue:
+        node, first_hop = queue.popleft()
+        for nxt in _direct_scaffold_parents(conn, node):
+            if nxt == original_uid:
+                return first_hop
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append((nxt, first_hop))
+    return parents[0]
 
 
 def _scaffold_depth(conn: sqlite3.Connection, scaffold_uid: str, original_uid: str) -> int:
@@ -1245,7 +1452,7 @@ def _scaffold_depth(conn: sqlite3.Connection, scaffold_uid: str, original_uid: s
     cur = scaffold_uid
     seen = {cur}
     while cur != original_uid and depth <= settings.SCAFFOLD_DESCENT_MAX_DEPTH + 1:
-        nxt = _scaffold_parent_uid(conn, cur)
+        nxt = _scaffold_parent_uid(conn, cur, original_uid)
         if nxt is None or nxt in seen or nxt == original_uid:
             break
         seen.add(nxt)
@@ -1370,9 +1577,34 @@ async def _descend_scaffold(
 async def _submit_stage2(
     session: sqlite3.Row, user_answer: str, self_assessment: str | None, db_path: Path | None
 ) -> SessionStepResponse:
-    """二阶脱壳微母题：等价 → 升层/三阶；不会/请求铺垫 → 递归降阶；错 → 停留反馈。"""
+    """二阶脱壳微母题：等价→升层/三阶；降级 SKIP→三阶；不会→递归降阶；错→停留反馈。"""
     session_id = str(session["session_id"])
     scaffold = await _ensure_prewarm_question(session_id, "scaffold", db_path)
+    if (
+        (self_assessment or "").strip().upper() == "SKIP"
+        and str(scaffold["verification_status"]) == "DUAL_LLM_FALLBACK"
+    ):
+        log_event(
+            logger,
+            "fsm.submission",
+            session_id=session_id,
+            question_uid=str(session["question_uid"]),
+            stage="STAGE_2_MICRO_SCAFFOLD",
+            correct=False,
+            skipped=True,
+        )
+        _transition(
+            db_path,
+            session_id,
+            expect="STAGE_2_MICRO_SCAFFOLD",
+            new="STAGE_3_REDO_ORIGINAL",
+            trigger="fallback_skipped",
+        )
+        return _build_response(
+            session_id,
+            db_path,
+            notice="已跳过未经沙盒强校验的微母题，直接回到原题。",
+        )
     no_idea = (
         (self_assessment or "").strip().lower() in _NO_IDEA_ASSESSMENTS
         or _is_no_idea_text(user_answer)
@@ -1402,7 +1634,9 @@ async def _submit_stage2(
     )
     if correct:
         with get_db_connection(db_path) as conn:
-            parent_uid = _scaffold_parent_uid(conn, str(scaffold["question_uid"]))
+            parent_uid = _scaffold_parent_uid(
+                conn, str(scaffold["question_uid"]), str(session["question_uid"])
+            )
             parent = _load_question(conn, parent_uid) if parent_uid else None
             ascent_depth = (
                 _scaffold_depth(
@@ -1480,13 +1714,34 @@ def _stage4_standard(
 
 
 async def _submit_stage4(
-    session: sqlite3.Row, user_answer: str, db_path: Path | None
+    session: sqlite3.Row,
+    user_answer: str,
+    self_assessment: str | None,
+    db_path: Path | None,
 ) -> SessionStepResponse:
     """四阶当场拆拐杖：通过 → 冻结托管 + PENDING_RETEST + 盲测窗口；错 → 冷却。"""
     session_id = str(session["session_id"])
     with get_db_connection(db_path) as conn:
         question = _load_question(conn, str(session["question_uid"]))
     variant = await _ensure_prewarm_question(session_id, "variant", db_path)
+    if (
+        (self_assessment or "").strip().upper() == "SKIP"
+        and str(variant["verification_status"]) == "DUAL_LLM_FALLBACK"
+    ):
+        log_event(
+            logger,
+            "fsm.submission",
+            session_id=session_id,
+            question_uid=str(session["question_uid"]),
+            stage="STAGE_4_DECRUTCH_VARIANT",
+            correct=False,
+            skipped=True,
+        )
+        return _build_response(
+            session_id,
+            db_path,
+            notice="四阶当场验证为结算关口不可跳过，请点击「换一题（重新热备）」重新生成或提交作答。",
+        )
     with get_db_connection(db_path) as conn:
         variant_steps = _branch_steps(conn, str(variant["question_uid"]), "canonical")
     standard, mode = _stage4_standard(question, variant, variant_steps)
@@ -1667,10 +1922,20 @@ def _build_response(
         elif stage == "STAGE_COOLDOWN_DEFERRED":
             view = {"skeleton_comparison_card": _comparison_card(conn, session, question)}
         elif stage == "SESSION_COMPLETED":
+            escrow_row = conn.execute(
+                "SELECT escrow_combat_delta FROM question_escrow_pool WHERE question_uid = ?",
+                (question["question_uid"],),
+            ).fetchone()
+            escrow_delta = (
+                float(escrow_row["escrow_combat_delta"])
+                if escrow_row is not None and str(question["mastery_state"]) == "PENDING_RETEST"
+                else None
+            )
             view = {
                 "mastery_state": question["mastery_state"],
                 "blind_test_unlock_at": question["blind_test_unlock_at"],
                 "blind_test_due_at": question["blind_test_due_at"],
+                "escrow_combat_delta": escrow_delta,
             }
         if feedback is not None:
             view["feedback"] = feedback

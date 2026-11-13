@@ -571,6 +571,10 @@ def _verify_equation_equivalence_impl(
 _IMPLICATION_SEPS = ("\\Rightarrow", "\\Longrightarrow", "\\implies", "⇒", "→")
 _TEXT_CMD_RE = re.compile(r"\\(?:text|mathrm|mbox|operatorname)\s*\{[^{}]*\}")
 _FRAC_RE = re.compile(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
+_SHORT_FRAC_RE = re.compile(
+    r"\\frac\s*(?:\{([^{}]*)\}|([A-Za-z0-9]))\s*(?:\{([^{}]*)\}|([A-Za-z0-9]))"
+)
+_SQRT_NTH_RE = re.compile(r"\\sqrt\s*\[([^\[\]]+)\]\s*\{([^{}]*)\}")
 _SQRT_RE = re.compile(r"\\sqrt\s*\{([^{}]*)\}")
 _LEFT_RIGHT_RE = re.compile(r"\\(?:left|right)\b")
 _SUB_BRACE_RE = re.compile(r"_\{([^{}]*)\}")
@@ -689,6 +693,75 @@ def _num_eq(a: float, b: float) -> bool:
     return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
 
 
+_CN_COUNTER_CHARS = "只个条张本名辆架台支根颗粒块片位户人岁套间"
+_LABELED_ITEM_RE = re.compile(
+    r"([A-Za-z\u4e00-\u9fff·_-]*[\u4e00-\u9fff][A-Za-z\u4e00-\u9fff·_\s-]*?)"
+    r"\s*[:=]?\s*(-?\d+(?:\.\d+)?)\s*"
+    rf"([{_CN_COUNTER_CHARS}]?)"
+    r"(?=$|[\s,;、A-Za-z\u4e00-\u9fff])"
+)
+_BARE_NUMBER_LIST_RE = re.compile(
+    r"^[\s,;、]*(-?\d+(?:\.\d+)?)(?:[\s,;、]+(-?\d+(?:\.\d+)?))*[\s,;、]*$"
+)
+
+
+def _unwrap_labeled_text(text: str) -> str:
+    s = _fullwidth_to_halfwidth((text or "").strip())
+    for sep in _IMPLICATION_SEPS:
+        if sep in s:
+            s = s.split(sep)[-1].strip()
+    for _ in range(2):
+        s = re.sub(r"\\(?:text|mathrm|mbox|operatorname)\s*\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\(?:qquad|quad|[,;:!])|\\ |~", " ", s)
+    s = s.replace("$", "")
+    return s.strip().rstrip("。，,.;；")
+
+
+def _parse_labeled_numbers(text: str) -> list[tuple[str, float]] | None:
+    """解析纯「含汉字实体标签 + 数值 + 可选计数词」序列，供多实体应用题比对。"""
+    s = _unwrap_labeled_text(text)
+    if not s or any(op in s for op in ("+", "*", "/", "^", "(", ")")):
+        return None
+    items: list[tuple[str, float]] = []
+    pos = 0
+    while pos < len(s):
+        sep_match = re.match(r"[\s,;、]+", s[pos:])
+        if sep_match is not None:
+            pos += sep_match.end()
+            continue
+        m = _LABELED_ITEM_RE.match(s, pos)
+        if m is None:
+            return None
+        label = re.sub(r"\s+", "", m.group(1))
+        if len(label) > 1 and label[-1] in ("有", "为", "是"):
+            label = label[:-1]
+        if not any("\u4e00" <= ch <= "\u9fff" for ch in label):
+            return None
+        items.append((label, float(m.group(2))))
+        pos = m.end()
+    return items or None
+
+
+def _labeled_numbers_equivalent(user_raw: str, std_items: list[tuple[str, float]]) -> bool:
+    user_items = _parse_labeled_numbers(user_raw)
+    if user_items is not None:
+        if len(user_items) != len(std_items):
+            return False
+        u_sorted = sorted(user_items, key=lambda x: (x[0], x[1]))
+        s_sorted = sorted(std_items, key=lambda x: (x[0], x[1]))
+        return all(
+            ul == sl and _num_eq(uv, sv)
+            for (ul, uv), (sl, sv) in zip(u_sorted, s_sorted, strict=True)
+        )
+    if len(std_items) >= 2:
+        s = _unwrap_labeled_text(user_raw)
+        if _BARE_NUMBER_LIST_RE.fullmatch(s) is not None:
+            nums = [float(tok) for tok in re.findall(r"-?\d+(?:\.\d+)?", s)]
+            if len(nums) == len(std_items):
+                return all(_num_eq(uv, sv) for uv, (_, sv) in zip(nums, std_items, strict=True))
+    return False
+
+
 def _parse_quantity(text: str) -> tuple[float, str] | None:
     """解析复合数量（纯「数字+单位」序列）→ (基本单位值, 量纲)。
 
@@ -715,6 +788,8 @@ def _parse_quantity(text: str) -> tuple[float, str] | None:
     while pos < len(s):
         m = _QUANTITY_UNIT_RE.match(s, pos)
         if m is not None:
+            if matched and m.group(1).startswith("-"):
+                return None  # 禁止后续分段出现负号（如 9小时-36分）
             num = float(m.group(1))
             unit = m.group(2)
             if unit == "分" and money_ctx:
@@ -780,16 +855,24 @@ def _quantity_equivalent(
     return any(_num_eq(val, c) for c in candidates)
 
 
+def _replace_short_frac(match: re.Match[str]) -> str:
+    num = match.group(1) if match.group(1) is not None else match.group(2)
+    den = match.group(3) if match.group(3) is not None else match.group(4)
+    return f"(({num})/({den}))"
+
+
 def latex_to_plain(text: str) -> str:
     """将步骤/答案 LaTeX 规范化为 verify_equation_equivalence 可解析的纯文本。
 
-    去除单位（\\text{...}）、间距与 \\left/\\right；\\frac/\\sqrt 转函数式；
+    去除单位（\\text{...}）、间距与 \\left/\\right；\\frac/\\dfrac/\\tfrac/\\sqrt 转函数式；
     下标扁平化（v_{max} → vmax，封死下划线内省面）；上标保留 ^（convert_xor）。
     """
-    s = _TEXT_CMD_RE.sub("", text)
+    s = _TEXT_CMD_RE.sub("", text).replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
     for _ in range(8):  # 交替展开嵌套 \frac / \sqrt，直至不动点
-        expanded = _SQRT_RE.sub(r"sqrt(\1)", s)
+        expanded = _SQRT_NTH_RE.sub(r"((\2)**(1/(\1)))", s)
+        expanded = _SQRT_RE.sub(r"sqrt(\1)", expanded)
         expanded = _FRAC_RE.sub(r"((\1)/(\2))", expanded)
+        expanded = _SHORT_FRAC_RE.sub(_replace_short_frac, expanded)
         if expanded == s:
             break
         s = expanded
@@ -797,7 +880,7 @@ def latex_to_plain(text: str) -> str:
     s = _SUB_BRACE_RE.sub(r"\1", s)
     s = _SUP_BRACE_RE.sub(r"^(\1)", s)
     s = _SUB_CHAR_RE.sub(r"\1", s)
-    s = s.replace(r"\cdot", "*").replace(r"\times", "*")
+    s = s.replace(r"\cdot", "*").replace(r"\times", "*").replace(r"\div", "/")
     s = _SPACING_RE.sub("", s)
     s = s.replace("~", " ")
     s = _COMMAND_RE.sub(r"\1", s)  # 其余字母命令（\theta → theta 等）
@@ -831,6 +914,9 @@ def answers_equivalent(user_answer: str, standard: str) -> bool:
     qs = _parse_quantity(standard)
     if qs is not None or qu is not None:
         return _quantity_equivalent(qu, qs, user_answer, standard)
+    std_labeled = _parse_labeled_numbers(standard)
+    if std_labeled is not None and _labeled_numbers_equivalent(user_answer, std_labeled):
+        return True
     user = normalize_answer(user_answer)
     std = normalize_answer(standard)
     if not user or not std:

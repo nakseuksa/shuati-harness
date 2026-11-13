@@ -273,3 +273,24 @@ def test_extra_frontmatter_fields_preserved() -> None:
     out, uid, _ = normalize_markdown_with_frontmatter(md, None, "G")
     assert uid == "keep-me"
     assert "tags: physics\n" in out
+
+
+def test_traversal_local_image_not_ingested(cas_dir: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "secret.png"
+    outside.write_bytes(_make_png((32, 32)))
+    base_dir = tmp_path / "md"
+    base_dir.mkdir()
+    md = "![越界](../secret.png)\n"
+
+    out, _, _ = normalize_markdown_with_frontmatter(md, None, "G", base_dir=base_dir)
+    assert "../secret.png" in out
+    assert list(cas_dir.rglob("*")) == []
+
+
+def test_decompression_bomb_raises_value_error(
+    cas_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 16)
+    big_png = _make_png((64, 64))
+    with pytest.raises(ValueError, match="解压炸弹"):
+        ingest_image_bytes(big_png)

@@ -16,6 +16,7 @@ elo_engine / cas_store / schema。本文件仅负责：
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -35,6 +36,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import PlainTextResponse, Response
 
+from backend.config import settings
 from backend.db.schema import get_db_connection, init_db
 from backend.observability import log_event, request_id_var, setup_logging
 from backend.services import elo_engine, knowledge_graph
@@ -47,11 +49,12 @@ from backend.services.blind_drill_scheduler import (
 from backend.services.cas_store import resolve_cas_uri
 from backend.services.ingest_service import GateCardDTO, InitialState, ingest_question
 from backend.services.knowledge_graph import CanonicalNodeResolver, GraphMetricsDTO
-from backend.services.llm_gateway import LLMGatewayError
+from backend.services.llm_gateway import LLMGatewayError, aclose_shared_clients
 from backend.services.scaffold_engine import (
     SessionStepResponse,
     confirm_diagnostic_gate,
     get_session_view,
+    prewarm_session_questions,
     retry_prewarm,
     submit_stage_answer,
 )
@@ -267,12 +270,22 @@ def _require_session(session_id: str) -> None:
 
 
 async def _save_uploads(uploads: list[UploadFile] | None, tmp_dir: Path, prefix: str) -> list[Path]:
-    """上传文件落 tmp 目录（序号命名，杜绝路径穿越），返回落盘路径列表。"""
+    """上传文件落 tmp 目录（序号命名 + 大小上限检查，杜绝路径穿越与内存 OOM），返回落盘路径列表。"""
+    limit = settings.MAX_UPLOAD_IMAGE_BYTES
     paths: list[Path] = []
     for idx, upload in enumerate(uploads or []):
         suffix = Path(upload.filename or "").suffix
         dest = tmp_dir / f"{prefix}_{idx}{suffix}"
-        dest.write_bytes(await upload.read())
+        total = 0
+        with dest.open("wb") as fh:
+            while True:
+                chunk = await upload.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError(f"上传图片体积超过上限 ({limit} bytes)")
+                fh.write(chunk)
         paths.append(dest)
     return paths
 
@@ -299,6 +312,7 @@ def _build_graph_response(conn: sqlite3.Connection) -> KnowledgeGraphResponse:
     l1_modules.update(
         str(row[0]) for row in conn.execute("SELECT DISTINCT primary_l1_module FROM questions")
     )
+    node_states = knowledge_graph.all_node_states(conn)
     modules: list[L1ModuleView] = []
     for l1 in sorted(l1_modules):
         l2_groups: list[L2GroupView] = []
@@ -309,7 +323,7 @@ def _build_graph_response(conn: sqlite3.Connection) -> KnowledgeGraphResponse:
                     node_id=str(row["node_id"]),
                     l3_operator=str(row["l3_operator"]),
                     aliases=json.loads(row["aliases_json"]),
-                    state=knowledge_graph.node_state(conn, str(row["node_id"])),
+                    state=node_states.get(str(row["node_id"]), "MASTERED"),
                     redirected_node_ids=sorted(redirected_children.get(str(row["node_id"]), [])),
                 )
                 for row in active_rows
@@ -493,7 +507,10 @@ class _RequestLogMiddleware(BaseHTTPMiddleware):
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     setup_logging()  # 幂等挂载行为日志（P5 观测层，先于业务初始化）
     init_db()  # 幂等建表（settings.SQLITE_PATH）
-    yield
+    try:
+        yield
+    finally:
+        await aclose_shared_clients()
 
 
 def create_app(frontend_dir: Path | None = None) -> FastAPI:
@@ -535,27 +552,30 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
     # ---- CUJ 1/2：门禁确认三分支 + 微观状态机作答 ----
     @app.post("/api/v1/sessions/{session_id}/confirm-gate", response_model=SessionStepResponse)
     async def confirm_gate(session_id: str, body: ConfirmGateRequest) -> SessionStepResponse:
-        _require_session(session_id)
+        await asyncio.to_thread(_require_session, session_id)
         return await confirm_diagnostic_gate(
             session_id, body.stalled_step_index, body.error_category
         )
 
     @app.post("/api/v1/sessions/{session_id}/step-submit", response_model=SessionStepResponse)
     async def step_submit(session_id: str, body: StepSubmitRequest) -> SessionStepResponse:
-        _require_session(session_id)
+        await asyncio.to_thread(_require_session, session_id)
         return await submit_stage_answer(session_id, body.user_answer, body.self_assessment)
 
     @app.get("/api/v1/sessions/{session_id}", response_model=SessionStepResponse)
     async def get_session(session_id: str) -> SessionStepResponse:
         """只读刷新会话视图：前端预热轮询与断点续传的服务端真相源。"""
-        _require_session(session_id)
+        await asyncio.to_thread(_require_session, session_id)
         return await get_session_view(session_id)
 
     @app.post("/api/v1/sessions/{session_id}/retry-prewarm", response_model=SessionStepResponse)
-    async def retry_session_prewarm(session_id: str) -> SessionStepResponse:
-        """预热 FAILED / 产物缺失时重试；READY 幂等无操作。"""
-        _require_session(session_id)
-        return await retry_prewarm(session_id)
+    async def retry_session_prewarm(
+        session_id: str,
+        force: Annotated[bool, Query()] = False,
+    ) -> SessionStepResponse:
+        """预热 FAILED / 产物缺失时重试；READY 默认幂等，force=true 强制换新重生成。"""
+        await asyncio.to_thread(_require_session, session_id)
+        return await retry_prewarm(session_id, force=force)
 
     # ---- CUJ 3：每日盲测题单 / 销账（active_date 注入贯穿，支持时间旅行） ----
     @app.get("/api/v1/drills/daily", response_model=list[BlindDrillItemDTO])
@@ -567,16 +587,26 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
             return get_daily_blind_drill_queue(conn, day)
 
     @app.post("/api/v1/drills/daily", response_model=BlindDrillOutcomeDTO)
-    def submit_drill(body: BlindDrillSubmitRequest) -> BlindDrillOutcomeDTO:
+    async def submit_drill(body: BlindDrillSubmitRequest) -> BlindDrillOutcomeDTO:
         day = body.active_date if body.active_date is not None else date.today()
-        with get_db_connection() as conn:
-            return evaluate_blind_drill_submission(
-                conn,
-                body.question_uid,
-                body.final_answer,
-                intermediate_sub_answer=body.intermediate_sub_answer,
-                active_date=day,
+
+        def _run_submit() -> BlindDrillOutcomeDTO:
+            with get_db_connection() as conn:
+                return evaluate_blind_drill_submission(
+                    conn,
+                    body.question_uid,
+                    body.final_answer,
+                    intermediate_sub_answer=body.intermediate_sub_answer,
+                    active_date=day,
+                )
+
+        outcome = await asyncio.to_thread(_run_submit)
+        if outcome.retrain_session_id:
+            await prewarm_session_questions(
+                outcome.retrain_session_id,
+                refresh_scaffold=outcome.retrain_stage != "STAGE_4_DECRUTCH_VARIANT",
             )
+        return outcome
 
     # ---- CUJ 4：三层知识网看板 + 并查集批次一键回滚 ----
     @app.get("/api/v1/knowledge-graph", response_model=KnowledgeGraphResponse)

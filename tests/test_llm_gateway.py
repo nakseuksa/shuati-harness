@@ -377,3 +377,24 @@ async def test_real_non_string_content_raises(
     )
     with pytest.raises(LLMGatewayError, match="非字符串"):
         await chat_json(SIMPLE_MESSAGES, KernelPayload, model="m", purpose="p")
+
+
+async def test_real_reuses_shared_httpx_client_and_closes(
+    real_mode: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests, client_kwargs = install_handler(
+        monkeypatch, lambda req: completion(KERNEL_JSON)
+    )
+    try:
+        for _ in range(3):
+            res = await chat_json(SIMPLE_MESSAGES, KernelPayload, model="m", purpose="p")
+            assert isinstance(res, KernelPayload)
+        assert len(requests) == 3
+        assert len(client_kwargs) == 1
+
+        await llm_gateway.aclose_shared_clients()
+        await chat_json(SIMPLE_MESSAGES, KernelPayload, model="m", purpose="p")
+        assert len(requests) == 4
+        assert len(client_kwargs) == 2
+    finally:
+        await llm_gateway.aclose_shared_clients()

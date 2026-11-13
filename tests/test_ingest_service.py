@@ -1075,3 +1075,47 @@ async def test_auto_mastered_observability_events(
         r for r in caplog.records if getattr(r, "event", None) == "ingest.persisted"
     ]
     assert persisted and getattr(persisted[0], "fields", {})["auto_mastered"] is True
+
+
+async def test_ingest_releases_db_lock_during_vlm_call(
+    tmp_db: Path, cas_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VLM HTTP 期间不持有 SQLite 写锁，外部连接可并发写入。"""
+    vlm_started = asyncio.Event()
+    release_vlm = asyncio.Event()
+    real_analyze = ingest_service.analyze_question_and_draft
+
+    async def slow_analyze(
+        stem_md: str,
+        stem_images: list[Path],
+        draft_images: list[Path],
+        target_grade: str,
+        existing_l1_l2_tree: dict[str, list[str]],
+    ) -> DiagnosisPayload:
+        vlm_started.set()
+        await release_vlm.wait()
+        return await real_analyze(
+            stem_md, stem_images, draft_images, target_grade, existing_l1_l2_tree
+        )
+
+    monkeypatch.setattr(ingest_service, "analyze_question_and_draft", slow_analyze)
+    task = asyncio.create_task(_ingest(tmp_db))
+    await vlm_started.wait()
+
+    other = sqlite3.connect(tmp_db, timeout=0.2)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute(
+            "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
+            " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
+            " base_elo, tier, primary_l1_module, mastery_state)"
+            " VALUES ('concurrent-probe', 'USER_CANONICAL', '高中物理-高二', '并发探针',"
+            " 'hash-probe', '1', 1, 1, 1, 1, 1200, 'L1_基础夯实', '力学', 'ACTIVE')"
+        )
+        other.commit()
+    finally:
+        other.close()
+        release_vlm.set()
+
+    card = await task
+    assert card.question_uid

@@ -54,6 +54,7 @@ from backend.services.difficulty_rubric import (
 )
 from backend.services.knowledge_graph import match_or_create_l3_node, record_co_error_edges
 from backend.services.vlm_diagnosis import (
+    DiagnosisPayload,
     DraftAlignmentResult,
     StepSkeletonItem,
     analyze_question_and_draft,
@@ -161,30 +162,78 @@ async def ingest_question(
             "SELECT * FROM questions WHERE question_uid = ?", (uid,)
         ).fetchone()
         if existing is not None:
-            return await _reimport_question(
+            latest = _latest_session(conn, uid)
+            stem_changed = existing["stem_hash"] != stem_hash
+            has_new_drafts = _has_new_drafts(draft_uris, latest)
+            if not stem_changed and not has_new_drafts:
+                log_event(
+                    logger,
+                    "ingest.reimport",
+                    question_uid=uid,
+                    session_id=str(latest["session_id"]),
+                    mode="short_circuit",
+                    stem_changed=False,
+                )
+                return _gate_card_from_db(conn, existing, latest, is_reimport=True)
+            if stem_changed and not has_new_drafts:
+                conn.execute(
+                    "UPDATE questions SET stem_md = ?, stem_hash = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
+                    (normalized_md, stem_hash, uid),
+                )
+                log_event(
+                    logger,
+                    "ingest.reimport",
+                    question_uid=uid,
+                    session_id=str(latest["session_id"]),
+                    mode="stem_updated",
+                    stem_changed=True,
+                )
+                log_event(
+                    logger,
+                    "ingest.persisted",
+                    question_uid=uid,
+                    session_id=str(latest["session_id"]),
+                    base_elo=int(existing["base_elo"]),
+                    tier=str(existing["tier"]),
+                    is_reimport=True,
+                )
+                return _gate_card_from_db(conn, existing, latest, is_reimport=True)
+        tree = _build_l1_l2_tree(conn)
+
+    # 释放数据库连接与 SQLite 锁后，再跨网络执行耗时 VLM 诊断与沙盒判定
+    payload = await analyze_question_and_draft(
+        normalized_md, stem_images, draft_images, target_grade, tree
+    )
+
+    if existing is not None:
+        with get_db_connection(db_path) as conn:
+            fresh_existing = conn.execute(
+                "SELECT * FROM questions WHERE question_uid = ?", (uid,)
+            ).fetchone()
+            assert fresh_existing is not None
+            return _persist_reimport_draft_session(
                 conn,
-                existing,
+                fresh_existing,
+                payload=payload,
                 normalized_md=normalized_md,
                 stem_hash=stem_hash,
-                stem_images=stem_images,
-                draft_images=draft_images,
                 draft_uris=draft_uris,
-                target_grade=target_grade,
                 initial_state=initial_state,
             )
-        return await _ingest_new_question(
-            conn,
-            uid=uid,
-            normalized_md=normalized_md,
-            stem_hash=stem_hash,
-            stem_images=stem_images,
-            draft_images=draft_images,
-            draft_uris=draft_uris,
-            target_grade=target_grade,
-            initial_state=initial_state,
-            user_answer=user_answer,
-            mastered_claim=mastered_claim,
-        )
+
+    return await _ingest_new_question(
+        db_path,
+        uid=uid,
+        payload=payload,
+        normalized_md=normalized_md,
+        stem_hash=stem_hash,
+        draft_uris=draft_uris,
+        target_grade=target_grade,
+        initial_state=initial_state,
+        user_answer=user_answer,
+        mastered_claim=mastered_claim,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -193,27 +242,22 @@ async def ingest_question(
 
 
 async def _ingest_new_question(
-    conn: sqlite3.Connection,
+    db_path: Path | None,
     *,
     uid: str,
+    payload: DiagnosisPayload,
     normalized_md: str,
     stem_hash: str,
-    stem_images: list[Path],
-    draft_images: list[Path],
     draft_uris: list[str],
     target_grade: str,
     initial_state: InitialState,
     user_answer: str,
     mastered_claim: bool,
 ) -> GateCardDTO:
-    """新题全链路：L1/L2 树注入 → VLM 诊断 → rubric 定级 → 三表原子写入。
+    """新题全链路：校验诊断结论与掌握判定（无锁） → rubric 定级 → 三表单事务原子写入。
 
     P7-A 掌握判定命中时，落库后同事务内 record_mastered_init 结算（录入即掌握）。
     """
-    tree = _build_l1_l2_tree(conn)
-    payload = await analyze_question_and_draft(
-        normalized_md, stem_images, draft_images, target_grade, tree
-    )
     trace = payload.trace
     alignment = payload.alignment
     if not trace.steps:
@@ -250,42 +294,48 @@ async def _ingest_new_question(
         step_count=len(trace.steps),
     )
 
-    conn.execute(
-        """INSERT INTO questions (
-            question_uid, origin_type, target_grade_and_subject, stem_md, stem_hash,
-            standard_answer_latex, c_score, s_score, t_score, l_score, base_elo, tier,
-            trap_tags_json, primary_l1_module, mastery_state, verification_status
-        ) VALUES (?, 'USER_CANONICAL', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  'ACTIVE', 'HUMAN_OR_CANONICAL')""",
-        (
-            uid,
-            target_grade,
-            normalized_md,
-            stem_hash,
-            trace.standard_answer_latex,
-            trace.c_score,
-            trace.s_score,
-            trace.t_score,
-            trace.l_score,
-            base_elo,
-            tier,
-            json.dumps(trace.trap_tags, ensure_ascii=False),
-            trace.steps[0].l1_module,
-        ),
-    )
+    with get_db_connection(db_path) as conn:
+        branches: list[tuple[str, list[StepSkeletonItem]]] = [("canonical", trace.steps)]
+        if alignment.alt_branch_steps:
+            branches.append(("user_alt_1", alignment.alt_branch_steps))
+        resolved_steps: list[
+            tuple[str, StepSkeletonItem, str, bool, tuple[int, int, int, int], int]
+        ] = []
+        for branch_id, steps in branches:
+            for step in steps:
+                sub_cstl, sub_elo = clamp_substep_difficulty(
+                    parent_cstl, base_elo, (step.c_sub, step.s_sub, step.t_sub, step.l_sub)
+                )
+                # 诊断 Schema 暂无别名字段，candidate_aliases 传 []
+                node_id, reused = await match_or_create_l3_node(
+                    conn, step.l1_module, step.l2_entity, step.l3_operator, []
+                )
+                resolved_steps.append((branch_id, step, node_id, reused, sub_cstl, sub_elo))
 
-    branches: list[tuple[str, list[StepSkeletonItem]]] = [("canonical", trace.steps)]
-    if alignment.alt_branch_steps:
-        branches.append(("user_alt_1", alignment.alt_branch_steps))
-    for branch_id, steps in branches:
-        for step in steps:
-            sub_cstl, sub_elo = clamp_substep_difficulty(
-                parent_cstl, base_elo, (step.c_sub, step.s_sub, step.t_sub, step.l_sub)
-            )
-            # 诊断 Schema 暂无别名字段，candidate_aliases 传 []
-            node_id, reused = await match_or_create_l3_node(
-                conn, step.l1_module, step.l2_entity, step.l3_operator, []
-            )
+        conn.execute(
+            """INSERT INTO questions (
+                question_uid, origin_type, target_grade_and_subject, stem_md, stem_hash,
+                standard_answer_latex, c_score, s_score, t_score, l_score, base_elo, tier,
+                trap_tags_json, primary_l1_module, mastery_state, verification_status
+            ) VALUES (?, 'USER_CANONICAL', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      'ACTIVE', 'HUMAN_OR_CANONICAL')""",
+            (
+                uid,
+                target_grade,
+                normalized_md,
+                stem_hash,
+                trace.standard_answer_latex,
+                trace.c_score,
+                trace.s_score,
+                trace.t_score,
+                trace.l_score,
+                base_elo,
+                tier,
+                json.dumps(trace.trap_tags, ensure_ascii=False),
+                trace.steps[0].l1_module,
+            ),
+        )
+        for branch_id, step, node_id, reused, sub_cstl, sub_elo in resolved_steps:
             _insert_step_row(
                 conn,
                 uid,
@@ -298,66 +348,66 @@ async def _ingest_new_question(
                 alignment.stalled_step_index,
             )
 
-    session_id = _insert_session(
-        conn, uid, draft_uris, alignment, initial_state, mastered=mastered
-    )
-    mastery_explanation: str | None = None
-    if mastered:
-        # 录入即结算（单事务）：参照 scaffold_engine.confirm_diagnostic_gate
-        # ALREADY_MASTERED 分支；水位线门控/幂等键等既有 Elo 规则不变。
-        result = elo_engine.record_mastered_init(conn, uid, session_id)
-        mastery_explanation = result.explanation_text
-        conn.execute(
-            "UPDATE questions SET mastery_state = 'MASTERED', "
-            "updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
-            (uid,),
+        session_id = _insert_session(
+            conn, uid, draft_uris, alignment, initial_state, mastered=mastered
         )
-        conn.execute(
-            "UPDATE diagnostic_sessions SET micro_stage = 'SESSION_COMPLETED', "
-            "user_confirmed_gate = 1, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
-            (session_id,),
-        )
-        conn.execute(
-            "UPDATE question_steps SET is_blocked_step = 0 WHERE question_uid = ?",
-            (uid,),
-        )
+        mastery_explanation: str | None = None
+        if mastered:
+            # 录入即结算（单事务）：参照 scaffold_engine.confirm_diagnostic_gate
+            # ALREADY_MASTERED 分支；水位线门控/幂等键等既有 Elo 规则不变。
+            result = elo_engine.record_mastered_init(conn, uid, session_id)
+            mastery_explanation = result.explanation_text
+            conn.execute(
+                "UPDATE questions SET mastery_state = 'MASTERED', "
+                "updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
+                (uid,),
+            )
+            conn.execute(
+                "UPDATE diagnostic_sessions SET micro_stage = 'SESSION_COMPLETED', "
+                "user_confirmed_gate = 1, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.execute(
+                "UPDATE question_steps SET is_blocked_step = 0 WHERE question_uid = ?",
+                (uid,),
+            )
+            log_event(
+                logger,
+                "ingest.auto_mastered",
+                question_uid=uid,
+                session_id=session_id,
+                mastered_claim=mastered_claim,
+                initial_state=initial_state,
+                applied=result.applied,
+            )
+        question = conn.execute(
+            "SELECT * FROM questions WHERE question_uid = ?", (uid,)
+        ).fetchone()
+        assert question is not None  # 刚写入，同事务内必然可见
+        session = _latest_session(conn, uid)
+        # CUJ 4：综合错题跨考点标红边生长（步骤落库后、同一事务内；
+        # ≥2 不同 resolve 节点才建边由 record_co_error_edges 内部判定）。
+        # 重入库路径不经过此处，天然不重复递增。
+        if initial_state == "错题" and session["error_category"] != "ALREADY_MASTERED":
+            record_co_error_edges(conn, uid)
         log_event(
             logger,
-            "ingest.auto_mastered",
+            "ingest.persisted",
             question_uid=uid,
-            session_id=session_id,
-            mastered_claim=mastered_claim,
-            initial_state=initial_state,
-            applied=result.applied,
+            session_id=str(session["session_id"]),
+            base_elo=base_elo,
+            tier=tier,
+            is_reimport=False,
+            auto_mastered=mastered,
         )
-    question = conn.execute(
-        "SELECT * FROM questions WHERE question_uid = ?", (uid,)
-    ).fetchone()
-    assert question is not None  # 刚写入，同事务内必然可见
-    session = _latest_session(conn, uid)
-    # CUJ 4：综合错题跨考点标红边生长（步骤落库后、同一事务内；
-    # ≥2 不同 resolve 节点才建边由 record_co_error_edges 内部判定）。
-    # 重入库路径不经过此处，天然不重复递增。
-    if initial_state == "错题" and session["error_category"] != "ALREADY_MASTERED":
-        record_co_error_edges(conn, uid)
-    log_event(
-        logger,
-        "ingest.persisted",
-        question_uid=uid,
-        session_id=str(session["session_id"]),
-        base_elo=base_elo,
-        tier=tier,
-        is_reimport=False,
-        auto_mastered=mastered,
-    )
-    return _gate_card_from_db(
-        conn,
-        question,
-        session,
-        is_reimport=False,
-        auto_mastered=mastered,
-        mastery_explanation=mastery_explanation,
-    )
+        return _gate_card_from_db(
+            conn,
+            question,
+            session,
+            is_reimport=False,
+            auto_mastered=mastered,
+            mastery_explanation=mastery_explanation,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -365,69 +415,25 @@ async def _ingest_new_question(
 # ---------------------------------------------------------------------------
 
 
-async def _reimport_question(
+def _persist_reimport_draft_session(
     conn: sqlite3.Connection,
     existing: sqlite3.Row,
     *,
+    payload: DiagnosisPayload,
     normalized_md: str,
     stem_hash: str,
-    stem_images: list[Path],
-    draft_images: list[Path],
     draft_uris: list[str],
-    target_grade: str,
     initial_state: InitialState,
 ) -> GateCardDTO:
-    """重入库：无增量短路；题干变更仅更新 stem 三字段；新草稿 → 新建会话。
-
-    绝不触碰 mastery_state、盲测字段、Elo 数据与既有步骤/旧会话。
-    """
-    uid = existing["question_uid"]
-    latest = _latest_session(conn, uid)
+    """携带新草稿重入库写库事务：题干更新（若变更）+ 新建会话（绝不跨 VLM 持锁）。"""
+    uid = str(existing["question_uid"])
     stem_changed = existing["stem_hash"] != stem_hash
-    has_new_drafts = _has_new_drafts(draft_uris, latest)
-
-    if not stem_changed and not has_new_drafts:
-        log_event(
-            logger,
-            "ingest.reimport",
-            question_uid=uid,
-            session_id=str(latest["session_id"]),
-            mode="short_circuit",
-            stem_changed=False,
-        )
-        return _gate_card_from_db(conn, existing, latest, is_reimport=True)
-
     if stem_changed:
         conn.execute(
             "UPDATE questions SET stem_md = ?, stem_hash = ?, "
             "updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
             (normalized_md, stem_hash, uid),
         )
-    if not has_new_drafts:
-        log_event(
-            logger,
-            "ingest.reimport",
-            question_uid=uid,
-            session_id=str(latest["session_id"]),
-            mode="stem_updated",
-            stem_changed=True,
-        )
-        log_event(
-            logger,
-            "ingest.persisted",
-            question_uid=uid,
-            session_id=str(latest["session_id"]),
-            base_elo=int(existing["base_elo"]),
-            tier=str(existing["tier"]),
-            is_reimport=True,
-        )
-        return _gate_card_from_db(conn, existing, latest, is_reimport=True)
-
-    # 携带新草稿截图：重新诊断对齐并新建会话（旧会话与步骤骨架原样保留）
-    tree = _build_l1_l2_tree(conn)
-    payload = await analyze_question_and_draft(
-        normalized_md, stem_images, draft_images, target_grade, tree
-    )
     log_event(
         logger,
         "ingest.diagnosis",
