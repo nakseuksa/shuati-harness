@@ -17,20 +17,26 @@ elo_engine / cas_store / schema。本文件仅负责：
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import tempfile
+import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.responses import PlainTextResponse, Response
 
 from backend.db.schema import get_db_connection, init_db
+from backend.observability import log_event, request_id_var, setup_logging
 from backend.services import elo_engine, knowledge_graph
 from backend.services.blind_drill_scheduler import (
     BlindDrillItemDTO,
@@ -51,6 +57,8 @@ from backend.services.scaffold_engine import (
 )
 
 __all__ = ["app", "create_app"]
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -230,6 +238,17 @@ def _gateway_error_handler(request: Request, exc: Exception) -> JSONResponse:
         status_code=502,
         content={"detail": f"模型网关调用失败：{exc}（请稍后重试）"},
     )
+
+
+def _unhandled_error_handler(request: Request, exc: Exception) -> Response:
+    """未处理异常：保持默认 500 纯文本响应体/状态码不变，仅附加 X-Request-ID。
+
+    500 响应由 ServerErrorMiddleware 在请求中间件外层生成，contextvar 已经复位，
+    故 rid 经 request.state（scope 共享）传递；业务异常传播行为不变。
+    """
+    rid = getattr(request.state, "request_id", "")
+    headers = {"X-Request-ID": rid} if rid else {}
+    return PlainTextResponse("Internal Server Error", status_code=500, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -424,12 +443,55 @@ def _build_elo_ledger_response(
 
 
 # ---------------------------------------------------------------------------
+# 请求日志中间件（P5 观测层：api.request 事件 + request_id 贯穿 + X-Request-ID）
+# ---------------------------------------------------------------------------
+
+
+class _RequestLogMiddleware(BaseHTTPMiddleware):
+    """每请求生成 uuid4 写入 contextvar，响应头回传 X-Request-ID。
+
+    只记录 method/path/status/duration_ms（绝不记录请求体/Authorization 头）；
+    路由层已处理的异常（400/404/502）以正常响应返回，未处理异常按 500 留痕后重抛。
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        rid = uuid.uuid4().hex
+        token = request_id_var.set(rid)
+        request.state.request_id = rid  # 供外层 500 处理器回传 X-Request-ID
+        start = time.perf_counter()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            response.headers["X-Request-ID"] = rid
+            return response
+        finally:
+            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            fields: dict[str, Any] = {
+                "method": request.method,
+                "path": request.url.path,
+                "status": status,
+                "duration_ms": duration_ms,
+            }
+            path_params = request.scope.get("path_params") or {}
+            if path_params.get("session_id"):
+                fields["session_id"] = str(path_params["session_id"])
+            if path_params.get("batch_id"):
+                fields["batch_id"] = str(path_params["batch_id"])
+            log_event(logger, "api.request", **fields)  # request_id 经 contextvar 自动附带
+            request_id_var.reset(token)
+
+
+# ---------------------------------------------------------------------------
 # 应用工厂与路由注册
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    setup_logging()  # 幂等挂载行为日志（P5 观测层，先于业务初始化）
     init_db()  # 幂等建表（settings.SQLITE_PATH）
     yield
 
@@ -437,10 +499,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(frontend_dir: Path | None = None) -> FastAPI:
     """构建应用；frontend_dir 缺省取项目根 ./frontend（缺失时跳过挂载不崩溃）。"""
     app = FastAPI(title="数理自适应刷题 Harness", version="0.1.0", lifespan=_lifespan)
+    app.add_middleware(_RequestLogMiddleware)
     app.add_exception_handler(ValueError, _value_error_handler)
     app.add_exception_handler(LookupError, _lookup_error_handler)
     app.add_exception_handler(FileNotFoundError, _file_not_found_handler)
     app.add_exception_handler(LLMGatewayError, _gateway_error_handler)
+    app.add_exception_handler(Exception, _unhandled_error_handler)
 
     # ---- CUJ 1：多模态录入 → 步骤对齐微确认卡 ----
     @app.post("/api/v1/questions/ingest", response_model=GateCardDTO)

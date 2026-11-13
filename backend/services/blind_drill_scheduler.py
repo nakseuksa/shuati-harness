@@ -25,6 +25,7 @@ Target File #12；任务契约 docs/tasks/P3-C_blind_drill.md。
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 import uuid
@@ -36,6 +37,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from backend.config import settings
+from backend.observability import log_event
 from backend.sandbox.sympy_verifier import answers_equivalent
 from backend.services import elo_engine, knowledge_graph
 
@@ -45,6 +47,8 @@ __all__ = [
     "get_daily_blind_drill_queue",
     "evaluate_blind_drill_submission",
 ]
+
+logger = logging.getLogger(__name__)
 
 # 连带销账包含度阈值（设计 §3.3 第 2 条：I >= 0.85；设计常量，settings 未收纳）
 _CASCADE_CONTAINMENT_MIN = 0.85
@@ -334,6 +338,8 @@ def get_daily_blind_drill_queue(
                 " ORDER BY blind_test_unlock_at ASC, question_uid ASC",
                 (day,),
             )
+            deferred_uids: list[str] = []
+            idempotent = True
         else:
             due = _query_all(
                 conn,
@@ -359,6 +365,16 @@ def get_daily_blind_drill_queue(
                     " updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
                     (str(row["question_uid"]),),
                 )
+            deferred_uids = [str(row["question_uid"]) for row in due[cap:]]
+            idempotent = False
+        log_event(
+            logger,
+            "drill.queue_locked",
+            active_date=day,
+            uids=[str(row["question_uid"]) for row in rows],
+            deferred_uids=deferred_uids,
+            idempotent=idempotent,
+        )
         items = [_build_item(conn, row) for row in rows]
         # 衰减接线：仅当日已排入且曝光 > 阈值的题衰减；顺延题未 slated → 冻结
         elo_engine.apply_overdue_escrow_decay(conn, active_date)
@@ -513,6 +529,17 @@ def evaluate_blind_drill_submission(
         session_id = (
             str(session["session_id"]) if session is not None else f"blind-drill:{question_uid}"
         )
+        log_event(
+            logger,
+            "drill.submission",
+            question_uid=question_uid,
+            session_id=session_id,
+            active_date=day.isoformat(),
+            drill_question_uid=item.drill_question_uid,
+            intermediate_ok=None if intermediate_correct is None else bool(intermediate_correct),
+            final_ok=final_ok,
+            passed=passed,
+        )
 
         if passed:
             result = elo_engine.realize_or_forfeit_blind_test(
@@ -525,6 +552,15 @@ def evaluate_blind_drill_submission(
             )
             knowledge_graph.decrement_co_error_edges_on_mastery(conn, question_uid)
             cascaded = _cascade_mastered_children(conn, question_uid)
+            if cascaded:
+                log_event(
+                    logger,
+                    "drill.cascade",
+                    question_uid=question_uid,
+                    session_id=session_id,
+                    active_date=day.isoformat(),
+                    uids=cascaded,
+                )
             explanation = result.explanation_text
             if cascaded:
                 explanation += (
@@ -552,7 +588,18 @@ def evaluate_blind_drill_submission(
             stage = "STAGE_4_DECRUTCH_VARIANT"  # 中间子目标已对，仅最终计算错
         else:
             stage = "STAGE_1_BLIND_PROBE"  # 中间量也错/缺（含变式只核最终的情形）
-        _create_retrain_session(conn, question_uid, session, stage)
+        retrain_session_id = _create_retrain_session(conn, question_uid, session, stage)
+        log_event(
+            logger,
+            "drill.retrain",
+            question_uid=question_uid,
+            session_id=session_id,
+            new_session_id=retrain_session_id,
+            retrain_stage=stage,
+            active_date=day.isoformat(),
+            intermediate_ok=None if intermediate_correct is None else bool(intermediate_correct),
+            final_ok=final_ok,
+        )
         explanation = (
             forfeit.explanation_text + f" 已新建重训会话，从 {stage} 启动。"
         )

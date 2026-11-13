@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import sqlite3
 import uuid
@@ -40,6 +41,7 @@ from typing import Any, TypeVar, cast
 from pydantic import BaseModel
 
 from backend.config import settings
+from backend.observability import log_event
 from backend.services import llm_gateway
 
 __all__ = [
@@ -54,6 +56,8 @@ __all__ = [
     "revert_compaction_batch",
     "run_scoped_compaction",
 ]
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 设计 §3.4 公式常量（设计文档锁定、config 未托管的数学定义参数）
@@ -309,6 +313,14 @@ async def match_or_create_l3_node(
                 "UPDATE knowledge_nodes SET aliases_json = ? WHERE node_id = ?",
                 (json.dumps(aliases, ensure_ascii=False), match_id),
             )
+            log_event(
+                logger,
+                "graph.node_reused",
+                l1=l1,
+                l2=l2,
+                l3=candidate_l3,
+                node_id=match_id,
+            )
             return match_id, True
 
     new_id = str(uuid.uuid4())
@@ -317,6 +329,14 @@ async def match_or_create_l3_node(
         "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator, aliases_json)"
         " VALUES (?, ?, ?, ?, ?)",
         (new_id, l1, l2, candidate_l3, json.dumps(aliases, ensure_ascii=False)),
+    )
+    log_event(
+        logger,
+        "graph.node_created",
+        l1=l1,
+        l2=l2,
+        l3=candidate_l3,
+        node_id=new_id,
     )
     if _new_nodes_since_last_compaction(conn, l1, l2) >= settings.COMPACTION_BATCH_THRESHOLD:
         run_scoped_compaction(conn, l1, l2)
@@ -457,6 +477,15 @@ def _merge_pair(
                 json.dumps(edge_snapshot, ensure_ascii=False),
             ),
         )
+    log_event(
+        logger,
+        "graph.compaction_merged",
+        batch_id=batch_id,
+        from_node=from_id,
+        to_node=to_id,
+        l1=l1,
+        l2=l2,
+    )
 
 
 def _edges_touching(conn: sqlite3.Connection, node_ids: set[str]) -> list[sqlite3.Row]:
@@ -548,11 +577,14 @@ def revert_compaction_batch(conn: sqlite3.Connection, batch_id: str) -> None:
         "SELECT * FROM compaction_audit_ledger WHERE batch_id = ? ORDER BY merge_id DESC",
         (batch_id,),
     ).fetchall()
+    reverted = 0
     for row in rows:
         if row["is_reverted"]:
             continue
         with _savepoint(conn):
             _revert_single_merge(conn, row)
+        reverted += 1
+    log_event(logger, "graph.reverted", batch_id=batch_id, merges=reverted)
 
 
 def _revert_single_merge(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
@@ -680,6 +712,14 @@ def record_co_error_edges(conn: sqlite3.Connection, question_uid: str) -> None:
                 " WHERE node_u_id = ? AND node_v_id = ?",
                 (json.dumps(uids, ensure_ascii=False), u, v),
             )
+    log_event(
+        logger,
+        "graph.co_error",
+        action="record",
+        question_uid=question_uid,
+        nodes=nodes,
+        edges=len(nodes) * (len(nodes) - 1) // 2,
+    )
 
 
 def decrement_co_error_edges_on_mastery(conn: sqlite3.Connection, question_uid: str) -> None:
@@ -691,6 +731,14 @@ def decrement_co_error_edges_on_mastery(conn: sqlite3.Connection, question_uid: 
             " WHERE node_u_id = ? AND node_v_id = ?",
             (u, v),
         )
+    log_event(
+        logger,
+        "graph.co_error",
+        action="decrement",
+        question_uid=question_uid,
+        nodes=nodes,
+        edges=len(nodes) * (len(nodes) - 1) // 2,
+    )
 
 
 # ---------------------------------------------------------------------------

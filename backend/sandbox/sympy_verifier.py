@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import math
 import os
 import re
@@ -37,9 +38,13 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 from dataclasses import dataclass
 
 from backend.config import settings
+from backend.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 _ALLOWED_IMPORT_ROOTS = frozenset({"sympy", "math", "fractions"})
 _FORBIDDEN_CALL_NAMES = frozenset(
@@ -309,7 +314,27 @@ def run_sympy_in_sandbox(
 
     timeout_s / max_mem_mb 缺省取 settings.SYMPY_TIMEOUT_SECONDS / SYMPY_MAX_MEMORY_MB。
     要求 solve_kernel() 返回 {"params": dict[str, str|int|float], "answer_latex": 非空 str}。
+    每次执行记录 sandbox.exec 行为事件（P5 观测层，不改任何执行行为）。
     """
+    start = time.perf_counter()
+    result = _run_sympy_in_sandbox_impl(code_str, timeout_s, max_mem_mb)
+    log_event(
+        logger,
+        "sandbox.exec",
+        mode="kernel",
+        ok=result.ok,
+        error_kind=result.error_kind,
+        duration_ms=round((time.perf_counter() - start) * 1000, 2),
+    )
+    return result
+
+
+def _run_sympy_in_sandbox_impl(
+    code_str: str,
+    timeout_s: float | None = None,
+    max_mem_mb: int | None = None,
+) -> SandboxExecutionResult:
+    """沙盒执行实现（公开包装负责计时与 sandbox.exec 埋点）。"""
     probe = validate_script_ast(code_str)
     if not probe.ok:
         return SandboxExecutionResult(
@@ -487,16 +512,35 @@ def verify_equation_equivalence(user_expr_str: str, standard_expr_str: str) -> b
     simplify(e1/e2).is_constant() 属方程缩放语义（e 与 -e、c·e 同解集），仅对含自由符号的
     表达式生效；纯数字答案要求严格数值相等（PM 批准修复：5≠7、5≠-5，防错误数值答案被放行）。
     解析失败 / 超时 / 任何异常一律返回 False，绝不向调用方抛异常。
+    每次执行记录 sandbox.exec 行为事件（P5 观测层，不改任何判定行为）。
     """
+    start = time.perf_counter()
+    equivalent, error_kind = _verify_equation_equivalence_impl(user_expr_str, standard_expr_str)
+    log_event(
+        logger,
+        "sandbox.exec",
+        mode="equivalence",
+        ok=error_kind is None,
+        error_kind=error_kind,
+        equivalent=equivalent,
+        duration_ms=round((time.perf_counter() - start) * 1000, 2),
+    )
+    return equivalent
+
+
+def _verify_equation_equivalence_impl(
+    user_expr_str: str, standard_expr_str: str
+) -> tuple[bool, str | None]:
+    """等价判定实现：返回 (equivalent, error_kind)；error_kind=None 表示沙盒正常产出结论。"""
     try:
         if not isinstance(user_expr_str, str) or not isinstance(standard_expr_str, str):
-            return False
+            return False, "BAD_INPUT"
         user_eqs = _split_equations(user_expr_str)
         std_eqs = _split_equations(standard_expr_str)
         if not user_eqs or not std_eqs or len(user_eqs) != len(std_eqs):
-            return False
+            return False, "BAD_INPUT"
         if not all(_is_safe_expression(eq) for eq in user_eqs + std_eqs):
-            return False
+            return False, "UNSAFE_EXPRESSION"
 
         timeout = settings.SYMPY_TIMEOUT_SECONDS
         mem = settings.SYMPY_MAX_MEMORY_MB
@@ -505,14 +549,19 @@ def verify_equation_equivalence(user_expr_str: str, standard_expr_str: str) -> b
             _build_rlimit_preamble(mem, timeout) + "_PAYLOAD = " + payload + "\n" + _EQUIV_RUNTIME
         )
         outcome = _run_isolated(runner_code, timeout)
-        if outcome.timed_out or outcome.returncode != 0:
-            return False
+        if outcome.timed_out:
+            return False, "TIMEOUT"
+        if outcome.returncode != 0:
+            return False, "RUNTIME_ERROR"
         line = _find_sentinel(outcome.stdout, _RESULT_SENTINEL)
         if line is None:
-            return False
-        return bool(json.loads(line)["equivalent"])
+            return False, "BAD_OUTPUT"
+        try:
+            return bool(json.loads(line)["equivalent"]), None
+        except (ValueError, KeyError, TypeError):
+            return False, "BAD_OUTPUT"
     except Exception:
-        return False
+        return False, "INTERNAL_ERROR"
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +578,65 @@ _SUP_BRACE_RE = re.compile(r"\^\{([^{}]*)\}")
 _SUB_CHAR_RE = re.compile(r"_([A-Za-z0-9])")
 _SPACING_RE = re.compile(r"\\[,;! ]")
 _COMMAND_RE = re.compile(r"\\([A-Za-z]+)")
+
+# ---- 单位/全角归一（PM 紧急修复 2026-11-13：带单位答案误判） ----
+
+# 尾部中文单位短语表（模块级常量，可扩充）；最长优先匹配。
+# 中文字符不可能是 SymPy 标识符，剥离尾部中文单位不影响代数语义。
+_CN_UNIT_PHRASES: tuple[str, ...] = (
+    "千米每小时", "平方厘米", "立方厘米", "米每秒", "米/秒",
+    "平方米", "立方米", "厘米", "毫米", "分米", "千米", "公里",
+    "分钟", "小时", "千克", "米", "秒", "天", "克", "吨", "元",
+    "角", "个", "只", "条", "种", "度",
+)
+# 尾部单位 + 容忍尾随空白/。，,.（最长优先 alternation + $ 锚定）
+_CN_UNIT_RE = re.compile(
+    r"(?:" + "|".join(sorted(_CN_UNIT_PHRASES, key=len, reverse=True)) + r")[\s。，,.]*$"
+)
+
+# 拉丁单位豁免（仅当标准答案为纯数字时启用）：最长优先，尾随标点容忍。
+# 前置 lookbehind 要求数字/空白：'15*m' 的 '*' 不满足 → 代数乘法绝不剥离。
+_LATIN_UNIT_RE = re.compile(
+    r"(?<=[\d\s])\s*(?:m\^3|m\^2|m/s|min|mm|cm|km|kg|m|g|t|h|s)[\s。，,.]*$"
+)
+
+
+def _fullwidth_to_halfwidth(text: str) -> str:
+    """全角→半角：U+FF01~U+FF5E（数字/字母/＝（）．＋－／ 等）偏移 0xFEE0；全角空格→普通空格。"""
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if 0xFF01 <= code <= 0xFF5E:
+            out.append(chr(code - 0xFEE0))
+        elif code == 0x3000:
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _strip_trailing_cn_unit(text: str) -> str:
+    """剥离尾部中文单位短语（循环至不动点，容忍尾随空白/标点）。"""
+    for _ in range(4):
+        stripped = _CN_UNIT_RE.sub("", text).strip()
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
+def _is_pure_numeric(text: str) -> bool:
+    """保守语法判定「parse 后无自由符号」：含数字、无字母、无 '='。
+
+    无字母 ⇒ parse 不可能产生自由符号（宿主进程禁跑 parse_expr，安全红线）；
+    比语义判定更严格（sqrt(2)/pi 等含字母的纯数不启用豁免），绝不误剥代数语境。
+    """
+    return (
+        bool(text)
+        and "=" not in text
+        and re.search(r"[A-Za-z]", text) is None
+        and any(ch.isdigit() for ch in text)
+    )
 
 
 def latex_to_plain(text: str) -> str:
@@ -558,8 +666,9 @@ def latex_to_plain(text: str) -> str:
 
 
 def normalize_answer(text: str) -> str:
-    """规范化单条作答/标准式：蕴含链取结论段；链式等式 a=b=c 取首尾 a=c。"""
-    s = (text or "").strip()
+    """规范化单条作答/标准式：全角归一 → 蕴含链取结论段 → LaTeX 归一 →
+    链式等式 a=b=c 取首尾 a=c → 剥离尾部中文单位（对双方生效）。"""
+    s = _fullwidth_to_halfwidth((text or "").strip())
     for sep in _IMPLICATION_SEPS:
         if sep in s:
             s = s.split(sep)[-1].strip()
@@ -567,17 +676,27 @@ def normalize_answer(text: str) -> str:
     if s.count("=") > 1 and ";" not in s and "\n" not in s:
         parts = [p.strip() for p in s.split("=")]
         s = f"{parts[0]} = {parts[-1]}"
+    s = _strip_trailing_cn_unit(s)
     return s.strip()
 
 
 def answers_equivalent(user_answer: str, standard: str) -> bool:
-    """代数等价判定：规范化字符串比对 → SymPy 沙盒等价 → 裸值对单方程右端。"""
+    """代数等价判定：规范化字符串比对 → 拉丁单位豁免（仅纯数字标准答案）→
+    SymPy 沙盒等价 → 裸值对单方程右端。"""
     user = normalize_answer(user_answer)
     std = normalize_answer(standard)
     if not user or not std:
         return False
     if user == std:
         return True
+    # 拉丁单位豁免：仅当标准答案为纯数字（无自由符号且不含 '='）时剥离用户答案
+    # 尾部拉丁单位；标准答案含符号时绝不剥离（代数语境 '15m'=15*m 必须保留）。
+    if _is_pure_numeric(std):
+        stripped = _LATIN_UNIT_RE.sub("", user).strip()
+        if stripped and stripped != user:
+            if stripped == std:
+                return True
+            user = stripped
     if verify_equation_equivalence(user, std):
         return True
     # 标准答案为单方程 var=value 时，允许用户仅提交裸值（如 "20" 对 "vmax = 20"）

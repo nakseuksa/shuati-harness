@@ -26,6 +26,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -37,6 +38,7 @@ from pydantic import BaseModel
 
 from backend.config import settings
 from backend.db.schema import get_db_connection
+from backend.observability import log_event
 from backend.sandbox.sympy_verifier import (
     answers_equivalent,
     normalize_answer,
@@ -236,20 +238,33 @@ def _write_session_fields(db_path: Path | None, session_id: str, **fields: Any) 
 
 
 def _transition(
-    db_path: Path | None, session_id: str, *, expect: str, new: str
+    db_path: Path | None, session_id: str, *, expect: str, new: str, trigger: str
 ) -> None:
-    """单事务状态迁移：事务内复核当前阶段，非法迁移抛 ValueError 并回滚。"""
+    """单事务状态迁移：事务内复核当前阶段，非法迁移抛 ValueError 并回滚。
+
+    成功迁移后记录 fsm.transition 行为事件（P5 观测层）。
+    """
     with get_db_connection(db_path) as conn:
         current = _load_session(conn, session_id)
         if current["micro_stage"] != expect:
             raise ValueError(
                 f"非法状态迁移: 当前 {current['micro_stage']}，期望 {expect} → {new}"
             )
+        question_uid = str(current["question_uid"])
         conn.execute(
             "UPDATE diagnostic_sessions SET micro_stage = ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE session_id = ?",
             (new, session_id),
         )
+    log_event(
+        logger,
+        "fsm.transition",
+        session_id=session_id,
+        question_uid=question_uid,
+        from_stage=expect,
+        to_stage=new,
+        trigger=trigger,
+    )
 
 
 def _parse_db_timestamp(value: str) -> datetime:
@@ -308,6 +323,7 @@ async def confirm_diagnostic_gate(
         raise ValueError(f"非法错误类别: {confirmed_category}")
 
     explanation: str | None = None
+    floor_applied = False
     with get_db_connection(db_path) as conn:
         session = _load_session(conn, session_id)
         if session["micro_stage"] != "STAGE_0_CONFIRM_GATE":
@@ -343,6 +359,7 @@ async def confirm_diagnostic_gate(
                     conn, question_uid, session_id, int(prefix_step["sub_elo"])
                 )
                 explanation = result.explanation_text
+                floor_applied = result.applied
             new_stage = (
                 "STAGE_1_BLIND_PROBE"
                 if confirmed_category == "CONCEPT_BOTTLENECK"
@@ -369,6 +386,26 @@ async def confirm_diagnostic_gate(
             "WHERE question_uid = ?",
             (confirmed_stalled_step, question_uid),
         )
+
+    log_event(
+        logger,
+        "gate.confirmed",
+        session_id=session_id,
+        question_uid=question_uid,
+        branch=confirmed_category,
+        overridden=bool(overridden),
+        floor_applied=floor_applied,
+        new_stage=new_stage,
+    )
+    log_event(
+        logger,
+        "fsm.transition",
+        session_id=session_id,
+        question_uid=question_uid,
+        from_stage="STAGE_0_CONFIRM_GATE",
+        to_stage=new_stage,
+        trigger="gate_confirmed",
+    )
 
     if confirmed_category != "ALREADY_MASTERED":
         task = _ensure_prewarm_task(session_id, db_path)
@@ -408,8 +445,14 @@ async def prewarm_session_questions(session_id: str, db_path: Path | None = None
     """
     try:
         await _prewarm_impl(session_id, db_path)
-    except Exception:
+    except Exception as exc:
         logger.exception("预热异常 session=%s", session_id)
+        log_event(
+            logger,
+            "prewarm.failed",
+            session_id=session_id,
+            error_kind=type(exc).__name__,
+        )
         try:
             _write_session_fields(db_path, session_id, prewarm_status="FAILED")
         except Exception:
@@ -451,15 +494,27 @@ async def retry_prewarm(session_id: str, db_path: Path | None = None) -> Session
 
 
 async def _prewarm_impl(session_id: str, db_path: Path | None) -> None:
+    started = time.perf_counter()
     with get_db_connection(db_path) as conn:
         session = _load_session(conn, session_id)
         question = _load_question(conn, str(session["question_uid"]))
         steps = _branch_steps(
             conn, str(question["question_uid"]), str(session["matched_branch_id"])
         )
+    question_uid = str(question["question_uid"])
+    log_event(
+        logger, "prewarm.started", session_id=session_id, question_uid=question_uid
+    )
     if question["origin_type"] != "USER_CANONICAL":
         # 合成题不得再作为母题衍生（设计 §3.2）：检索命中可直接复用，生成硬拒绝
         logger.warning("拒绝以合成题为母题预热: %s", question["question_uid"])
+        log_event(
+            logger,
+            "prewarm.failed",
+            session_id=session_id,
+            question_uid=question_uid,
+            error_kind="SYNTHETIC_PARENT_REJECTED",
+        )
         _write_session_fields(db_path, session_id, prewarm_status="FAILED")
         return
     if not steps:
@@ -468,8 +523,10 @@ async def _prewarm_impl(session_id: str, db_path: Path | None) -> None:
 
     _write_session_fields(db_path, session_id, prewarm_status="RUNNING")
     scaffold_out, variant_out = await asyncio.gather(
-        _prepare_scaffold(question, stalled_step, db_path),
-        _prepare_variant(question, str(session["error_category"]), db_path),
+        _prepare_scaffold(question, stalled_step, db_path, session_id=session_id),
+        _prepare_variant(
+            question, str(session["error_category"]), db_path, session_id=session_id
+        ),
     )
 
     fields: dict[str, Any] = {}
@@ -484,10 +541,23 @@ async def _prewarm_impl(session_id: str, db_path: Path | None) -> None:
     else:
         fields["prewarm_status"] = "READY_FALLBACK"
     _write_session_fields(db_path, session_id, **fields)
+    log_event(
+        logger,
+        "prewarm.completed",
+        session_id=session_id,
+        question_uid=question_uid,
+        status=fields["prewarm_status"],
+        scaffold_uid=fields.get("prewarm_scaffold_uid"),
+        variant_uid=fields.get("prewarm_variant_uid"),
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
 
 
 async def _prepare_scaffold(
-    question: sqlite3.Row, stalled_step: sqlite3.Row, db_path: Path | None
+    question: sqlite3.Row,
+    stalled_step: sqlite3.Row,
+    db_path: Path | None,
+    session_id: str | None = None,
 ) -> _PrewarmOutcome | None:
     """二阶脱壳微母题：本地 SCAFFOLD_PRE 检索 → 内核先行生成（针对卡点步）。"""
     try:
@@ -506,8 +576,19 @@ async def _prepare_scaffold(
                     sims=_REUSE_SIMS,
                     trap_overlap=_jaccard(_trap_tags(question), _trap_tags(local)),
                 )
+                log_event(
+                    logger,
+                    "prewarm.local_hit",
+                    kind="scaffold",
+                    session_id=session_id,
+                    question_uid=parent_uid,
+                    reused_uid=str(local["question_uid"]),
+                    verified=_reuse_verified(local),
+                )
                 return _PrewarmOutcome(str(local["question_uid"]), _reuse_verified(local))
-        gen = await _generate_kernel_question(question, kind="scaffold", stalled_step=stalled_step)
+        gen = await _generate_kernel_question(
+            question, kind="scaffold", stalled_step=stalled_step, session_id=session_id
+        )
         if gen is None:
             return None
         uid = _persist_synthetic(
@@ -519,13 +600,24 @@ async def _prepare_scaffold(
             stalled_step=stalled_step,
         )
         return _PrewarmOutcome(uid, gen.verification_status == "SYMPY_VERIFIED")
-    except Exception:
+    except Exception as exc:
         logger.exception("二阶微母题预热失败 question=%s", question["question_uid"])
+        log_event(
+            logger,
+            "prewarm.failed",
+            kind="scaffold",
+            session_id=session_id,
+            question_uid=str(question["question_uid"]),
+            error_kind=type(exc).__name__,
+        )
         return None
 
 
 async def _prepare_variant(
-    question: sqlite3.Row, error_category: str, db_path: Path | None
+    question: sqlite3.Row,
+    error_category: str,
+    db_path: Path | None,
+    session_id: str | None = None,
 ) -> _PrewarmOutcome | None:
     """四阶拆拐杖变式：TRAP → SHARED_TRAP，否则 ISOMORPHIC（整题）。"""
     relation_type = "SHARED_TRAP" if error_category == "TRAP_OR_CALC_ERROR" else "ISOMORPHIC"
@@ -545,8 +637,19 @@ async def _prepare_variant(
                     sims=_REUSE_SIMS,
                     trap_overlap=_jaccard(_trap_tags(question), _trap_tags(local)),
                 )
+                log_event(
+                    logger,
+                    "prewarm.local_hit",
+                    kind="variant",
+                    session_id=session_id,
+                    question_uid=parent_uid,
+                    reused_uid=str(local["question_uid"]),
+                    verified=_reuse_verified(local),
+                )
                 return _PrewarmOutcome(str(local["question_uid"]), _reuse_verified(local))
-        gen = await _generate_kernel_question(question, kind="variant", stalled_step=None)
+        gen = await _generate_kernel_question(
+            question, kind="variant", stalled_step=None, session_id=session_id
+        )
         if gen is None:
             return None
         uid = _persist_synthetic(
@@ -558,8 +661,16 @@ async def _prepare_variant(
             stalled_step=None,
         )
         return _PrewarmOutcome(uid, gen.verification_status == "SYMPY_VERIFIED")
-    except Exception:
+    except Exception as exc:
         logger.exception("四阶变式预热失败 question=%s", question["question_uid"])
+        log_event(
+            logger,
+            "prewarm.failed",
+            kind="variant",
+            session_id=session_id,
+            question_uid=str(question["question_uid"]),
+            error_kind=type(exc).__name__,
+        )
         return None
 
 
@@ -759,6 +870,7 @@ async def _generate_kernel_question(
     *,
     kind: Literal["scaffold", "variant", "descent"],
     stalled_step: sqlite3.Row | None,
+    session_id: str | None = None,
 ) -> _GenResult | None:
     """内核先行流水线：LLM 内核 → AST 探针 → SymPy 沙盒 → 重试 → 双盲降级。
 
@@ -779,6 +891,7 @@ async def _generate_kernel_question(
     code = ""
 
     for attempt in range(settings.SYMPY_MAX_RETRIES + 1):
+        attempt_start = time.perf_counter()
         kernel = cast(
             _KernelPayload,
             await chat_json(
@@ -788,10 +901,14 @@ async def _generate_kernel_question(
         tpl = kernel.parametric_stem_tpl
         code = kernel.sympy_solver_code
         probe = validate_script_ast(code)
+        sandbox_ok: bool | None = None
+        error_kind: str | None = None
         if not probe.ok:
             last_error = f"AST 探针拒绝: {probe.reason}"
+            error_kind = probe.reason
         else:
             sandbox = await asyncio.to_thread(run_sympy_in_sandbox, code)
+            sandbox_ok = sandbox.ok
             if sandbox.params is not None:
                 last_params = sandbox.params
             if sandbox.ok and sandbox.answer_latex:
@@ -806,10 +923,36 @@ async def _generate_kernel_question(
                         "attempts": attempt + 1,
                         "sympy_version": _pkg_version("sympy"),
                     }
+                    log_event(
+                        logger,
+                        "prewarm.kernel_attempt",
+                        kind=kind,
+                        session_id=session_id,
+                        question_uid=str(question["question_uid"]),
+                        attempt=attempt + 1,
+                        ast_ok=True,
+                        sandbox_ok=True,
+                        error_kind=None,
+                        duration_ms=round((time.perf_counter() - attempt_start) * 1000, 2),
+                    )
                     return _GenResult(stem, sandbox.answer_latex, "SYMPY_VERIFIED", artifact)
                 last_error = "题干模板参数回填失败"
+                error_kind = "RENDER_FAILED"
             else:
                 last_error = f"{sandbox.error_kind}: {sandbox.stderr_tail}"
+                error_kind = sandbox.error_kind
+        log_event(
+            logger,
+            "prewarm.kernel_attempt",
+            kind=kind,
+            session_id=session_id,
+            question_uid=str(question["question_uid"]),
+            attempt=attempt + 1,
+            ast_ok=probe.ok,
+            sandbox_ok=sandbox_ok,
+            error_kind=error_kind,
+            duration_ms=round((time.perf_counter() - attempt_start) * 1000, 2),
+        )
         # 附 stderr/拒绝原因重试（<= settings.SYMPY_MAX_RETRIES 次）
         messages = [
             *messages,
@@ -828,6 +971,14 @@ async def _generate_kernel_question(
         logger.warning("双盲降级失败：题干模板无法实例化 question=%s", question["question_uid"])
         return None
     consensus = await _dual_blind_solve(stem)
+    log_event(
+        logger,
+        "prewarm.dual_blind",
+        kind=kind,
+        session_id=session_id,
+        question_uid=str(question["question_uid"]),
+        consensus=consensus is not None,
+    )
     if consensus is None:
         logger.warning("双盲答案不一致 question=%s", question["question_uid"])
         return None
@@ -1055,13 +1206,26 @@ async def _submit_stage1(
         correct = await asyncio.to_thread(
             _probe_answer_matches, user_answer, str(stalled_step["step_formula_latex"])
         )
+    log_event(
+        logger,
+        "fsm.submission",
+        session_id=session_id,
+        question_uid=str(session["question_uid"]),
+        stage="STAGE_1_BLIND_PROBE",
+        correct=correct,
+        no_idea=no_idea,
+    )
     if correct:
         _transition(
-            db_path, session_id, expect="STAGE_1_BLIND_PROBE", new="STAGE_3_REDO_ORIGINAL"
+            db_path, session_id, expect="STAGE_1_BLIND_PROBE", new="STAGE_3_REDO_ORIGINAL",
+            trigger="stage1_correct",
         )
         return _build_response(session_id, db_path)
     await _ensure_prewarm_question(session_id, "scaffold", db_path)
-    _transition(db_path, session_id, expect="STAGE_1_BLIND_PROBE", new="STAGE_2_MICRO_SCAFFOLD")
+    _transition(
+        db_path, session_id, expect="STAGE_1_BLIND_PROBE", new="STAGE_2_MICRO_SCAFFOLD",
+        trigger="stage1_stuck",
+    )
     return _build_response(session_id, db_path)
 
 
@@ -1114,6 +1278,15 @@ async def _descend_scaffold(
     with get_db_connection(db_path) as conn:
         depth = _scaffold_depth(conn, current_uid, original_uid)
         steps = _branch_steps(conn, current_uid, "canonical")
+    log_event(
+        logger,
+        "descent.triggered",
+        session_id=session_id,
+        question_uid=original_uid,
+        scaffold_uid=current_uid,
+        depth=depth,
+        elo_before=int(current["base_elo"]),
+    )
     atomic = int(current["c_score"]) <= 1 and int(current["s_score"]) <= 1
     if (
         depth >= settings.SCAFFOLD_DESCENT_MAX_DEPTH
@@ -1121,14 +1294,42 @@ async def _descend_scaffold(
         or int(current["base_elo"]) <= settings.BASE_ELO_MIN
         or not steps
     ):
+        if depth >= settings.SCAFFOLD_DESCENT_MAX_DEPTH:
+            reason = "depth_cap"
+        elif int(current["base_elo"]) <= settings.BASE_ELO_MIN:
+            reason = "elo_floor"
+        else:
+            reason = "atomic"  # C=S=1 原子题或缺步骤骨架，不再降阶
+        log_event(
+            logger,
+            "descent.floor_reveal",
+            session_id=session_id,
+            question_uid=original_uid,
+            scaffold_uid=current_uid,
+            depth=depth,
+            elo_before=int(current["base_elo"]),
+            reason=reason,
+        )
         return _build_response(
             session_id,
             db_path,
             notice="🪜 已降至最基础的原子题，不再继续降阶；看懂标准答案后重新作答即可逐层返回。",
             worked_example=_worked_example_view(current),
         )
-    gen = await _generate_kernel_question(current, kind="descent", stalled_step=None)
+    gen = await _generate_kernel_question(
+        current, kind="descent", stalled_step=None, session_id=session_id
+    )
     if gen is None:
+        log_event(
+            logger,
+            "descent.floor_reveal",
+            session_id=session_id,
+            question_uid=original_uid,
+            scaffold_uid=current_uid,
+            depth=depth,
+            elo_before=int(current["base_elo"]),
+            reason="gen_failed",
+        )
         return _build_response(
             session_id,
             db_path,
@@ -1146,6 +1347,16 @@ async def _descend_scaffold(
     _write_session_fields(db_path, session_id, prewarm_scaffold_uid=new_uid)
     with get_db_connection(db_path) as conn:
         new_q = _load_question(conn, new_uid)
+    log_event(
+        logger,
+        "descent.generated",
+        session_id=session_id,
+        question_uid=original_uid,
+        scaffold_uid=new_uid,
+        depth=depth + 1,
+        elo_before=int(current["base_elo"]),
+        elo_after=int(new_q["base_elo"]),
+    )
     return _build_response(
         session_id,
         db_path,
@@ -1167,22 +1378,59 @@ async def _submit_stage2(
         or _is_no_idea_text(user_answer)
     )
     if no_idea:
+        log_event(
+            logger,
+            "fsm.submission",
+            session_id=session_id,
+            question_uid=str(session["question_uid"]),
+            stage="STAGE_2_MICRO_SCAFFOLD",
+            correct=False,
+            no_idea=True,
+        )
         return await _descend_scaffold(session, scaffold, db_path)
     correct = await asyncio.to_thread(
         answers_equivalent, user_answer, str(scaffold["standard_answer_latex"])
+    )
+    log_event(
+        logger,
+        "fsm.submission",
+        session_id=session_id,
+        question_uid=str(session["question_uid"]),
+        stage="STAGE_2_MICRO_SCAFFOLD",
+        correct=correct,
+        no_idea=False,
     )
     if correct:
         with get_db_connection(db_path) as conn:
             parent_uid = _scaffold_parent_uid(conn, str(scaffold["question_uid"]))
             parent = _load_question(conn, parent_uid) if parent_uid else None
+            ascent_depth = (
+                _scaffold_depth(
+                    conn, str(parent["question_uid"]), str(session["question_uid"])
+                )
+                if parent is not None
+                else 0
+            )
         if parent is not None and parent["origin_type"] != "USER_CANONICAL":
             # 降阶梯 ascent：答对当前层 → 回到上一层铺垫题（仍为合成题）
             _write_session_fields(db_path, session_id, prewarm_scaffold_uid=parent_uid)
+            log_event(
+                logger,
+                "ascent.step",
+                session_id=session_id,
+                question_uid=str(session["question_uid"]),
+                from_uid=str(scaffold["question_uid"]),
+                to_uid=str(parent["question_uid"]),
+                depth=ascent_depth,
+                elo_before=int(scaffold["base_elo"]),
+                elo_after=int(parent["base_elo"]),
+            )
             return _build_response(
                 session_id, db_path, notice="✅ 通过！已回到上一层铺垫题，继续作答。"
             )
         _transition(
-            db_path, session_id, expect="STAGE_2_MICRO_SCAFFOLD", new="STAGE_3_REDO_ORIGINAL"
+            db_path, session_id, expect="STAGE_2_MICRO_SCAFFOLD", new="STAGE_3_REDO_ORIGINAL",
+            trigger="stage2_passed",
         )
         return _build_response(session_id, db_path)
     return _build_response(session_id, db_path, feedback=_WRONG_FEEDBACK)
@@ -1198,10 +1446,20 @@ async def _submit_stage3(
     correct = await asyncio.to_thread(
         answers_equivalent, user_answer, str(question["standard_answer_latex"])
     )
+    log_event(
+        logger,
+        "fsm.submission",
+        session_id=session_id,
+        question_uid=str(session["question_uid"]),
+        stage="STAGE_3_REDO_ORIGINAL",
+        correct=correct,
+        no_idea=False,
+    )
     if correct:
         await _ensure_prewarm_question(session_id, "variant", db_path)
         _transition(
-            db_path, session_id, expect="STAGE_3_REDO_ORIGINAL", new="STAGE_4_DECRUTCH_VARIANT"
+            db_path, session_id, expect="STAGE_3_REDO_ORIGINAL", new="STAGE_4_DECRUTCH_VARIANT",
+            trigger="stage3_passed",
         )
         return _build_response(session_id, db_path)
     return _build_response(session_id, db_path, feedback=_WRONG_FEEDBACK)
@@ -1233,6 +1491,15 @@ async def _submit_stage4(
         variant_steps = _branch_steps(conn, str(variant["question_uid"]), "canonical")
     standard, mode = _stage4_standard(question, variant, variant_steps)
     correct = await asyncio.to_thread(answers_equivalent, user_answer, standard)
+    log_event(
+        logger,
+        "fsm.submission",
+        session_id=session_id,
+        question_uid=str(session["question_uid"]),
+        stage="STAGE_4_DECRUTCH_VARIANT",
+        correct=correct,
+        no_idea=False,
+    )
 
     if correct:
         with get_db_connection(db_path) as conn:
@@ -1260,10 +1527,20 @@ async def _submit_stage4(
                 "updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
                 (session_id,),
             )
+        log_event(
+            logger,
+            "fsm.transition",
+            session_id=session_id,
+            question_uid=str(question["question_uid"]),
+            from_stage="STAGE_4_DECRUTCH_VARIANT",
+            to_stage="SESSION_COMPLETED",
+            trigger="stage4_passed",
+        )
         return _build_response(session_id, db_path, explanation_text=result.explanation_text)
 
     _transition(
-        db_path, session_id, expect="STAGE_4_DECRUTCH_VARIANT", new="STAGE_COOLDOWN_DEFERRED"
+        db_path, session_id, expect="STAGE_4_DECRUTCH_VARIANT", new="STAGE_COOLDOWN_DEFERRED",
+        trigger="stage4_failed",
     )
     response = _build_response(session_id, db_path, feedback=_WRONG_FEEDBACK)
     card = response.view_payload.get("skeleton_comparison_card")
@@ -1280,7 +1557,8 @@ async def _submit_cooldown(session: sqlite3.Row, db_path: Path | None) -> Sessio
     if datetime.now(UTC).date() < cooldown_end_date:
         raise ValueError("冷却期未满（次日重测），暂不可提交")
     _transition(
-        db_path, session_id, expect="STAGE_COOLDOWN_DEFERRED", new="STAGE_4_DECRUTCH_VARIANT"
+        db_path, session_id, expect="STAGE_COOLDOWN_DEFERRED", new="STAGE_4_DECRUTCH_VARIANT",
+        trigger="cooldown_elapsed",
     )
     return _build_response(session_id, db_path, notice="冷却期满，请重新提交变式作答。")
 

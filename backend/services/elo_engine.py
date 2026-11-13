@@ -21,13 +21,15 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import date
-from typing import Literal
+from typing import Any, Literal
 
 from backend.config import settings
+from backend.observability import log_event
 
 __all__ = [
     "DualEloState",
@@ -42,6 +44,8 @@ __all__ = [
     "apply_overdue_escrow_decay",
     "replay_module_elo_from_ledger",
 ]
+
+logger = logging.getLogger(__name__)
 
 # 账本触发器全集：切片 A 三类 + 切片 B 两类（盲测兑现 / 超时衰减）。
 # 仅为类型别名扩充，切片 A 各函数签名与行为不变。
@@ -255,6 +259,37 @@ def _idempotent_hit(
     return _result_from_event(row) if row is not None else None
 
 
+def _log_elo_event(
+    trigger: str,
+    key: str,
+    question_uid: str,
+    session_id: str | None,
+    module: str,
+    gamma: float,
+    result: LedgerEventResult,
+) -> None:
+    """elo.event 行为事件（P5 观测层）：幂等键 + 双轨 before/after 全量留痕。
+
+    幂等命中 / 门控拦截的 applied=False 调用亦留痕（审计可追溯）。
+    """
+    fields: dict[str, Any] = {
+        "trigger": trigger,
+        "idempotency_key": key,
+        "question_uid": question_uid,
+        "l1_module": module,
+        "applied": result.applied,
+        "event_id": result.event_id,
+        "coverage_before": result.coverage_before,
+        "coverage_after": result.coverage_after,
+        "combat_before": result.combat_before,
+        "combat_after": result.combat_after,
+        "gamma": gamma,
+    }
+    if session_id is not None:
+        fields["session_id"] = session_id
+    log_event(logger, "elo.event", **fields)
+
+
 # ---------------------------------------------------------------------------
 # 法则 1：直接录入「已掌握」题的水位线结算
 # ---------------------------------------------------------------------------
@@ -271,7 +306,12 @@ def record_mastered_init(
     key = f"{question_uid}:{session_id}:MASTERED_INIT"
     prior = _find_event_by_key(conn, key)
     if prior is not None:
-        return _result_from_event(prior)
+        result = _result_from_event(prior)
+        _log_elo_event(
+            "MASTERED_INIT", key, question_uid, session_id,
+            str(prior["l1_module"]), float(prior["watermark_gamma"]), result,
+        )
+        return result
 
     question = _load_question(conn, question_uid)
     module = str(question["primary_l1_module"])
@@ -280,18 +320,22 @@ def record_mastered_init(
 
     gamma = compute_watermark_gamma(difficulty, before.combat_elo)
     if gamma == 0.0:
-        return _noop_result(
+        result = _noop_result(
             before,
             f"【{module}】直接录入已掌握题：难度基准 {difficulty} 分远低于当前实战分"
             f" {before.combat_elo:.1f} 的水位线下限（-{settings.WATERMARK_ZERO_MARGIN}），"
             "门控 γ=0，本次不加分。",
         )
+        _log_elo_event("MASTERED_INIT", key, question_uid, session_id, module, gamma, result)
+        return result
     delta = gamma * settings.K_INIT * (1.0 - expected_pass(before.combat_elo, difficulty))
     if delta == 0.0:
-        return _noop_result(
+        result = _noop_result(
             before,
             f"【{module}】直接录入已掌握题：难度基准 {difficulty} 分，本次增量为 0，不写事件。",
         )
+        _log_elo_event("MASTERED_INIT", key, question_uid, session_id, module, gamma, result)
+        return result
 
     combat_after = before.combat_elo + delta
     after = DualEloState(
@@ -320,8 +364,9 @@ def record_mastered_init(
         hit = _idempotent_hit(conn, key)
         if hit is None:
             raise
+        _log_elo_event("MASTERED_INIT", key, question_uid, session_id, module, gamma, hit)
         return hit
-    return LedgerEventResult(
+    result = LedgerEventResult(
         event_id=event_id,
         applied=True,
         coverage_before=before.coverage_elo,
@@ -330,6 +375,8 @@ def record_mastered_init(
         combat_after=after.combat_elo,
         explanation_text=explanation,
     )
+    _log_elo_event("MASTERED_INIT", key, question_uid, session_id, module, gamma, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -350,24 +397,37 @@ def apply_draft_subgoal_floor(
     key = f"{question_uid}:{session_id}:PARTIAL_DRAFT_SUBGOAL_FLOOR"
     prior = _find_event_by_key(conn, key)
     if prior is not None:
-        return _result_from_event(prior)
+        result = _result_from_event(prior)
+        _log_elo_event(
+            "PARTIAL_DRAFT_SUBGOAL_FLOOR", key, question_uid, session_id,
+            str(prior["l1_module"]), float(prior["watermark_gamma"]), result,
+        )
+        return result
 
     question = _load_question(conn, question_uid)
     module = str(question["primary_l1_module"])
     before = get_module_elo(conn, module)
 
     if before.combat_elo >= d_sub:
-        return _noop_result(
+        result = _noop_result(
             before,
             f"【{module}】草稿子步保底未发放：当前实战分 {before.combat_elo:.1f} 已不低于"
             f"子步难度基准 {d_sub} 分，无需保底推演。",
         )
+        _log_elo_event(
+            "PARTIAL_DRAFT_SUBGOAL_FLOOR", key, question_uid, session_id, module, 1.0, result
+        )
+        return result
     delta = settings.K_FLOOR * (1.0 - expected_pass(before.combat_elo, d_sub))
     if delta == 0.0:
-        return _noop_result(
+        result = _noop_result(
             before,
             f"【{module}】草稿子步保底：子步难度基准 {d_sub} 分，本次增量为 0，不写事件。",
         )
+        _log_elo_event(
+            "PARTIAL_DRAFT_SUBGOAL_FLOOR", key, question_uid, session_id, module, 1.0, result
+        )
+        return result
 
     combat_after = before.combat_elo + delta
     after = DualEloState(
@@ -398,6 +458,9 @@ def apply_draft_subgoal_floor(
         hit = _idempotent_hit(conn, key)
         if hit is None:
             raise
+        _log_elo_event(
+            "PARTIAL_DRAFT_SUBGOAL_FLOOR", key, question_uid, session_id, module, 1.0, hit
+        )
         return hit
 
     pool = _query_one(
@@ -421,7 +484,7 @@ def apply_draft_subgoal_floor(
             " WHERE question_uid = ?",
             (delta, question_uid),
         )
-    return LedgerEventResult(
+    result = LedgerEventResult(
         event_id=event_id,
         applied=True,
         coverage_before=before.coverage_elo,
@@ -430,6 +493,10 @@ def apply_draft_subgoal_floor(
         combat_after=after.combat_elo,
         explanation_text=explanation,
     )
+    _log_elo_event(
+        "PARTIAL_DRAFT_SUBGOAL_FLOOR", key, question_uid, session_id, module, 1.0, result
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +520,12 @@ def freeze_decrutch_escrow(
     key = f"{question_uid}:{session_id}:SCAFFOLD_COVER_GAIN"
     prior = _find_event_by_key(conn, key)
     if prior is not None:
-        return _result_from_event(prior)
+        result = _result_from_event(prior)
+        _log_elo_event(
+            "SCAFFOLD_COVER_GAIN", key, question_uid, session_id,
+            str(prior["l1_module"]), float(prior["watermark_gamma"]), result,
+        )
+        return result
 
     question = _load_question(conn, question_uid)
     module = str(question["primary_l1_module"])
@@ -470,21 +542,30 @@ def freeze_decrutch_escrow(
         # 覆盖分熔断：无论会话是否相同，只结算一次；回读原结算事件快照。
         settled = _find_latest_question_event(conn, question_uid, "SCAFFOLD_COVER_GAIN")
         if settled is not None:
-            return _result_from_event(settled)
-        return _noop_result(
+            result = _result_from_event(settled)
+            _log_elo_event(
+                "SCAFFOLD_COVER_GAIN", key, question_uid, session_id,
+                str(settled["l1_module"]), float(settled["watermark_gamma"]), result,
+            )
+            return result
+        result = _noop_result(
             before,
             f"【{module}】拆拐杖覆盖分已结算过（is_cov_settled=1），本次不重复结算。",
         )
+        _log_elo_event("SCAFFOLD_COVER_GAIN", key, question_uid, session_id, module, 1.0, result)
+        return result
 
     snapshot = float(pool["initial_combat_elo_snapshot"]) if pool is not None else before.combat_elo
     floor_applied = float(pool["floor_elo_applied"]) if pool is not None else 0.0
 
     cov_delta = settings.K_COV * (1.0 - expected_pass(before.coverage_elo, d_orig))
     if cov_delta == 0.0:
-        return _noop_result(
+        result = _noop_result(
             before,
             f"【{module}】拆拐杖覆盖分结算：原题难度基准 {d_orig} 分，本次增量为 0，不写事件。",
         )
+        _log_elo_event("SCAFFOLD_COVER_GAIN", key, question_uid, session_id, module, 1.0, result)
+        return result
     after = DualEloState(
         coverage_elo=max(before.coverage_elo + cov_delta, before.combat_elo),
         combat_elo=before.combat_elo,
@@ -515,6 +596,7 @@ def freeze_decrutch_escrow(
         hit = _idempotent_hit(conn, key)
         if hit is None:
             raise
+        _log_elo_event("SCAFFOLD_COVER_GAIN", key, question_uid, session_id, module, 1.0, hit)
         return hit
 
     if pool is None:
@@ -533,7 +615,7 @@ def freeze_decrutch_escrow(
         " WHERE question_uid = ?",
         (escrow_delta, question_uid),
     )
-    return LedgerEventResult(
+    result = LedgerEventResult(
         event_id=event_id,
         applied=True,
         coverage_before=before.coverage_elo,
@@ -542,6 +624,17 @@ def freeze_decrutch_escrow(
         combat_after=after.combat_elo,
         explanation_text=explanation,
     )
+    _log_elo_event("SCAFFOLD_COVER_GAIN", key, question_uid, session_id, module, 1.0, result)
+    log_event(
+        logger,
+        "escrow.frozen",
+        question_uid=question_uid,
+        session_id=session_id,
+        l1_module=module,
+        amount=escrow_delta,
+        decay_factor=1.0,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -582,18 +675,34 @@ def realize_or_forfeit_blind_test(
         if pool["escrow_status"] == "REALIZED_MASTERED":
             realized = _find_latest_question_event(conn, question_uid, "BLIND_TEST_REALIZE")
             if realized is not None:
-                return _result_from_event(realized)
-        return _noop_result(
+                result = _result_from_event(realized)
+                _log_elo_event(
+                    "BLIND_TEST_REALIZE", f"{question_uid}:{session_id}:BLIND_TEST_REALIZE",
+                    question_uid, session_id,
+                    str(realized["l1_module"]), float(realized["watermark_gamma"]), result,
+                )
+                return result
+        result = _noop_result(
             before,
             f"【{module}】单题托管池已处于终态 {pool['escrow_status']}，盲测结算幂等无操作。",
         )
+        _log_elo_event(
+            "BLIND_TEST_REALIZE", f"{question_uid}:{session_id}:BLIND_TEST_REALIZE",
+            question_uid, session_id, module, 1.0, result,
+        )
+        return result
 
     # 尚未冻结（无池 / FLOOR_ONLY）：无可兑现差额，防御性无操作。
     if pool is None or pool["escrow_status"] != "FROZEN_PENDING_BLIND":
-        return _noop_result(
+        result = _noop_result(
             before,
             f"【{module}】单题托管池尚未冻结待兑现差额，盲测结算无操作。",
         )
+        _log_elo_event(
+            "BLIND_TEST_REALIZE", f"{question_uid}:{session_id}:BLIND_TEST_REALIZE",
+            question_uid, session_id, module, 1.0, result,
+        )
+        return result
 
     if not passed:
         # forfeit：差额归零、状态 FORFEITED_RESET；combat/cov 分文不动，不写账本事件。
@@ -603,16 +712,35 @@ def realize_or_forfeit_blind_test(
             " updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
             (question_uid,),
         )
-        return _noop_result(
+        result = _noop_result(
             before,
             f"【{module}】延迟盲测未通过：托管差额清零（FORFEITED_RESET），"
             "实战分与覆盖分基线分文不动，题目退回重训流。",
         )
+        _log_elo_event(
+            "BLIND_TEST_FORFEIT", f"{question_uid}:{session_id}:BLIND_TEST_REALIZE",
+            question_uid, session_id, module, float(pool["decay_factor"]), result,
+        )
+        log_event(
+            logger,
+            "escrow.forfeited",
+            question_uid=question_uid,
+            session_id=session_id,
+            l1_module=module,
+            amount=float(pool["escrow_combat_delta"]),
+            decay_factor=float(pool["decay_factor"]),
+        )
+        return result
 
     key = f"{question_uid}:{session_id}:BLIND_TEST_REALIZE"
     prior = _find_event_by_key(conn, key)
     if prior is not None:
-        return _result_from_event(prior)
+        result = _result_from_event(prior)
+        _log_elo_event(
+            "BLIND_TEST_REALIZE", key, question_uid, session_id,
+            str(prior["l1_module"]), float(prior["watermark_gamma"]), result,
+        )
+        return result
 
     escrow = float(pool["escrow_combat_delta"])
     factor = float(pool["decay_factor"])
@@ -645,6 +773,7 @@ def realize_or_forfeit_blind_test(
         hit = _idempotent_hit(conn, key)
         if hit is None:
             raise
+        _log_elo_event("BLIND_TEST_REALIZE", key, question_uid, session_id, module, factor, hit)
         return hit
 
     conn.execute(
@@ -653,7 +782,7 @@ def realize_or_forfeit_blind_test(
         " updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
         (question_uid,),
     )
-    return LedgerEventResult(
+    result = LedgerEventResult(
         event_id=event_id,
         applied=True,
         coverage_before=before.coverage_elo,
@@ -662,6 +791,17 @@ def realize_or_forfeit_blind_test(
         combat_after=after.combat_elo,
         explanation_text=explanation,
     )
+    _log_elo_event("BLIND_TEST_REALIZE", key, question_uid, session_id, module, factor, result)
+    log_event(
+        logger,
+        "escrow.realized",
+        question_uid=question_uid,
+        session_id=session_id,
+        l1_module=module,
+        amount=delta,
+        decay_factor=factor,
+    )
+    return result
 
 
 def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> int:
@@ -679,7 +819,7 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
     """
     cur = conn.execute(
         "SELECT q.question_uid, q.primary_l1_module, q.base_elo,"
-        " q.slated_exposure_count, p.decay_factor"
+        " q.slated_exposure_count, p.escrow_combat_delta, p.decay_factor"
         " FROM questions q JOIN question_escrow_pool p ON q.question_uid = p.question_uid"
         " WHERE q.mastery_state = 'PENDING_RETEST'"
         " AND p.escrow_status = 'FROZEN_PENDING_BLIND'"
@@ -697,6 +837,19 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
         module = str(row["primary_l1_module"])
         key = f"{uid}:{active_date.isoformat()}:ESCROW_TIMEOUT_DECAY"
         if _find_event_by_key(conn, key) is not None:
+            state = get_module_elo(conn, module)
+            _log_elo_event(
+                "ESCROW_TIMEOUT_DECAY", key, uid, None, module, float(row["decay_factor"]),
+                LedgerEventResult(
+                    event_id=None,
+                    applied=False,
+                    coverage_before=state.coverage_elo,
+                    coverage_after=state.coverage_elo,
+                    combat_before=state.combat_elo,
+                    combat_after=state.combat_elo,
+                    explanation_text="同日已衰减，幂等跳过。",
+                ),
+            )
             continue  # 同日已衰减，幂等跳过
         before = get_module_elo(conn, module)
         old_factor = float(row["decay_factor"])
@@ -709,7 +862,7 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
             "仅折减待兑现差额，实战分与覆盖分基线分文不动。"
         )
         try:
-            _insert_event(
+            event_id = _insert_event(
                 conn,
                 idempotency_key=key,
                 l1_module=module,
@@ -729,6 +882,28 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
             "UPDATE question_escrow_pool"
             " SET decay_factor = ?, updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
             (new_factor, uid),
+        )
+        _log_elo_event(
+            "ESCROW_TIMEOUT_DECAY", key, uid, None, module, new_factor,
+            LedgerEventResult(
+                event_id=event_id,
+                applied=True,
+                coverage_before=before.coverage_elo,
+                coverage_after=before.coverage_elo,
+                combat_before=before.combat_elo,
+                combat_after=before.combat_elo,
+                explanation_text=explanation,
+            ),
+        )
+        log_event(
+            logger,
+            "escrow.decayed",
+            question_uid=uid,
+            l1_module=module,
+            amount=float(row["escrow_combat_delta"]),
+            decay_factor=new_factor,
+            old_factor=old_factor,
+            active_date=active_date.isoformat(),
         )
         decayed += 1
     return decayed

@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     LLM_TIMEOUT_SECONDS: float = 300.0
     USE_MOCK_LLM: bool = False
 
+    # ---- 行为日志（P5 观测层，docs/tasks/P5-observability.md） ----
+    LOG_LEVEL: str = "INFO"
+    LOG_DIR: Path = Path("./data/logs")
+    LOG_MAX_BYTES: int = 5_000_000
+    LOG_BACKUP_COUNT: int = 5
+    LOG_CONSOLE: bool = True
+
     # ---- 存储路径 ----
     DATA_DIR: Path = Path("./data")
     SQLITE_PATH: Path = Path("./data/harness.db")

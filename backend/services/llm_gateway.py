@@ -17,6 +17,8 @@ vlm_diagnosis / scaffold_engine / 双盲校验均复用本网关，禁止私自�
 import asyncio
 import base64
 import json
+import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,9 +26,12 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from backend.config import settings
+from backend.observability import log_event
 from backend.services import llm_mocks
 
 __all__ = ["LLMGatewayError", "chat_json", "image_path_to_data_url"]
+
+logger = logging.getLogger(__name__)
 
 # 图片后缀 → MIME（CAS 入库统一 WebP；兼容常见原始格式）
 _MIME_BY_SUFFIX: dict[str, str] = {
@@ -40,7 +45,14 @@ _MIME_BY_SUFFIX: dict[str, str] = {
 
 
 class LLMGatewayError(RuntimeError):
-    """网关统一异常：网络/HTTP/解析/校验/Mock 路由失败全部收敛于此。"""
+    """网关统一异常：网络/HTTP/解析/校验/Mock 路由失败全部收敛于此。
+
+    error_kind 为短分类码（仅供观测日志，不含密钥/请求体等敏感内容）。
+    """
+
+    def __init__(self, message: str, *, error_kind: str = "GATEWAY_ERROR") -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
 
 
 def image_path_to_data_url(path: Path) -> str:
@@ -77,7 +89,19 @@ async def chat_json(
             修复重试后仍无法解析或校验。
     """
     if settings.USE_MOCK_LLM:
-        return _resolve_mock(schema, purpose)
+        start = time.perf_counter()
+        try:
+            result = _resolve_mock(schema, purpose)
+        except LLMGatewayError as exc:
+            _log_llm_request(
+                purpose, model, mock=True, attempt=1, start=start, ok=False,
+                error_kind=exc.error_kind,
+            )
+            raise
+        _log_llm_request(
+            purpose, model, mock=True, attempt=1, start=start, ok=True, error_kind=None
+        )
+        return result
 
     resolved_temperature = settings.LLM_TEMPERATURE if temperature is None else temperature
     request_body: dict[str, Any] = {
@@ -86,28 +110,68 @@ async def chat_json(
         "temperature": resolved_temperature,
         "response_format": {"type": "json_object"},
     }
+    start = time.perf_counter()
+    stats: dict[str, Any] = {"attempts": 0}  # 仅计数，绝不记录请求体/头
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(settings.LLM_TIMEOUT_SECONDS)) as client:
-            content = await _post_with_retries(client, request_body, purpose)
+            content = await _post_with_retries(client, request_body, purpose, stats)
             try:
-                return schema.model_validate(json.loads(content))
+                result = schema.model_validate(json.loads(content))
             except (json.JSONDecodeError, ValidationError) as first_exc:
                 # 附校验错误信息修复重试 1 次（契约实现规格）
                 repair_body = {
                     **request_body,
                     "messages": _build_repair_messages(messages, content, first_exc),
                 }
-                repaired = await _post_with_retries(client, repair_body, purpose)
+                repaired = await _post_with_retries(client, repair_body, purpose, stats)
                 try:
-                    return schema.model_validate(json.loads(repaired))
+                    result = schema.model_validate(json.loads(repaired))
                 except (json.JSONDecodeError, ValidationError) as second_exc:
                     raise LLMGatewayError(
-                        f"purpose={purpose!r} 修复重试后仍未通过校验: {second_exc}"
+                        f"purpose={purpose!r} 修复重试后仍未通过校验: {second_exc}",
+                        error_kind="REPAIR_VALIDATION_FAILED",
                     ) from second_exc
-    except LLMGatewayError:
+            _log_llm_request(
+                purpose, model, mock=False, attempt=int(stats["attempts"]), start=start,
+                ok=True, error_kind=None,
+            )
+            return result
+    except LLMGatewayError as exc:
+        _log_llm_request(
+            purpose, model, mock=False, attempt=int(stats["attempts"]), start=start,
+            ok=False, error_kind=exc.error_kind,
+        )
         raise
     except Exception as exc:  # 所有异常收敛为 LLMGatewayError
+        _log_llm_request(
+            purpose, model, mock=False, attempt=int(stats["attempts"]), start=start,
+            ok=False, error_kind="GATEWAY_ERROR",
+        )
         raise LLMGatewayError(f"purpose={purpose!r} 网关调用失败: {exc}") from exc
+
+
+def _log_llm_request(
+    purpose: str,
+    model: str,
+    *,
+    mock: bool,
+    attempt: int,
+    start: float,
+    ok: bool,
+    error_kind: str | None,
+) -> None:
+    """llm.request 事件（每次真实/Mock 调用各一条）；绝不记录密钥/头/请求体。"""
+    log_event(
+        logger,
+        "llm.request",
+        purpose=purpose,
+        model=model,
+        mock=mock,
+        attempt=attempt,
+        latency_ms=round((time.perf_counter() - start) * 1000, 2),
+        ok=ok,
+        error_kind=error_kind,
+    )
 
 
 def _resolve_mock(schema: type[BaseModel], purpose: str) -> BaseModel:
@@ -115,13 +179,15 @@ def _resolve_mock(schema: type[BaseModel], purpose: str) -> BaseModel:
     fixtures = llm_mocks.MOCK_RESPONSES
     if purpose not in fixtures:
         raise LLMGatewayError(
-            f"Mock purpose 未注册: {purpose!r}（已注册: {sorted(fixtures)}）"
+            f"Mock purpose 未注册: {purpose!r}（已注册: {sorted(fixtures)}）",
+            error_kind="MOCK_PURPOSE_UNREGISTERED",
         )
     try:
         return schema.model_validate(fixtures[purpose])
     except ValidationError as exc:
         raise LLMGatewayError(
-            f"Mock fixture purpose={purpose!r} 未通过 {schema.__name__} 校验: {exc}"
+            f"Mock fixture purpose={purpose!r} 未通过 {schema.__name__} 校验: {exc}",
+            error_kind="MOCK_VALIDATION_FAILED",
         ) from exc
 
 
@@ -131,14 +197,22 @@ async def _sleep_backoff(delay_seconds: float) -> None:
 
 
 async def _post_with_retries(
-    client: httpx.AsyncClient, body: dict[str, Any], purpose: str
+    client: httpx.AsyncClient,
+    body: dict[str, Any],
+    purpose: str,
+    stats: dict[str, Any] | None = None,
 ) -> str:
-    """POST + 网络错误/5xx/429 指数退避重试（1s/2s），返回 message.content 字符串。"""
+    """POST + 网络错误/5xx/429 指数退避重试（1s/2s），返回 message.content 字符串。
+
+    stats 仅累加 attempts 计数（供 llm.request 观测），绝不记录请求体/头。
+    """
     url = f"{settings.LLM_BASE_URL.rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {settings.LLM_API_KEY}"}
     max_retries = settings.LLM_MAX_RETRIES
     last_error = "unknown"
     for attempt in range(max_retries + 1):
+        if stats is not None:
+            stats["attempts"] = int(stats.get("attempts", 0)) + 1
         try:
             response = await client.post(url, json=body, headers=headers)
         except httpx.HTTPError as exc:
@@ -149,14 +223,19 @@ async def _post_with_retries(
             elif response.status_code >= 400:
                 raise LLMGatewayError(
                     f"purpose={purpose!r} 网关返回不可重试错误 "
-                    f"HTTP {response.status_code}: {response.text[:200]}"
+                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    error_kind="HTTP_4XX",
                 )
             else:
                 return _extract_content(response, purpose)
         if attempt < max_retries:
             await _sleep_backoff(float(2**attempt))  # 1s, 2s, ...
+    error_kind = "NETWORK_ERROR" if last_error.startswith("网络错误") else (
+        "HTTP_429" if last_error == "HTTP 429" else "HTTP_5XX"
+    )
     raise LLMGatewayError(
-        f"purpose={purpose!r} 重试 {max_retries} 次后仍失败: {last_error}"
+        f"purpose={purpose!r} 重试 {max_retries} 次后仍失败: {last_error}",
+        error_kind=error_kind,
     )
 
 
@@ -166,9 +245,14 @@ def _extract_content(response: httpx.Response, purpose: str) -> str:
         data = response.json()
         content = data["choices"][0]["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as exc:
-        raise LLMGatewayError(f"purpose={purpose!r} 响应结构非法: {exc}") from exc
+        raise LLMGatewayError(
+            f"purpose={purpose!r} 响应结构非法: {exc}", error_kind="BAD_ENVELOPE"
+        ) from exc
     if not isinstance(content, str):
-        raise LLMGatewayError(f"purpose={purpose!r} 响应 content 非字符串: {content!r}")
+        raise LLMGatewayError(
+            f"purpose={purpose!r} 响应 content 非字符串: {content!r}",
+            error_kind="BAD_ENVELOPE",
+        )
     return content
 
 

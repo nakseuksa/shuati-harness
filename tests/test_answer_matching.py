@@ -161,3 +161,87 @@ def test_answers_equivalent(user: str, standard: str, expected: bool) -> None:
 def test_bare_value_not_matched_against_multi_equation_standard() -> None:
     """标准答案为多方程时，裸值不享受「对单方程右端」豁免。"""
     assert answers_equivalent("2", "x = 2; y = 3") is False
+
+
+# ---------------------------------------------------------------------------
+# PM 紧急修复（2026-11-13 用户实测）：带单位答案误判 / 全角归一
+# 规格：normalize_answer 全角→半角 + 尾部中文单位剥离；answers_equivalent
+# 拉丁单位豁免（仅纯数字标准答案）；既有判据语义零漂移。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        # 裸中文单位 / 拉丁单位 / 全角数字 vs \text{米} 标准答案 → 全部 True
+        ("15米", r"15\ \text{米}", True),
+        ("15 米", r"15\ \text{米}", True),
+        ("15 m", r"15\ \text{米}", True),
+        ("15m", r"15\ \text{米}", True),
+        ("１５", r"15\ \text{米}", True),
+        # 复合中文单位与自匹配
+        ("20米/秒", "20", True),
+        ("15米", "15米", True),
+        # 符号题回归：代数语境绝不剥离（'15*m' 的 '*' 不满足 lookbehind）
+        ("15*m", "15", False),
+        ("m*v", "v*m", True),
+        ("R=mv/(qB)", "R = m*v/(q*B)", True),
+        # 全角方程归一
+        ("ｘ＝５", "x=5", True),
+        # 标准答案含符号时 '15m' 保留隐式乘法语义（15*m）
+        ("15m", "15*m", True),
+        # 单位豁免不放行错误数值（自由符号守卫 5≠7 不动）
+        ("15米", "16", False),
+        ("5m", "7", False),
+        # 复合单位 LaTeX 标准答案
+        ("20米/秒", r"20\ \text{m/s}", True),
+        # 尾随标点容忍
+        ("15米。", "15", True),
+        ("15m.", "15", True),
+    ],
+)
+def test_unit_and_fullwidth_answers(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized"),
+    [
+        # 全角数字/字母/符号 → 半角
+        ("１５", "15"),
+        ("ｘ＝５", "x = 5"),
+        ("（１＋２）／３", "(1+2)/3"),
+        # 尾部中文单位剥离（最长优先）
+        ("20米/秒", "20"),
+        ("15 米", "15"),
+        ("9.8米", "9.8"),
+        ("3平方厘米", "3"),
+        ("2千米每小时", "2"),
+        ("5千克。", "5"),
+        # 中文单位不在尾部 → 不剥离（非单位语境不动）
+        ("米 = 100厘米", "米 = 100"),
+    ],
+)
+def test_normalize_answer_units_and_fullwidth(raw: str, normalized: str) -> None:
+    assert normalize_answer(raw) == normalized
+
+
+def test_latin_unit_exemption_skips_sandbox_on_string_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """纯数字标准答案 + 拉丁单位剥离后字符串相等 → 快路径，不触发沙盒。"""
+
+    def _boom(*args: object, **kwargs: object) -> bool:
+        raise AssertionError("单位豁免字符串快路径不应调用 verify_equation_equivalence")
+
+    monkeypatch.setattr(sympy_verifier, "verify_equation_equivalence", _boom)
+    assert answers_equivalent("15m", "15") is True
+    assert answers_equivalent("20米/秒", "20") is True
+
+
+def test_algebraic_context_never_strips_latin_unit() -> None:
+    """标准答案含自由符号时，'15m' 绝不剥离为 '15'（代数语境保留）。"""
+    # 若误剥离，'15' 对 '15*m' 会判 False；保留隐式乘法才能判 True
+    assert answers_equivalent("15m", "15*m") is True
+    # 反向：纯数字标准答案下 '15*m' 仍不豁免（lookbehind 拦截 '*'）
+    assert answers_equivalent("15*m", "15") is False

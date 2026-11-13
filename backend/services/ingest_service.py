@@ -27,6 +27,7 @@ Target File #5/#8；API 签名与落库流程按 PM 契约 docs/tasks/P2-D_inges
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from pathlib import Path
@@ -35,6 +36,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from backend.db.schema import get_db_connection
+from backend.observability import log_event
 from backend.services.cas_store import (
     ingest_image_bytes,
     normalize_markdown_with_frontmatter,
@@ -51,6 +53,8 @@ from backend.services.vlm_diagnosis import (
 )
 
 __all__ = ["GateCardDTO", "GateStepDTO", "ingest_question"]
+
+logger = logging.getLogger(__name__)
 
 GateStatus = Literal["completed", "blocked", "untouched"]
 InitialState = Literal["错题", "已掌握"]
@@ -111,6 +115,18 @@ async def ingest_question(
     for image_path in stem_images:
         ingest_image_bytes(image_path.read_bytes())
     draft_uris = [ingest_image_bytes(p.read_bytes()) for p in draft_images]
+
+    log_event(
+        logger,
+        "ingest.received",
+        question_uid=uid,
+        stem_hash=stem_hash,
+        initial_state=initial_state,
+        target_grade=target_grade,
+        stem_excerpt=normalized_md,  # 内容字段经观测层统一截断 <= 120 字符
+        stem_image_count=len(stem_images),
+        draft_image_count=len(draft_images),
+    )
 
     with get_db_connection(db_path) as conn:
         existing = conn.execute(
@@ -173,6 +189,17 @@ async def _ingest_new_question(
     tier = str(rubric["tier"])
     parent_cstl = (trace.c_score, trace.s_score, trace.t_score, trace.l_score)
 
+    log_event(
+        logger,
+        "ingest.diagnosis",
+        question_uid=uid,
+        base_elo=base_elo,
+        tier=tier,
+        error_category=alignment.error_category,
+        stalled_step=alignment.stalled_step_index,
+        step_count=len(trace.steps),
+    )
+
     conn.execute(
         """INSERT INTO questions (
             question_uid, origin_type, target_grade_and_subject, stem_md, stem_hash,
@@ -232,6 +259,15 @@ async def _ingest_new_question(
     # 重入库路径不经过此处，天然不重复递增。
     if initial_state == "错题" and session["error_category"] != "ALREADY_MASTERED":
         record_co_error_edges(conn, uid)
+    log_event(
+        logger,
+        "ingest.persisted",
+        question_uid=uid,
+        session_id=str(session["session_id"]),
+        base_elo=base_elo,
+        tier=tier,
+        is_reimport=False,
+    )
     return _gate_card_from_db(conn, question, session, is_reimport=False)
 
 
@@ -262,6 +298,14 @@ async def _reimport_question(
     has_new_drafts = _has_new_drafts(draft_uris, latest)
 
     if not stem_changed and not has_new_drafts:
+        log_event(
+            logger,
+            "ingest.reimport",
+            question_uid=uid,
+            session_id=str(latest["session_id"]),
+            mode="short_circuit",
+            stem_changed=False,
+        )
         return _gate_card_from_db(conn, existing, latest, is_reimport=True)
 
     if stem_changed:
@@ -271,6 +315,23 @@ async def _reimport_question(
             (normalized_md, stem_hash, uid),
         )
     if not has_new_drafts:
+        log_event(
+            logger,
+            "ingest.reimport",
+            question_uid=uid,
+            session_id=str(latest["session_id"]),
+            mode="stem_updated",
+            stem_changed=True,
+        )
+        log_event(
+            logger,
+            "ingest.persisted",
+            question_uid=uid,
+            session_id=str(latest["session_id"]),
+            base_elo=int(existing["base_elo"]),
+            tier=str(existing["tier"]),
+            is_reimport=True,
+        )
         return _gate_card_from_db(conn, existing, latest, is_reimport=True)
 
     # 携带新草稿截图：重新诊断对齐并新建会话（旧会话与步骤骨架原样保留）
@@ -278,8 +339,35 @@ async def _reimport_question(
     payload = await analyze_question_and_draft(
         normalized_md, stem_images, draft_images, target_grade, tree
     )
+    log_event(
+        logger,
+        "ingest.diagnosis",
+        question_uid=uid,
+        base_elo=int(existing["base_elo"]),
+        tier=str(existing["tier"]),
+        error_category=payload.alignment.error_category,
+        stalled_step=payload.alignment.stalled_step_index,
+        step_count=len(payload.trace.steps),
+    )
     _insert_session(conn, uid, draft_uris, payload.alignment, initial_state)
     new_session = _latest_session(conn, uid)
+    log_event(
+        logger,
+        "ingest.reimport",
+        question_uid=uid,
+        session_id=str(new_session["session_id"]),
+        mode="new_draft_session",
+        stem_changed=stem_changed,
+    )
+    log_event(
+        logger,
+        "ingest.persisted",
+        question_uid=uid,
+        session_id=str(new_session["session_id"]),
+        base_elo=int(existing["base_elo"]),
+        tier=str(existing["tier"]),
+        is_reimport=True,
+    )
     return _gate_card_from_db(conn, existing, new_session, is_reimport=True)
 
 

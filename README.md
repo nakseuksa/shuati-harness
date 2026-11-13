@@ -78,6 +78,7 @@ LLM_TEMPERATURE=0.1
 backend/
   main.py                     # FastAPI 应用工厂 + 7 个 REST 端点 + /assets + 前端静态挂载
   config.py                   # Settings：超参数/网关/沙盒配额/存储路径（.env 可覆盖）
+  observability.py            # P5 观测层：结构化行为日志 + request_id 上下文 + 脱敏截断
   db/schema.py                # SQLite DDL 与连接管理（WAL、外键、幂等建表）
   sandbox/sympy_verifier.py   # Python AST 静态探针 + 平台兼容 SymPy 子进程沙盒
   services/
@@ -99,6 +100,80 @@ docs/
   tasks/                      # 各阶段任务契约（P1-A ~ P4-C）
 理论基础.md                    # 教育学/测量学理论依据（四维 Rubric、双轨 Elo、五边拓扑）
 ```
+
+## 观测与审计
+
+运行时行为日志（P5 观测层，`backend/observability.py`）让系统透明化：LLM 调用、沙盒执行、
+FSM 流转、预热流水线、降阶/升层、盲测调度、知识网操作、API 请求全部以结构化事件留痕，
+与 DB 审计账本互补。日志不改任何业务行为；序列化异常降级为 repr 截断，绝不击穿业务。
+
+### 日志位置与格式
+
+- 文件：`data/logs/harness.jsonl`（JSON Lines；滚动 `LOG_MAX_BYTES`=5MB × `LOG_BACKUP_COUNT`=5 备份）
+- 控制台：人类可读「时间 级别 模块 事件 摘要」（`LOG_CONSOLE=False` 关闭；`LOG_LEVEL` 控制级别）
+- 每请求生成 `request_id`（uuid4），经 contextvar 贯穿该请求触发的全部事件，响应头回传 `X-Request-ID`
+
+JSONL 示例：
+
+```json
+{"ts": "2026-11-13T00:24:48.123+00:00", "level": "INFO", "logger": "backend.services.scaffold_engine", "event": "fsm.transition", "request_id": "3f2a9c…", "session_id": "sess-…", "question_uid": "q-…", "from_stage": "STAGE_1_BLIND_PROBE", "to_stage": "STAGE_2_MICRO_SCAFFOLD", "trigger": "stage1_stuck"}
+```
+
+### 事件目录速查
+
+| 模块 | 事件 | 关键字段 |
+| :--- | :--- | :--- |
+| main | `api.request` | method, path, status, duration_ms, request_id |
+| ingest | `ingest.received` / `ingest.reimport` / `ingest.diagnosis` / `ingest.persisted` | reimport 带 mode=short_circuit\|stem_updated\|new_draft_session；diagnosis 带 base_elo, tier, error_category, stalled_step, step_count |
+| scaffold | `gate.confirmed` | branch, overridden, floor_applied, new_stage |
+| scaffold | `fsm.transition` / `fsm.submission` | from_stage, to_stage, trigger；submission 带 stage, correct, no_idea |
+| scaffold | `descent.triggered` / `descent.generated` / `descent.floor_reveal` / `ascent.step` | depth, elo_before/elo_after, reason=atomic\|depth_cap\|elo_floor\|gen_failed |
+| scaffold | `prewarm.started` / `prewarm.local_hit` / `prewarm.kernel_attempt` / `prewarm.dual_blind` / `prewarm.completed` / `prewarm.failed` | kind, attempt, ast_ok, sandbox_ok, error_kind, duration_ms, status, consensus |
+| sandbox | `sandbox.exec` | ok, error_kind, duration_ms（mode=kernel\|equivalence） |
+| gateway | `llm.request` | purpose, model, mock, attempt, latency_ms, ok, error_kind |
+| elo | `elo.event` | trigger, idempotency_key, applied, coverage_before/after, combat_before/after, gamma |
+| elo | `escrow.frozen` / `escrow.realized` / `escrow.forfeited` / `escrow.decayed` | amount, decay_factor |
+| drill | `drill.queue_locked` / `drill.submission` / `drill.cascade` / `drill.retrain` | active_date, uids, deferred_uids；intermediate_ok, final_ok, passed；retrain_stage |
+| graph | `graph.node_reused` / `graph.node_created` / `graph.compaction_merged` / `graph.reverted` / `graph.co_error` | l1/l2/l3, batch_id, from_node, to_node, merges |
+
+所有事件携带相关 `session_id` / `question_uid`（如适用）；幂等命中（applied=false）亦留痕。
+
+### 审计命令
+
+```bash
+# 实时跟踪
+tail -f data/logs/harness.jsonl
+
+# 按请求链路过滤（request_id 取自响应头 X-Request-ID）
+grep '"request_id": "<rid>"' data/logs/harness.jsonl | jq .
+
+# 按会话审计 FSM 流转
+jq 'select(.session_id == "<sid>" and .event == "fsm.transition")' data/logs/harness.jsonl
+
+# 按题目审计 Elo 结算（含幂等 applied=false 留痕）
+jq 'select(.question_uid == "<uid>" and .event == "elo.event")' data/logs/harness.jsonl
+
+# 沙盒失败排查
+jq 'select(.event == "sandbox.exec" and .ok == false)' data/logs/harness.jsonl
+
+# LLM 调用耗时与失败分类
+jq 'select(.event == "llm.request") | {purpose, mock, attempt, latency_ms, ok, error_kind}' data/logs/harness.jsonl
+```
+
+### 安全红线
+
+- 绝不记录 `LLM_API_KEY` / `Authorization` 头 / 完整请求体；密钥类字段名一律脱敏，
+  字符串值中出现的真实密钥与 Bearer 令牌替换为 `***REDACTED***`；
+- 题干等内容字段截断 ≤120 字符（全文在 DB）；
+- 日志只写 method/path/status 等元数据，不写请求体与查询参数。
+
+### 与 DB 审计账本的关系
+
+- `elo_mutation_ledger` / `compaction_audit_ledger`：不可变业务账本，是 Elo 确定性重放与
+  合并回滚的**事实来源**（事务内原子写入，永不滚动删除）。
+- `harness.jsonl`：运行时观测层，记录「发生了什么、耗时多少、是否幂等命中、失败原因」，
+  覆盖账本之外的行为（LLM/沙盒/FSM/预热/API）。两者经 `question_uid` / `session_id` /
+  `idempotency_key` / `batch_id` 关联互查；日志滚动过期不影响账本审计。
 
 ## 文档索引
 
