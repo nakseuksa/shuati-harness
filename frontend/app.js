@@ -821,7 +821,9 @@ function answerZoneHtml(resp) {
         <button class="btn btn-primary" type="button" data-action="stage-submit">📤 提交作答</button>
         ${resp.micro_stage === 'STAGE_1_BLIND_PROBE'
           ? '<button class="btn" type="button" data-action="stage-noidea">🪜 仍无思路，请求二阶微母题铺垫</button>'
-          : ''}
+          : resp.micro_stage === 'STAGE_2_MICRO_SCAFFOLD'
+            ? '<button class="btn" type="button" data-action="stage-noidea">🪜 仍不会，请求更基础的铺垫</button>'
+            : ''}
       </div>
     </div>`;
 }
@@ -877,13 +879,18 @@ function renderTraining() {
       ${extraPayloadHtml(v, ['masked_conditions', 'masked_conditions_json', 'conditions', 'probe_question_md', 'probe_md', 'probe', 'verification_mode', 'mode', 'allowed_symbols', 'symbols'])}`;
   } else if (stage === 'STAGE_2_MICRO_SCAFFOLD') {
     const wait = prewarmWaitState(resp);
+    const depth = Number(v.scaffold_depth || 0);
+    const we = v.worked_example;
     body = `
       ${fallbackBannerHtml(resp)}
-      <div class="mask-banner" style="border-left:5px solid var(--magenta)">🐣 二阶 · 脱壳微母题：已剥离原题背景，只练卡点那一步的原子转化</div>
+      ${v.notice ? `<div class="notice-bar" role="status">${esc(v.notice)}</div>` : ''}
+      <div class="mask-banner" style="border-left:5px solid var(--magenta)">🐣 二阶 · 脱壳微母题：已剥离原题背景，只练卡点那一步的原子转化${depth > 0 ? `<span class="depth-chip">铺垫层级 ${depth}</span>` : ''}</div>
       ${wait === 'ready'
-        ? `<div class="drill-stem rich">${renderRich(stem)}</div>${answerZoneHtml(resp)}`
+        ? `<div class="drill-stem rich">${renderRich(stem)}</div>
+           ${we ? `<div class="worked-example"><h4>📖 最基础原子题 · 标准答案演示</h4><div class="rich">${renderRich(we.answer_latex || '')}</div><p class="field-help">${esc(we.hint || '')}</p></div>` : ''}
+           ${answerZoneHtml(resp)}`
         : prewarmCardHtml(resp, wait, 'micro')}
-      ${extraPayloadHtml(v, ['micro_scaffold', 'stem_md', 'scaffold_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status', 'verification_badge', 'prewarm_failed'])}`;
+      ${extraPayloadHtml(v, ['micro_scaffold', 'stem_md', 'scaffold_stem_md', 'stem', 'verification_mode', 'mode', 'allowed_symbols', 'symbols', 'verification_status', 'verification_badge', 'prewarm_failed', 'notice', 'scaffold_depth', 'worked_example'])}`;
   } else if (stage === 'STAGE_3_REDO_ORIGINAL') {
     body = `
       <div class="mask-banner" style="border-left:5px solid var(--green)">🔓 三阶 · 无提示回原题：所有遮罩与微母题已撤去，请独立贯通完整原题</div>

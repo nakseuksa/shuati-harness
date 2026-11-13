@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     L3_TOP_K_CANDIDATES: int = 15
     MAX_ALIASES_PER_NODE: int = 8
     COMPACTION_BATCH_THRESHOLD: int = 15
+    SCAFFOLD_DESCENT_MAX_DEPTH: int = 4
 
     # ---- 盲测调度 ----
     DAILY_BLIND_DRILL_CAP: int = 3

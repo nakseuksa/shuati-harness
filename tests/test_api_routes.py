@@ -959,3 +959,18 @@ async def test_retry_prewarm_route_noop_and_unknown_404(client: AsyncClient) -> 
     assert r.status_code == 200, r.text
     r = await client.post("/api/v1/sessions/no-such-session/retry-prewarm")
     assert r.status_code == 404
+
+
+async def test_stage2_no_idea_descends_via_api(client: AsyncClient) -> None:
+    """二阶输入「不会」→ 递归降阶：新铺垫题难度更低、层级+1（API 层回归）。"""
+    card = await _ingest(client)
+    sid = card["session_id"]
+    await _confirm(client, sid, "CONCEPT_BOTTLENECK")
+    resp = await _submit(client, sid, STAGE1_WRONG)
+    assert resp["micro_stage"] == "STAGE_2_MICRO_SCAFFOLD"
+    l0 = resp["view_payload"]["micro_scaffold"]["question_uid"]
+    resp = await _submit(client, sid, "不会", None)
+    assert resp["micro_stage"] == "STAGE_2_MICRO_SCAFFOLD"
+    assert resp["view_payload"]["micro_scaffold"]["question_uid"] != l0
+    assert resp["view_payload"]["scaffold_depth"] == 1
+    assert resp["view_payload"].get("notice")

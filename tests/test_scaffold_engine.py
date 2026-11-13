@@ -926,3 +926,122 @@ async def test_retry_prewarm_completed_rejected(
     await confirm_diagnostic_gate(sid, 2, "ALREADY_MASTERED", db_path=tmp_db)
     with pytest.raises(ValueError, match="会话已完成"):
         await retry_prewarm(sid, tmp_db)
+
+
+# ---------------------------------------------------------------------------
+# 二阶递归降阶（2026-11-13 用户需求：不会/请求铺垫 → 逐层降阶至最基础题）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["不会", "我不会", "不懂", "请求铺垫", "不知道", "没思路", "再简单点", "help", "降阶"],
+)
+def test_no_idea_text_detection_positive(text: str) -> None:
+    assert scaffold_engine._is_no_idea_text(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["x = 5", "2*(x + 3) = 16", "不等式 x > 2", "R + R*sin(theta) = d", "", "   "],
+)
+def test_no_idea_text_detection_negative(text: str) -> None:
+    assert not scaffold_engine._is_no_idea_text(text)
+
+
+async def _reach_stage2(tmp_db: Path, install_diagnosis: Any) -> tuple[str, str]:
+    gate = await _concept_session(tmp_db, install_diagnosis)
+    sid = gate.session_id
+    await confirm_diagnostic_gate(sid, 2, "CONCEPT_BOTTLENECK", db_path=tmp_db)
+    await _drain(sid)
+    resp = await submit_stage_answer(sid, STAGE1_WRONG, db_path=tmp_db)
+    assert resp.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+    uid = str(resp.view_payload["micro_scaffold"]["question_uid"])
+    return sid, uid
+
+
+def _question_elo(tmp_db: Path, uid: str) -> int:
+    row = _one(tmp_db, "SELECT base_elo FROM questions WHERE question_uid = ?", (uid,))
+    return int(row["base_elo"])
+
+
+async def test_stage2_no_idea_text_descends_to_simpler_scaffold(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    sid, l0_uid = await _reach_stage2(tmp_db, install_diagnosis)
+    l0_elo = int(
+        _one(tmp_db, "SELECT base_elo FROM questions WHERE question_uid = ?", (l0_uid,))["base_elo"]
+    )
+    resp = await submit_stage_answer(sid, "不会", db_path=tmp_db)
+    assert resp.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+    assert resp.view_payload.get("notice")
+    l1_uid = str(resp.view_payload["micro_scaffold"]["question_uid"])
+    assert l1_uid != l0_uid
+    l1_elo = int(
+        _one(tmp_db, "SELECT base_elo FROM questions WHERE question_uid = ?", (l1_uid,))["base_elo"]
+    )
+    assert l1_elo < l0_elo  # 难度严格单调递减
+    assert resp.view_payload["scaffold_depth"] == 1
+    edge = _one(
+        tmp_db,
+        "SELECT target_question_uid FROM question_relations "
+        "WHERE source_question_uid = ? AND relation_type = 'SCAFFOLD_PRE'",
+        (l1_uid,),
+    )
+    assert str(edge["target_question_uid"]) == l0_uid
+    sess = _one(
+        tmp_db,
+        "SELECT prewarm_scaffold_uid FROM diagnostic_sessions WHERE session_id = ?",
+        (sid,),
+    )
+    assert str(sess["prewarm_scaffold_uid"]) == l1_uid
+
+
+async def test_stage2_recursive_descent_terminates_at_floor(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    sid, uid = await _reach_stage2(tmp_db, install_diagnosis)
+    elos = [_question_elo(tmp_db, uid)]
+    resp = None
+    for _ in range(settings.SCAFFOLD_DESCENT_MAX_DEPTH + 2):
+        resp = await submit_stage_answer(sid, "", "NO_IDEA", db_path=tmp_db)
+        assert resp.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+        if resp.view_payload.get("worked_example"):
+            break
+        cur = str(resp.view_payload["micro_scaffold"]["question_uid"])
+        elo = _question_elo(tmp_db, cur)
+        assert elo < elos[-1], "降阶必须严格单调递减"
+        elos.append(elo)
+    else:
+        pytest.fail("递归降阶未在深度上限内终止")
+    assert resp is not None
+    we = resp.view_payload["worked_example"]
+    assert we["answer_latex"] and we["hint"]
+
+
+async def test_stage2_ascent_ladder_back_to_original(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    sid, l0_uid = await _reach_stage2(tmp_db, install_diagnosis)
+    resp = await submit_stage_answer(sid, "请求铺垫", db_path=tmp_db)
+    l1_uid = str(resp.view_payload["micro_scaffold"]["question_uid"])
+    assert l1_uid != l0_uid
+    # 答对降阶题（Mock 答案 x = 5）→ 回到 L0（仍二阶）
+    resp = await submit_stage_answer(sid, "x = 5", db_path=tmp_db)
+    assert resp.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+    assert str(resp.view_payload["micro_scaffold"]["question_uid"]) == l0_uid
+    assert resp.view_payload["scaffold_depth"] == 0
+    # 答对 L0 → 三阶原题
+    resp = await submit_stage_answer(sid, "x = 5", db_path=tmp_db)
+    assert resp.micro_stage == "STAGE_3_REDO_ORIGINAL"
+
+
+async def test_stage2_wrong_math_answer_does_not_descend(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    sid, l0_uid = await _reach_stage2(tmp_db, install_diagnosis)
+    resp = await submit_stage_answer(sid, "x = 999", db_path=tmp_db)
+    assert resp.micro_stage == "STAGE_2_MICRO_SCAFFOLD"
+    assert str(resp.view_payload["micro_scaffold"]["question_uid"]) == l0_uid
+    assert resp.view_payload.get("feedback")
+    assert not resp.view_payload.get("worked_example")

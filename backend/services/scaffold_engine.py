@@ -71,6 +71,21 @@ _CATEGORIES = frozenset({"ALREADY_MASTERED", "TRAP_OR_CALC_ERROR", "CONCEPT_BOTT
 # 一阶自评「仍无思路」触发词（结构化自评，直接请求二阶铺垫）
 _NO_IDEA_ASSESSMENTS = frozenset({"no_idea", "stuck", "无思路", "仍无思路"})
 
+# 作答框求助语义识别（二阶递归降阶触发，2026-11-13 用户需求）
+_NO_IDEA_TEXT_RE = re.compile(
+    r"不会|不懂|不知道|没思路|无思路|没有思路|没头绪|请求铺垫|要铺垫|给铺垫|铺垫|"
+    r"降阶|再简单|更简单|简单点|求助|help|no\s*idea|stuck",
+    re.IGNORECASE,
+)
+
+
+def _is_no_idea_text(answer: str) -> bool:
+    """短文本 + 短语匹配识别求助语义，避免误伤正常数学作答（如“不等式”）。"""
+    s = (answer or "").strip()
+    if not s or len(s) > 24:
+        return False
+    return bool(_NO_IDEA_TEXT_RE.search(s))
+
 # 本地检索阈值（设计 §3.2 第 2 条「本地题库优先结构化检索」）
 _SCAFFOLD_MAX_STEPS = 2  # SCAFFOLD_PRE：子题步数 <= 2
 _SCAFFOLD_MIN_ELO_GAP = 200  # SCAFFOLD_PRE：D_orig - D_cand >= 200
@@ -697,7 +712,9 @@ _BLIND_SYSTEM_PROMPT = (
 
 
 def _kernel_messages(
-    question: sqlite3.Row, kind: Literal["scaffold", "variant"], stalled_step: sqlite3.Row | None
+    question: sqlite3.Row,
+    kind: Literal["scaffold", "variant", "descent"],
+    stalled_step: sqlite3.Row | None,
 ) -> list[dict[str, Any]]:
     if kind == "scaffold":
         assert stalled_step is not None
@@ -707,6 +724,14 @@ def _kernel_messages(
             f"核心关系式：{stalled_step['step_formula_latex']}\n\n"
             "请生成一道剥离原题背景、1～2 步可解的脱壳微母题内核，"
             "针对该卡点步的纯代数/几何关系，难度显著低于原题。"
+        )
+    elif kind == "descent":
+        user_content = (
+            f"当前铺垫题题干：\n{question['stem_md']}\n\n"
+            f"标准答案：{question['standard_answer_latex']}\n\n"
+            "学生仍然不会。请生成一道严格更简单的降阶铺垫题内核：保留同一原子技能，"
+            "压缩到 1 步直达，数值更小更整，去除一切多余情境与干扰条件，"
+            "难度必须显著低于当前铺垫题。"
         )
     else:
         user_content = (
@@ -732,13 +757,21 @@ def _render_stem(tpl: str, params: dict[str, str | int | float] | None) -> str |
 async def _generate_kernel_question(
     question: sqlite3.Row,
     *,
-    kind: Literal["scaffold", "variant"],
+    kind: Literal["scaffold", "variant", "descent"],
     stalled_step: sqlite3.Row | None,
 ) -> _GenResult | None:
-    """内核先行流水线：LLM 内核 → AST 探针 → SymPy 沙盒 → 重试 → 双盲降级。"""
-    if question["origin_type"] != "USER_CANONICAL":
+    """内核先行流水线：LLM 内核 → AST 探针 → SymPy 沙盒 → 重试 → 双盲降级。
+
+    kind='descent' 为用户驱动的递归降阶（2026-11-13 需求）：允许以合成铺垫题为母题，
+    由深度上限 + 单调性硬锁约束；自动预热路径仍禁止合成题衍生（设计 §3.2）。
+    """
+    if kind != "descent" and question["origin_type"] != "USER_CANONICAL":
         raise ValueError("合成题不得作为母题再次衍生（设计 §3.2）")
-    purpose = "scaffold_kernel" if kind == "scaffold" else "variant_kernel"
+    purpose = {
+        "scaffold": "scaffold_kernel",
+        "variant": "variant_kernel",
+        "descent": "descent_kernel",
+    }[kind]
     messages = _kernel_messages(question, kind, stalled_step)
     last_error = "unknown"
     last_params: dict[str, str | int | float] | None = None
@@ -972,7 +1005,7 @@ async def submit_stage_answer(
     if stage == "STAGE_1_BLIND_PROBE":
         return await _submit_stage1(session, user_answer, self_assessment, db_path)
     if stage == "STAGE_2_MICRO_SCAFFOLD":
-        return await _submit_stage2(session, user_answer, db_path)
+        return await _submit_stage2(session, user_answer, self_assessment, db_path)
     if stage == "STAGE_3_REDO_ORIGINAL":
         return await _submit_stage3(session, user_answer, db_path)
     if stage == "STAGE_4_DECRUTCH_VARIANT":
@@ -1032,16 +1065,122 @@ async def _submit_stage1(
     return _build_response(session_id, db_path)
 
 
-async def _submit_stage2(
-    session: sqlite3.Row, user_answer: str, db_path: Path | None
+def _scaffold_parent_uid(conn: sqlite3.Connection, uid: str) -> str | None:
+    """SCAFFOLD_PRE 有向边（source=子题 → target=母题）的直接上层。"""
+    row = conn.execute(
+        "SELECT target_question_uid FROM question_relations "
+        "WHERE source_question_uid = ? AND relation_type = 'SCAFFOLD_PRE' LIMIT 1",
+        (uid,),
+    ).fetchone()
+    return str(row["target_question_uid"]) if row else None
+
+
+def _scaffold_depth(conn: sqlite3.Connection, scaffold_uid: str, original_uid: str) -> int:
+    """沿 SCAFFOLD_PRE 链回溯的降阶层数（直接铺垫=0，防环；回到原题的边不计入）。"""
+    depth = 0
+    cur = scaffold_uid
+    seen = {cur}
+    while cur != original_uid and depth <= settings.SCAFFOLD_DESCENT_MAX_DEPTH + 1:
+        nxt = _scaffold_parent_uid(conn, cur)
+        if nxt is None or nxt in seen or nxt == original_uid:
+            break
+        seen.add(nxt)
+        cur = nxt
+        depth += 1
+    return depth
+
+
+def _worked_example_view(current: sqlite3.Row) -> dict[str, Any]:
+    """降阶触底时的标准答案演示卡（最基础原子题，不剧透原题结论）。"""
+    return {
+        "stem_md": str(current["stem_md"]),
+        "answer_latex": str(current["standard_answer_latex"]),
+        "hint": "这已是最基础的原子题。看懂标准答案后重新作答，答对即可逐层返回原题。",
+    }
+
+
+async def _descend_scaffold(
+    session: sqlite3.Row, current: sqlite3.Row, db_path: Path | None
 ) -> SessionStepResponse:
-    """二阶脱壳微母题：与微母题标准答案等价 → 三阶；错 → 停留并反馈。"""
+    """用户驱动的递归降阶：生成严格更简单的铺垫题，直到最基础原子题。
+
+    终止条件：深度上限 / C=S=1 原子题 / 难度触底 800 → 展示标准答案演示卡。
+    难度单调递减由 _persist_synthetic 内的 clamp_substep_difficulty 保证
+    （每层 C/S 至少降 1，elo 至少降 150，直至 800 下界）。
+    """
+    session_id = str(session["session_id"])
+    original_uid = str(session["question_uid"])
+    current_uid = str(current["question_uid"])
+    with get_db_connection(db_path) as conn:
+        depth = _scaffold_depth(conn, current_uid, original_uid)
+        steps = _branch_steps(conn, current_uid, "canonical")
+    atomic = int(current["c_score"]) <= 1 and int(current["s_score"]) <= 1
+    if (
+        depth >= settings.SCAFFOLD_DESCENT_MAX_DEPTH
+        or atomic
+        or int(current["base_elo"]) <= settings.BASE_ELO_MIN
+        or not steps
+    ):
+        return _build_response(
+            session_id,
+            db_path,
+            notice="🪜 已降至最基础的原子题，不再继续降阶；看懂标准答案后重新作答即可逐层返回。",
+            worked_example=_worked_example_view(current),
+        )
+    gen = await _generate_kernel_question(current, kind="descent", stalled_step=None)
+    if gen is None:
+        return _build_response(
+            session_id,
+            db_path,
+            notice="降阶题生成未通过校验；已展示当前铺垫题的标准答案供学习。",
+            worked_example=_worked_example_view(current),
+        )
+    new_uid = _persist_synthetic(
+        db_path,
+        current,
+        gen,
+        origin_type="AI_SYNTHETIC_SCAFFOLD",
+        relation_type="SCAFFOLD_PRE",
+        stalled_step=steps[0],
+    )
+    _write_session_fields(db_path, session_id, prewarm_scaffold_uid=new_uid)
+    with get_db_connection(db_path) as conn:
+        new_q = _load_question(conn, new_uid)
+    return _build_response(
+        session_id,
+        db_path,
+        notice=(
+            f"🪜 已降阶至第 {depth + 1} 层铺垫（难度 {new_q['base_elo']}）；"
+            "逐层答对可返回原题。"
+        ),
+    )
+
+
+async def _submit_stage2(
+    session: sqlite3.Row, user_answer: str, self_assessment: str | None, db_path: Path | None
+) -> SessionStepResponse:
+    """二阶脱壳微母题：等价 → 升层/三阶；不会/请求铺垫 → 递归降阶；错 → 停留反馈。"""
     session_id = str(session["session_id"])
     scaffold = await _ensure_prewarm_question(session_id, "scaffold", db_path)
+    no_idea = (
+        (self_assessment or "").strip().lower() in _NO_IDEA_ASSESSMENTS
+        or _is_no_idea_text(user_answer)
+    )
+    if no_idea:
+        return await _descend_scaffold(session, scaffold, db_path)
     correct = await asyncio.to_thread(
         answers_equivalent, user_answer, str(scaffold["standard_answer_latex"])
     )
     if correct:
+        with get_db_connection(db_path) as conn:
+            parent_uid = _scaffold_parent_uid(conn, str(scaffold["question_uid"]))
+            parent = _load_question(conn, parent_uid) if parent_uid else None
+        if parent is not None and parent["origin_type"] != "USER_CANONICAL":
+            # 降阶梯 ascent：答对当前层 → 回到上一层铺垫题（仍为合成题）
+            _write_session_fields(db_path, session_id, prewarm_scaffold_uid=parent_uid)
+            return _build_response(
+                session_id, db_path, notice="✅ 通过！已回到上一层铺垫题，继续作答。"
+            )
         _transition(
             db_path, session_id, expect="STAGE_2_MICRO_SCAFFOLD", new="STAGE_3_REDO_ORIGINAL"
         )
@@ -1212,6 +1351,7 @@ def _build_response(
     explanation_text: str | None = None,
     feedback: str | None = None,
     notice: str | None = None,
+    worked_example: dict[str, Any] | None = None,
 ) -> SessionStepResponse:
     with get_db_connection(db_path) as conn:
         session = _load_session(conn, session_id)
@@ -1231,6 +1371,14 @@ def _build_response(
             }
         elif stage == "STAGE_2_MICRO_SCAFFOLD":
             view = _question_view(conn, session["prewarm_scaffold_uid"], "micro_scaffold")
+            if session["prewarm_scaffold_uid"] is not None:
+                view["scaffold_depth"] = _scaffold_depth(
+                    conn,
+                    str(session["prewarm_scaffold_uid"]),
+                    str(question["question_uid"]),
+                )
+            if worked_example is not None:
+                view["worked_example"] = worked_example
         elif stage == "STAGE_3_REDO_ORIGINAL":
             view = {
                 "stem_md": question["stem_md"],

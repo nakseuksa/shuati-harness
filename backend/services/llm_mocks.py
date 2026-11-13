@@ -139,6 +139,18 @@ MOCK_RESPONSES: dict[str, dict[str, Any]] = {
         "sympy_solver_code": _SCAFFOLD_SOLVER_CODE,
         "constraints_check": "a, b, c 为正整数且 a ≠ 0；方程在实数域有唯一解，且解 x 为正整数。",
     },
+    # 递归降阶内核（2026-11-13 需求）：一步直达最简方程，与 solver_blind 答案一致（x = 5）。
+    "descent_kernel": {
+        "parametric_stem_tpl": "解关于 $x$ 的一元一次方程：$2x = 10$。",
+        "sympy_solver_code": (
+            "import sympy\n\n"
+            "def solve_kernel():\n"
+            "    x = sympy.symbols('x')\n"
+            "    sol = sympy.solve(sympy.Eq(2 * x, 10), x)\n"
+            "    return {'params': {}, 'answer_latex': 'x = ' + str(sol[0])}\n"
+        ),
+        "constraints_check": "一步除法直达，系数整除，无情境干扰；解 x = 5 为正整数。",
+    },
     "variant_kernel": {
         "parametric_stem_tpl": "一个矩形的宽为 ${b}$，周长为 ${p}$。设长为 $x$，求 $x$。",
         "sympy_solver_code": _VARIANT_SOLVER_CODE,
