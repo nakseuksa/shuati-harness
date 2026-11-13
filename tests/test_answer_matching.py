@@ -245,3 +245,259 @@ def test_algebraic_context_never_strips_latin_unit() -> None:
     assert answers_equivalent("15m", "15*m") is True
     # 反向：纯数字标准答案下 '15*m' 仍不豁免（lookbehind 拦截 '*'）
     assert answers_equivalent("15*m", "15") is False
+
+
+# ---------------------------------------------------------------------------
+# P6：复合数量答案解析（2026-11-13 用户报告：「9小时36分」误判）
+# 规格：docs/tasks/P6-compound-quantity.md —— 复合量必须在 normalize 之前解析
+# （\text 剥离会把数字拼接成 "936"）；任一方为数量即权威判定，绝不回落
+# normalize 字符串比对；既有判据（自由符号守卫/拉丁豁免/中文剥离）零漂移。
+# ---------------------------------------------------------------------------
+
+_P6_STD_TIME = r"9\ \text{小时}\ 36\ \text{分}"  # = 576 分钟 = 9.6 小时
+
+
+@pytest.mark.parametrize(
+    "user",
+    [
+        "9小时36分",
+        "9小时36分钟",
+        "9.6小时",
+        "576分",
+        "576分钟",
+        "9.6",  # 裸数字：小时表示
+        "576",  # 裸数字：分钟表示
+        "9小时36",  # 小时后尾部裸数字按分钟推断
+        "９小时３６分",  # 全角
+        r"9\ \text{小时}\ 36\ \text{分}",  # LaTeX 原样
+    ],
+)
+def test_p6_compound_time_accepted(user: str) -> None:
+    assert answers_equivalent(user, _P6_STD_TIME) is True
+
+
+@pytest.mark.parametrize(
+    "user",
+    [
+        "9小时35分",
+        "10小时",
+        "936",  # 关键红线：破损拼接值绝不通过
+        "9.6分",
+        "576小时",
+        "9小时",
+        "36分",
+    ],
+)
+def test_p6_compound_time_rejected(user: str) -> None:
+    assert answers_equivalent(user, _P6_STD_TIME) is False
+
+
+def test_p6_user_real_case() -> None:
+    """用户真实题目 a01b47d7 端到端：「9小时36分」对 LaTeX 标准答案必须判对。"""
+    assert answers_equivalent("9小时36分", "9\\ \\text{小时}\\ 36\\ \\text{分}") is True
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        # 长度/质量复合量
+        ("2米30厘米", "2.3米", True),
+        ("230厘米", r"2\ \text{米}\ 30\ \text{厘米}", True),
+        ("1千克50克", "1050克", True),
+        ("2米31厘米", "2.3米", False),
+        ("2米30厘米", "230厘米", True),
+        ("230", "2米30厘米", True),  # 裸数字：厘米表示
+        ("2300", "2米30厘米", True),  # 裸数字：毫米表示
+        ("1.05", "1千克50克", True),  # 裸数字：千克表示
+        ("1050", "1千克50克", True),  # 裸数字：克表示
+        # 符号回归：零漂移既有判据
+        ("m*v", "v*m", True),
+        ("15*m", "15", False),
+        ("15米", "15", True),
+        ("x=5", "x = 5", True),
+        ("20米/秒", "20", True),
+        ("15m", "15*m", True),  # 代数语境隐式乘法保留（单字母拉丁不进数量解析）
+    ],
+)
+def test_p6_length_mass_and_symbol_regression(
+    user: str, standard: str, expected: bool
+) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        # 货币：「分」在同串出现 元/角 时按货币（0.01元）
+        ("5元3角", "5.3元", True),
+        ("5元30分", "5.3元", True),
+        ("0.36元", "3角6分", True),
+        ("5.3", "5元3角", True),  # 裸数字：元表示
+        ("53", "5元3角", True),  # 裸数字：角表示
+        ("530", "5元3角", True),  # 裸数字：分表示
+        # 「分」歧义默认时间：无货币上下文不跨量纲放行
+        ("36分", "0.36元", False),
+        ("5元3角", "530分", False),
+        ("36分", "36分", True),
+    ],
+)
+def test_p6_money_units(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        ("9时36分", _P6_STD_TIME, True),  # 「时」别名
+        ("9小时36分。", _P6_STD_TIME, True),  # 尾随标点
+        (r"9\,\text{小时}\,36\,\text{分}", _P6_STD_TIME, True),
+        (r"9\mathrm{小时}36\mathrm{分}", _P6_STD_TIME, True),
+        (r"9\quad\text{小时}\quad36\quad\text{分}", _P6_STD_TIME, True),
+        ("9小时36分", "９小时３６分", True),  # 全角标准答案
+        (_P6_STD_TIME, "9小时36分", True),  # 方向反转
+        ("576分钟", "9.6小时", True),
+        ("34560", _P6_STD_TIME, True),  # 裸数字：秒表示
+        (r"540分 \Rightarrow 9\text{小时}36\text{分}", _P6_STD_TIME, True),  # 蕴含链结论
+        ("90min", "1.5小时", True),  # 多字母拉丁单位无歧义
+        ("2km", "2000米", True),
+        ("1.5kg", "1500克", True),
+        ("500mm", "0.5米", True),
+    ],
+)
+def test_p6_aliases_and_latex_variants(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        # 尾随单字母拉丁单位：数量语境按量纲换算（非量纲盲剥）
+        ("9.6h", _P6_STD_TIME, True),
+        ("34560s", _P6_STD_TIME, True),
+        ("576s", _P6_STD_TIME, False),  # 576秒=9.6分 ≠ 576分
+        ("9.6h", "9.6分", False),
+        ("1500g", "1.5千克", True),
+        ("15g", "15米", False),  # 异量纲拒绝
+        ("15m", "15克", False),
+        ("15*m", r"15\ \text{米}", False),  # 代数式绝不进入数量换算
+    ],
+)
+def test_p6_latin_suffix_dimension_aware(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        ("-5米", "-500厘米", True),
+        ("-5米", "-5", True),
+        ("-5", "-5米", True),
+        ("-5米", "5米", False),
+    ],
+)
+def test_p6_negative_quantities(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+def test_p6_quantity_path_authoritative_no_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """双方均为数量时权威判定：绝不回落 normalize 比对，也不触发沙盒。"""
+
+    def _boom(*args: object, **kwargs: object) -> bool:
+        raise AssertionError("数量权威路径不应调用 normalize/沙盒")
+
+    monkeypatch.setattr(sympy_verifier, "normalize_answer", _boom)
+    monkeypatch.setattr(sympy_verifier, "verify_equation_equivalence", _boom)
+    assert answers_equivalent("9小时36分", _P6_STD_TIME) is True
+    assert answers_equivalent("9小时35分", _P6_STD_TIME) is False
+    assert answers_equivalent("9小时36分", "2米30厘米") is False  # 异量纲
+
+
+def test_p6_broken_concat_never_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """关键红线：破损拼接值 '936' 绝不通过（裸值分支 float 快路径，不触沙盒）。"""
+
+    def _boom(*args: object, **kwargs: object) -> bool:
+        raise AssertionError("裸值数量分支不应调用沙盒")
+
+    monkeypatch.setattr(sympy_verifier, "verify_equation_equivalence", _boom)
+    assert answers_equivalent("936", _P6_STD_TIME) is False
+    assert answers_equivalent("936", "9小时36分") is False
+    assert answers_equivalent("9小时36分", "936") is False
+    assert answers_equivalent("576", _P6_STD_TIME) is True
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        # 纯数字表达式裸答案：沙盒数值等价（保留旧管线能力，仍不回落字符串比对）
+        ("1152/2", _P6_STD_TIME, True),
+        ("2^9", "512分", True),
+        ("(576)", _P6_STD_TIME, True),
+        ("936/1", _P6_STD_TIME, False),
+    ],
+)
+def test_p6_numeric_expression_bare_answer(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        ("", _P6_STD_TIME, False),
+        (_P6_STD_TIME, "", False),
+        ("9小时36米", _P6_STD_TIME, False),  # 混合量纲非法
+        ("x=576", _P6_STD_TIME, False),  # 含自由符号方程不享裸值匹配
+    ],
+)
+def test_p6_empty_and_non_quantity(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("9小时36分", (576.0, "time")),
+        ("9小时36", (576.0, "time")),
+        ("9时36分", (576.0, "time")),
+        ("９小时３６分", (576.0, "time")),
+        (r"9\ \text{小时}\ 36\ \text{分}", (576.0, "time")),
+        ("2米30厘米", (2.3, "length")),
+        ("1千克50克", (1050.0, "mass")),
+        ("5元3角", (5.3, "money")),
+        ("5元30分", (5.3, "money")),
+        ("36分", (36.0, "time")),
+        ("-5米", (-5.0, "length")),
+        ("90min", (90.0, "time")),
+        ("2km", (2000.0, "length")),
+    ],
+)
+def test_p6_parse_quantity_values(text: str, expected: tuple[float, str]) -> None:
+    parsed = sympy_verifier._parse_quantity(text)
+    assert parsed is not None
+    assert parsed[0] == pytest.approx(expected[0])
+    assert parsed[1] == expected[1]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "15*m",  # 代数乘法
+        "m*v",
+        "x=5",
+        "20米/秒",  # 速率单位
+        "米/秒",
+        "936",  # 无单位裸数字不是数量
+        "",
+        "   ",
+        "9小时36米",  # 混合量纲
+        "1/2小时",  # 分数写法回落代数管线
+        "9小时36分x",
+        # 单字母拉丁单位与代数符号同形 → 绝不解析为数量（零漂移红线）
+        "15m",
+        "5g",
+        "2t",
+        "3h",
+        "10s",
+    ],
+)
+def test_p6_parse_quantity_rejects_non_quantity(text: str) -> None:
+    assert sympy_verifier._parse_quantity(text) is None

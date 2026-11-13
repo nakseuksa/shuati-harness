@@ -639,6 +639,147 @@ def _is_pure_numeric(text: str) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# 复合数量解析与单位换算（2026-11-13 用户报告修复：「9小时36分」对
+# 「9\ \text{小时}\ 36\ \text{分}」被误判——\text 剥离会把数字拼接成 "936"，
+# 复合量必须在归一化之前解析换算）
+# ---------------------------------------------------------------------------
+
+# 单位 → (量纲, 换算到基本单位的因子)；时间基本单位=分，长度=米，质量=克，货币=元。
+# 单字母拉丁单位（m/g/t/h/s）与代数符号同形，绝不进入数量解析——'15m' 对 '15*m'
+# 必须保留隐式乘法语义（零漂移红线）；它们仅在权威路径裸值分支按量纲换算
+# （_BARE_LATIN_UNIT_RE）。多字母拉丁单位（min/km/cm/mm/kg/dm）无歧义，保留。
+_QUANTITY_UNITS: dict[str, tuple[str, float]] = {
+    "小时": ("time", 60.0), "时": ("time", 60.0),
+    "分钟": ("time", 1.0), "分": ("time", 1.0), "min": ("time", 1.0),
+    "秒": ("time", 1.0 / 60.0),
+    "千米": ("length", 1000.0), "公里": ("length", 1000.0), "km": ("length", 1000.0),
+    "米": ("length", 1.0),
+    "分米": ("length", 0.1), "dm": ("length", 0.1),
+    "厘米": ("length", 0.01), "cm": ("length", 0.01),
+    "毫米": ("length", 0.001), "mm": ("length", 0.001),
+    "吨": ("mass", 1_000_000.0),
+    "千克": ("mass", 1000.0), "kg": ("mass", 1000.0),
+    "克": ("mass", 1.0),
+    "元": ("money", 1.0), "角": ("money", 0.1),
+}
+_QUANTITY_UNIT_RE = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*("
+    + "|".join(sorted(_QUANTITY_UNITS, key=len, reverse=True))
+    + r")"
+)
+# 基本单位值 → 各常用单位表示的乘数（裸数字答案按任一常用单位匹配）
+_QUANTITY_REPS: dict[str, dict[str, float]] = {
+    "time": {"小时": 1.0 / 60.0, "分": 1.0, "秒": 60.0},
+    "length": {"千米": 1.0 / 1000.0, "米": 1.0, "厘米": 100.0, "毫米": 1000.0},
+    "mass": {"吨": 1.0 / 1_000_000.0, "千克": 1.0 / 1000.0, "克": 1.0},
+    "money": {"元": 1.0, "角": 10.0, "分": 100.0},
+}
+# 裸值分支的尾随单字母拉丁单位：全串「数字+单位」匹配（含运算符的 '15*m' 绝不匹配），
+# 按量纲换算后与数量基本单位值比对——异量纲拒绝（'576s' 是 9.6 分，不是 576 分）。
+_BARE_LATIN_UNIT_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*(h|s|m|t|g)[\s。，,.]*$")
+_BARE_LATIN_FACTORS: dict[str, tuple[str, float]] = {
+    "h": ("time", 60.0), "s": ("time", 1.0 / 60.0),
+    "m": ("length", 1.0),
+    "t": ("mass", 1_000_000.0), "g": ("mass", 1.0),
+}
+
+
+def _num_eq(a: float, b: float) -> bool:
+    return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
+
+
+def _parse_quantity(text: str) -> tuple[float, str] | None:
+    """解析复合数量（纯「数字+单位」序列）→ (基本单位值, 量纲)。
+
+    支持中文/ LaTeX 单位、全角、多段（如 9小时36分 / 2米30厘米）；
+    非纯数量文本（方程/符号式/含运算符）返回 None，回落代数管线。
+    「分」默认按时间（分钟）；仅当同串出现 元/角 时按货币（0.01元）。
+    """
+    s = _fullwidth_to_halfwidth((text or "").strip())
+    if not s:
+        return None
+    # 与 normalize_answer 同步：蕴含链取结论段（否则结论为数量时解析被前缀破坏）
+    for sep in _IMPLICATION_SEPS:
+        if sep in s:
+            s = s.split(sep)[-1].strip()
+    s = re.sub(r"\\(?:text|mathrm|mbox|operatorname)\s*\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\(?:qquad|quad|[,;:!])|\\ |~", " ", s)
+    s = re.sub(r"\s+", " ", s).strip().rstrip("。，,.")
+    money_ctx = "元" in s or "角" in s
+    pos = 0
+    total = 0.0
+    dim: str | None = None
+    last_unit = ""
+    matched = False
+    while pos < len(s):
+        m = _QUANTITY_UNIT_RE.match(s, pos)
+        if m is not None:
+            num = float(m.group(1))
+            unit = m.group(2)
+            if unit == "分" and money_ctx:
+                d, f = "money", 0.01
+            else:
+                d, f = _QUANTITY_UNITS[unit]
+            if dim is None:
+                dim = d
+            elif d != dim:
+                return None  # 混合量纲（如 9小时36米）非法
+            total += num * f
+            last_unit = unit
+            matched = True
+            pos = m.end()
+            while pos < len(s) and s[pos] == " ":
+                pos += 1
+            continue
+        # 「9小时36」：小时后尾部裸数字按分钟推断
+        m2 = re.match(r"(\d+(?:\.\d+)?)$", s[pos:])
+        if m2 is not None and matched and last_unit in ("小时", "时") and dim == "time":
+            total += float(m2.group(1))
+            pos = len(s)
+            continue
+        return None
+    if not matched or dim is None:
+        return None
+    return total, dim
+
+
+def _quantity_equivalent(
+    qu: tuple[float, str] | None,
+    qs: tuple[float, str] | None,
+    user_raw: str,
+    std_raw: str,
+) -> bool:
+    """数量等价（权威路径）：同量纲比基本单位值；裸数字按任一常用单位表示匹配。
+
+    任一方解析为数量时本函数即最终判定，绝不回落 normalize 字符串比对
+    （否则破损拼接值 "936" 会经归一化误判通过）。
+    """
+    if qu is not None and qs is not None:
+        return qu[1] == qs[1] and _num_eq(qu[0], qs[0])
+    qty, other_raw = (qs, user_raw) if qs is not None else (qu, std_raw)
+    assert qty is not None
+    other = normalize_answer(other_raw)
+    if not other:
+        return False
+    # 尾随单字母拉丁单位（15m/576s）：按量纲换算，异量纲拒绝；
+    # 全串匹配 → '15*m' 等代数式绝不进入数量换算（回落路径已先行排除）。
+    lm = _BARE_LATIN_UNIT_RE.fullmatch(other)
+    if lm is not None:
+        d, f = _BARE_LATIN_FACTORS[lm.group(2)]
+        return d == qty[1] and _num_eq(float(lm.group(1)) * f, qty[0])
+    if not _is_pure_numeric(other):
+        return False
+    candidates = [qty[0] * f for f in _QUANTITY_REPS[qty[1]].values()]
+    try:
+        val = float(other)
+    except ValueError:
+        # 纯数字表达式（分数/幂/括号，无字母无 '='）：沙盒数值等价，
+        # 保留旧管线对 '1152/2' 等写法的判定能力；仍不回落字符串比对。
+        return any(verify_equation_equivalence(other, repr(c)) for c in candidates)
+    return any(_num_eq(val, c) for c in candidates)
+
+
 def latex_to_plain(text: str) -> str:
     """将步骤/答案 LaTeX 规范化为 verify_equation_equivalence 可解析的纯文本。
 
@@ -681,8 +822,15 @@ def normalize_answer(text: str) -> str:
 
 
 def answers_equivalent(user_answer: str, standard: str) -> bool:
-    """代数等价判定：规范化字符串比对 → 拉丁单位豁免（仅纯数字标准答案）→
-    SymPy 沙盒等价 → 裸值对单方程右端。"""
+    """代数等价判定：复合数量换算（权威快路径）→ 规范化字符串比对 →
+    拉丁单位豁免（仅纯数字标准答案）→ SymPy 沙盒等价 → 裸值对单方程右端。"""
+    # 复合数量快路径：必须在 normalize 之前解析双方原始文本——\text 剥离会把
+    # "9\text{小时}36\text{分}" 拼接成 "936"，归一化后不可逆；任一方为纯数量时
+    # 本路径为权威判定（绝不回落破损拼接比对，"936" 不得通过）。
+    qu = _parse_quantity(user_answer)
+    qs = _parse_quantity(standard)
+    if qs is not None or qu is not None:
+        return _quantity_equivalent(qu, qs, user_answer, standard)
     user = normalize_answer(user_answer)
     std = normalize_answer(standard)
     if not user or not std:
