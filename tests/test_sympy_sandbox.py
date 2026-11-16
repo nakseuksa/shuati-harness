@@ -310,9 +310,11 @@ def test_user_print_lands_in_stderr_tail() -> None:
         ("x=2\ny=3", "x=2; y=3", True),
         # 不等价
         ("x+1", "x+2", False),
-        ("x**2", "x", False),
         ("2*x=5", "x=2", False),
-        # 方程数量不一致
+        # P9-B 期望演进（预授权：钉住旧「无解集比对」行为）：x**2=0 与 x=0 解集同为 {0}，
+        # 严格全符号解集等价下判 True（旧引擎仅逐方程判据故为 False）。
+        ("x**2", "x", True),
+        # 解集不一致（std 未约束 y）——P9-B 严格语义下仍 False
         ("x=2; y=3", "x=2", False),
         # 垃圾输入：返回 False 且不抛异常
         ("????", "x", False),
@@ -377,3 +379,65 @@ def test_equivalence_timeout_protection(monkeypatch: pytest.MonkeyPatch) -> None
     assert verify_equation_equivalence("(x+1)**300000", "x") is False
     assert time.monotonic() - t0 < 6.0
     assert any(o.timed_out for o in seen)
+
+
+# ---------------------------------------------------------------------------
+# P9-B：多方程「消元比对解集」完全体（严格全符号解集等价，用户裁决 2026-11-16）
+# 规格：docs/tasks/P9-B_solution_set_equivalence.md —— 逐方程配对失败/方程数不等时
+# 由 runner 内解集兜底；自由符号守卫 + 规模上限 + solve(dict=True) + 互代验证，
+# 任何异常/无解保守拒绝。纯数字红线（5≠7、5≠-5）绝不放宽。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("user_expr", "standard_expr", "expected"),
+    [
+        # 解集等价正例：消元后解集一致（双向）
+        ("x+y=10; x-y=2", "x=6; y=4", True),
+        ("x=6; y=4", "x+y=10; x-y=2", True),
+        # 方程数不等的冗余方程组（消元后解集一致）
+        ("x=6; y=4; x+y=10", "x+y=10; x-y=2", True),
+        # 单方程参数化欠定（x+y=10 与 x=10-y 同解集）
+        ("x+y=10", "x=10-y", True),
+        # 参数化欠定：参数符号用非保留单字母 c（sympy parse_expr 保留 S/E/I/N/Q 为
+        # SingletonRegistry/自然常数/虚数单位等；PM 裁决 2026-11-16 改用 c，解析链不动）。
+        ("a+b=c/6; a-b=c/12", "a=c/8; b=c/24", True),
+    ],
+)
+def test_p9b_solution_set_positive(user_expr: str, standard_expr: str, expected: bool) -> None:
+    assert verify_equation_equivalence(user_expr, standard_expr) is expected
+
+
+@pytest.mark.parametrize(
+    ("user_expr", "standard_expr", "expected"),
+    [
+        # 增根反例：x**2=4 解集 {-2,2}，std 仅 {2}（双向拒绝）
+        ("x**2=4", "x=2", False),
+        ("x=2", "x**2=4", False),
+        # 多解不一致：x**2-3x+2=0 解集 {1,2}，std 仅 {1}
+        ("x**2-3*x+2=0", "x=1", False),
+        # 数值错误 / 缺项（未约束 y）/ 空解集（矛盾方程组）
+        ("x=6; y=5", "x+y=10; x-y=2", False),
+        ("x=6", "x+y=10; x-y=2", False),
+        ("x=1; x=2", "x=3", False),
+    ],
+)
+def test_p9b_solution_set_extraneous_rejected(
+    user_expr: str, standard_expr: str, expected: bool
+) -> None:
+    assert verify_equation_equivalence(user_expr, standard_expr) is expected
+
+
+def test_p9b_pure_numeric_never_solution_path() -> None:
+    """自由符号守卫：纯数字绝不走解集兜底（即便方程数不等触发兜底分支）。"""
+    assert verify_equation_equivalence("5", "7") is False
+    assert verify_equation_equivalence("5", "-5") is False
+    # 方程数不等 → 配对跳过 → 兜底；user 侧 [5,7] 无自由符号 → 守卫拒绝
+    assert verify_equation_equivalence("5; 7", "5") is False
+
+
+def test_p9b_size_cap_conservative_reject() -> None:
+    """规模上限守卫：任一方方程数 >8 → 保守拒绝（防 solve 组合爆炸），即便解集一致。"""
+    nine = "; ".join(f"{ch}=1" for ch in "abcdefghi")  # 9 个方程
+    redundant = nine + "; a=1"  # 10 个方程（末项冗余，解集与 nine 一致）
+    assert verify_equation_equivalence(nine, redundant) is False

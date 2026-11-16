@@ -417,6 +417,7 @@ import traceback as _traceback
 
 from sympy import nsimplify as _nsimplify
 from sympy import simplify as _simplify
+from sympy import solve as _solve
 from sympy.parsing.sympy_parser import convert_xor as _convert_xor
 from sympy.parsing.sympy_parser import implicit_multiplication_application as _implicit_mul
 from sympy.parsing.sympy_parser import parse_expr as _parse_expr
@@ -464,17 +465,59 @@ def _single_equivalent(e1, e2):
     return False
 
 
+def _solutions_equivalent(user_exprs, std_exprs):
+    # P9-B（用户裁决 2026-11-16）：多方程「消元比对解集」完全体——严格全符号
+    # 解集等价。未知量取双方全部自由符号的并集，solve 后互代验证，解集必须
+    # 完全一致（缺项/增根/多解不一致均判错）。任何异常 → False（保守拒绝）。
+    try:
+        if any(e is None for e in user_exprs) or any(e is None for e in std_exprs):
+            return False
+        u_syms = set().union(*(e.free_symbols for e in user_exprs))
+        s_syms = set().union(*(e.free_symbols for e in std_exprs))
+        # 自由符号守卫：任一侧无自由符号（纯数字）绝不走解集路径（5≠7、5≠-5 红线）。
+        if not u_syms or not s_syms:
+            return False
+        # 规模上限：防 solve 组合爆炸（5s 子进程超时仍是硬兜底）。
+        if len(user_exprs) > 8 or len(std_exprs) > 8:
+            return False
+        union_syms = u_syms | s_syms
+        if len(union_syms) > 8:
+            return False
+        # 确定性排序（未知量 = 双方自由符号并集）。
+        U = sorted(union_syms, key=lambda s: s.name)
+        # 默认 check=True：保留 sympy 自身解验证，防奇异变换伪解。
+        sols_u = _solve(user_exprs, U, dict=True)
+        sols_s = _solve(std_exprs, U, dict=True)
+        # 无解/求解失败（空列表）保守拒绝。
+        if not sols_u or not sols_s:
+            return False
+        # 互代验证：sols_u 每个解代入 std 每个表达式必须化简为 0；反向对称。
+        # 参数化欠定系统由 subs+simplify 自然处理；多解逐解验证，解集不一致自然拒绝。
+        for sol in sols_u:
+            for expr in std_exprs:
+                if _simplify(expr.subs(sol)) != 0:
+                    return False
+        for sol in sols_s:
+            for expr in user_exprs:
+                if _simplify(expr.subs(sol)) != 0:
+                    return False
+        return True
+    except BaseException:
+        return False
+
+
 _equivalent = False
 try:
     _user_exprs = [_parse_equation(t) for t in _PAYLOAD["user"]]
     _std_exprs = [_parse_equation(t) for t in _PAYLOAD["standard"]]
-    if (
+    _parsed_ok = bool(
         _user_exprs
         and _std_exprs
-        and len(_user_exprs) == len(_std_exprs)
         and all(e is not None for e in _user_exprs)
         and all(e is not None for e in _std_exprs)
-    ):
+    )
+    # 逐方程配对仅在方程数相等时尝试（保持现状）。
+    if _parsed_ok and len(_user_exprs) == len(_std_exprs):
         _used = set()
         _equivalent = True
         for _ue in _user_exprs:
@@ -485,6 +528,9 @@ try:
             else:
                 _equivalent = False
                 break
+    # P9-B 解集兜底：配对已 True 时短路（不触发 solve）；否则消元比对解集。
+    if _parsed_ok and not _equivalent:
+        _equivalent = _solutions_equivalent(_user_exprs, _std_exprs)
 except BaseException:
     _traceback.print_exc()
     _equivalent = False
@@ -511,6 +557,9 @@ def verify_equation_equivalence(user_expr_str: str, standard_expr_str: str) -> b
     单方程判据：simplify(e1-e2)==0 恒适用；反号 simplify(e1+e2)==0 与非零常数比率
     simplify(e1/e2).is_constant() 属方程缩放语义（e 与 -e、c·e 同解集），仅对含自由符号的
     表达式生效；纯数字答案要求严格数值相等（PM 批准修复：5≠7、5≠-5，防错误数值答案被放行）。
+    P9-B（用户裁决 2026-11-16 严格全符号解集等价）：逐方程配对失败或方程数不等时，
+    在 runner 内以「消元比对解集」兜底——未知量取双方自由符号并集，solve 后互代验证，
+    解集必须完全一致（缺项/增根/多解不一致均判错）；纯数字自由符号守卫绝不放宽。
     解析失败 / 超时 / 任何异常一律返回 False，绝不向调用方抛异常。
     每次执行记录 sandbox.exec 行为事件（P5 观测层，不改任何判定行为）。
     """
@@ -537,7 +586,9 @@ def _verify_equation_equivalence_impl(
             return False, "BAD_INPUT"
         user_eqs = _split_equations(user_expr_str)
         std_eqs = _split_equations(standard_expr_str)
-        if not user_eqs or not std_eqs or len(user_eqs) != len(std_eqs):
+        # P9-B：移除「方程数必须相等」硬拒——方程数不等的冗余/欠定方程组交由
+        # runner 内解集兜底判定（严格全符号解集等价）。非字符串/空列表仍 BAD_INPUT。
+        if not user_eqs or not std_eqs:
             return False, "BAD_INPUT"
         if not all(_is_safe_expression(eq) for eq in user_eqs + std_eqs):
             return False, "UNSAFE_EXPRESSION"

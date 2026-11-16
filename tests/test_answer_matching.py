@@ -19,6 +19,7 @@ from backend.sandbox.sympy_verifier import (
     answers_equivalent,
     latex_to_plain,
     normalize_answer,
+    verify_equation_equivalence,
 )
 from backend.services import scaffold_engine
 
@@ -548,4 +549,82 @@ _CHICK_RABBIT_STD = r"\text{鸡 } 40 \text{ 只，兔 } 60 \text{ 只}"
     ],
 )
 def test_p8_labeled_chinese_answers(user: str, standard: str, expected: bool) -> None:
+    assert answers_equivalent(user, standard) is expected
+
+
+# ---------------------------------------------------------------------------
+# P9-B：多方程「消元比对解集」完全体（严格全符号解集等价，用户裁决 2026-11-16）
+# 规格：docs/tasks/P9-B_solution_set_equivalence.md —— 未知量取双方自由符号并集，
+# solve 后互代验证，解集必须完全一致（缺项/增根/多解不一致均判错）。逐方程配对
+# 失败或方程数不等时由 runner 内解集兜底判定；纯数字自由符号守卫（5≠7、5≠-5）
+# 与复合数量/标签数值快路径绝不放宽。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        # 核心：消元后解集一致（双向）
+        ("x+y=10; x-y=2", "x=6; y=4", True),
+        ("x=6; y=4", "x+y=10; x-y=2", True),
+        # 参数化欠定系统（PM 裁决 2026-11-16：参数符号用非保留单字母 c——sympy
+        # parse_expr 保留 S/E/I/N/Q 为 SingletonRegistry/自然常数/虚数单位等，契约原稿
+        # 的 S 无法解析为自由符号；解析链一字不动，测试意图以 c 完整保留）。
+        ("a+b=c/6; a-b=c/12", "a=c/8; b=c/24", True),
+        ("a=c/8; b=c/24", "a+b=c/6; a-b=c/12", True),
+        # 方程数不等的冗余方程组（消元后解集一致）
+        ("x=6; y=4; x+y=10", "x+y=10; x-y=2", True),
+        ("x+y=10; x-y=2", "x=6; y=4; x+y=10", True),
+        # 单方程参数化欠定（x+y=10 与 x=10-y 同解集）
+        ("x+y=10", "x=10-y", True),
+        ("x=10-y", "x+y=10", True),
+    ],
+)
+def test_p9b_solution_set_equivalence(user: str, standard: str, expected: bool) -> None:
+    assert verify_equation_equivalence(user, standard) is expected
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        # 数值错误（解集不一致，双向）
+        ("x=6; y=5", "x+y=10; x-y=2", False),
+        ("x+y=10; x-y=2", "x=6; y=5", False),
+        # 增根 / 多解不一致（x**2=4 解集 {-2,2} ≠ {2}，双向拒绝）
+        ("x**2=4", "x=2", False),
+        ("x=2", "x**2=4", False),
+        # 空解集（矛盾方程组 x=1 且 x=2 无解，保守拒绝）
+        ("x=1; x=2", "x=3", False),
+        ("x=3", "x=1; x=2", False),
+        # 缺项（user 未约束 y，解集不同，双向拒绝）
+        ("x=6", "x+y=10; x-y=2", False),
+        ("x+y=10; x-y=2", "x=6", False),
+    ],
+)
+def test_p9b_solution_set_rejects(user: str, standard: str, expected: bool) -> None:
+    assert verify_equation_equivalence(user, standard) is expected
+
+
+def test_p9b_latex_parametric_via_answers_equivalent() -> None:
+    """LaTeX 形态经共享栈 answers_equivalent 判等价（参数符号 c，PM 裁决 2026-11-16）。"""
+    assert answers_equivalent("a=c/8; b=c/24", r"a=\frac{c}{8}; b=\frac{c}{24}") is True
+    assert answers_equivalent(r"a=\frac{c}{8}; b=\frac{c}{24}", "a=c/8; b=c/24") is True
+    # 多方程答案经 answers_equivalent 自动受益于解集兜底
+    assert answers_equivalent("x+y=10; x-y=2", "x=6; y=4") is True
+    assert answers_equivalent("x=6; y=4", "x+y=10; x-y=2") is True
+
+
+@pytest.mark.parametrize(
+    ("user", "standard", "expected"),
+    [
+        # 纯数字自由符号守卫红线：绝不因解集兜底放宽（5≠7、5≠-5）
+        ("5", "7", False),
+        ("5", "-5", False),
+        # 复合数量权威快路径零漂移
+        ("9小时36分", "576分", True),
+        # 「标签+数值」快路径零漂移
+        ("鸡40，兔60", r"\text{鸡 }40\text{ 只，兔 }60\text{ 只}", True),
+    ],
+)
+def test_p9b_redline_regression(user: str, standard: str, expected: bool) -> None:
     assert answers_equivalent(user, standard) is expected
