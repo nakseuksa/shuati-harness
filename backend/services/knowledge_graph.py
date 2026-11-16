@@ -5,13 +5,20 @@ Target File #10/#17、Alternative 2A/2B（为什么同域 + 可逆）。
 API 签名为 PM 锁定契约（docs/tasks/P3-A_knowledge_graph.md，conn 由调用方管理，
 同 elo_engine 模式：本模块不开连接、不 commit）。
 
+P10-C（docs/tasks/P10-C_graph_grade_scoping.md）学段学科分区：知识网全部操作
+（召回/复用/Compaction/标红边/指标/水位线）缩到同学段作用域；Compaction 作用域
+由 (L1, L2) 升级为 (grade_subject, L1, L2) 三元组，跨学段合并与跨 L1/L2 同级硬拒。
+作用域类函数在 conn 后加 grade_subject 参数；按 uid 操作的函数（node_state /
+record_co_error_edges / decrement_co_error_edges_on_mastery / revert_compaction_batch）
+签名不变，学段自题目/节点/批次行自派生并在写入时落库。
+
 核心不变量：
-- 严禁跨 L1/L2 重定向（Alternative 2A 被否决原因：撕裂分模块 Elo 账本）：
+- 严禁跨学段 / 跨 L1/L2 重定向（Alternative 2A 被否决原因：撕裂分模块 Elo 账本）：
   函数签名即作用域，合并写入前再断言节点归属；AI 裁判返回作用域外 / 非活跃
   节点 ID 一律视为未命中（硬拒绝，绝不产生跨域 redirect）。
 - 一次性路径压缩：from 及其全部子节点直接指向 to，任意节点跳数 <= 1。
 - 每对合并单 SAVEPOINT 小事务（Risks 表：避开前台答题高峰的单对小事务）。
-- 回滚按 merge_id 逆序逐字段精确恢复（父指针 / aliases / 标红边快照），
+- 回滚按 merge_id 逆序逐字段精确恢复（父指针 / aliases / 标红边快照，含 grade_subject），
   Elo 账本（elo_mutation_ledger / question_escrow_pool）零变化。
 - 节点展示状态为派生值（悲观半格 ACTIVE > PENDING_RETEST > MASTERED），不落库。
 - 双指标冷启动安全：total=0 / w<5 / N<3 时无除零、无 NaN。
@@ -89,7 +96,7 @@ class NodeJudgeResult(BaseModel):
 
 
 class GraphMetricsDTO(BaseModel):
-    """单个 L1 模块的知识网双指标（版图攻克率 + 分布熵校准收敛度，均为百分数）。"""
+    """单个 (学段, L1 模块) 分区的知识网双指标（版图攻克率 + 分布熵校准收敛度，均为百分数）。"""
 
     mastery_rate: float
     convergence: float
@@ -106,17 +113,22 @@ class CanonicalNodeResolver:
 
     防御性实现：允许穿透任意长链，但检测到环立即抛 ValueError（图谱损坏）；
     未知 node_id 抛 KeyError。不做缓存（conn 由调用方管理，合并/回滚随时发生）。
+    P10-C：解析链限同学段（SQL grade 过滤为防御；迁移与新建/合并同学段保证链
+    内同质），跨学段节点视为未知（KeyError）。
     """
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, grade_subject: str) -> None:
         self._conn = conn
+        self._grade_subject = grade_subject
 
     def resolve(self, node_id: str) -> str:
         seen: set[str] = set()
         current = node_id
         while True:
             row = self._conn.execute(
-                "SELECT redirect_to_id FROM knowledge_nodes WHERE node_id = ?", (current,)
+                "SELECT redirect_to_id FROM knowledge_nodes"
+                " WHERE node_id = ? AND grade_subject = ?",
+                (current, self._grade_subject),
             ).fetchone()
             if row is None:
                 raise KeyError(f"knowledge_nodes 中不存在节点: {node_id!r}")
@@ -144,11 +156,23 @@ def _node_row(conn: sqlite3.Connection, node_id: str) -> sqlite3.Row:
 
 
 def _assert_same_scope(
-    conn: sqlite3.Connection, node_ids: Iterable[str], l1: str, l2: str
+    conn: sqlite3.Connection,
+    grade_subject: str,
+    node_ids: Iterable[str],
+    l1: str,
+    l2: str,
 ) -> None:
-    """合并/回滚写入前的最后一道硬闸：任何节点跨 L1/L2 立即抛 ValueError。"""
+    """合并/回滚写入前的最后一道硬闸：任何节点跨学段或跨 L1/L2 立即抛 ValueError。
+
+    P10-C：学段相等与 L1/L2 相等为同级红线（跨学段合并撕裂学段分区）。
+    """
     for node_id in node_ids:
         row = _node_row(conn, node_id)
+        if row["grade_subject"] != grade_subject:
+            raise ValueError(
+                f"严禁跨学段重定向: 节点 {node_id!r} 属于学段 {row['grade_subject']!r}，"
+                f"作用域学段为 {grade_subject!r}"
+            )
         if row["l1_module"] != l1 or row["l2_entity"] != l2:
             raise ValueError(
                 f"严禁跨 L1/L2 重定向: 节点 {node_id!r} 属于 "
@@ -205,12 +229,17 @@ def _merge_aliases(existing: list[str], primary: str, incoming: Iterable[str]) -
     return merged[: settings.MAX_ALIASES_PER_NODE]
 
 
-def _active_nodes(conn: sqlite3.Connection, l1: str, l2: str) -> list[sqlite3.Row]:
-    """同父 L2 活跃节点（redirect_to_id IS NULL），按创建时间 + ID 稳定排序。"""
+def _active_nodes(
+    conn: sqlite3.Connection, grade_subject: str, l1: str, l2: str
+) -> list[sqlite3.Row]:
+    """同 (学段, 父 L2) 活跃节点（redirect_to_id IS NULL），按创建时间 + ID 稳定排序。
+
+    P10-C：召回限同学段，绝不跨学段召回。
+    """
     return conn.execute(
-        "SELECT * FROM knowledge_nodes WHERE l1_module = ? AND l2_entity = ?"
-        " AND redirect_to_id IS NULL ORDER BY created_at, node_id",
-        (l1, l2),
+        "SELECT * FROM knowledge_nodes WHERE grade_subject = ? AND l1_module = ?"
+        " AND l2_entity = ? AND redirect_to_id IS NULL ORDER BY created_at, node_id",
+        (grade_subject, l1, l2),
     ).fetchall()
 
 
@@ -269,19 +298,21 @@ def _pessimistic(current: str, incoming: str) -> str:
 
 async def match_or_create_l3_node(
     conn: sqlite3.Connection,
+    grade_subject: str,
     l1: str,
     l2: str,
     candidate_l3: str,
     candidate_aliases: list[str],
 ) -> tuple[str, bool]:
-    """同父 L2 邻域 AI 裁判对齐：命中复用主 ID，未命中 uuid4 新建。
+    """同 (学段, 父 L2) 邻域 AI 裁判对齐：命中复用主 ID，未命中 uuid4 新建。
 
     返回 (node_id, reused)。reused=True 时由入库方标记
     question_steps.reused_existing_node = 1。新建累计满
-    settings.COMPACTION_BATCH_THRESHOLD（自上次该 L2 compaction 批次以来）
-    自动触发 run_scoped_compaction。
+    settings.COMPACTION_BATCH_THRESHOLD（自上次该 (学段, L2) compaction 批次以来）
+    自动触发 run_scoped_compaction。P10-C：召回/复用/新建均限同学段，
+    新建节点 INSERT 落 grade_subject。
     """
-    nodes = _active_nodes(conn, l1, l2)
+    nodes = _active_nodes(conn, grade_subject, l1, l2)
     match_id: str | None = None
     if nodes:
         if len(nodes) > settings.L3_LOCAL_RECALL_TRIGGER_COUNT:
@@ -303,8 +334,13 @@ async def match_or_create_l3_node(
 
     if match_id is not None:
         row = _node_row(conn, match_id)
-        # 硬拒绝：裁判命中必须仍是同作用域活跃主节点，否则降级为新建。
-        if row["redirect_to_id"] is None and row["l1_module"] == l1 and row["l2_entity"] == l2:
+        # 硬拒绝：裁判命中必须仍是同作用域（含学段，P10-C）活跃主节点，否则降级为新建。
+        if (
+            row["redirect_to_id"] is None
+            and row["grade_subject"] == grade_subject
+            and row["l1_module"] == l1
+            and row["l2_entity"] == l2
+        ):
             aliases = _merge_aliases(
                 json.loads(row["aliases_json"]),
                 str(row["l3_operator"]),
@@ -317,6 +353,7 @@ async def match_or_create_l3_node(
             log_event(
                 logger,
                 "graph.node_reused",
+                grade=grade_subject,
                 l1=l1,
                 l2=l2,
                 l3=candidate_l3,
@@ -327,28 +364,33 @@ async def match_or_create_l3_node(
     new_id = str(uuid.uuid4())
     aliases = _merge_aliases([], candidate_l3, candidate_aliases)
     conn.execute(
-        "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator, aliases_json)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (new_id, l1, l2, candidate_l3, json.dumps(aliases, ensure_ascii=False)),
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+        " l3_operator, aliases_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (new_id, grade_subject, l1, l2, candidate_l3, json.dumps(aliases, ensure_ascii=False)),
     )
     log_event(
         logger,
         "graph.node_created",
+        grade=grade_subject,
         l1=l1,
         l2=l2,
         l3=candidate_l3,
         node_id=new_id,
     )
-    if _new_nodes_since_last_compaction(conn, l1, l2) >= settings.COMPACTION_BATCH_THRESHOLD:
+    if (
+        _new_nodes_since_last_compaction(conn, grade_subject, l1, l2)
+        >= settings.COMPACTION_BATCH_THRESHOLD
+    ):
         if run_scoped_compaction is _ORIG_RUN_SCOPED_COMPACTION:
-            await _run_scoped_compaction_async(conn, l1, l2)
+            await _run_scoped_compaction_async(conn, grade_subject, l1, l2)
         else:
-            run_scoped_compaction(conn, l1, l2)
+            run_scoped_compaction(conn, grade_subject, l1, l2)
     return new_id, False
 
 
-# (db_key, l1, l2) -> (anchor_node_id, scanned_raw_count)：0 合并扫描后推进水位，防重复全扫
-_NO_MERGE_SCAN_WATERMARKS: dict[tuple[str, str, str], tuple[str, int]] = {}
+# (db_key, grade, l1, l2) -> (anchor_node_id, scanned_raw_count)：0 合并扫描后推进水位，防重复全扫
+# P10-C：水位线 key 升级含 grade，跨学段 0 合并水位互不影响
+_NO_MERGE_SCAN_WATERMARKS: dict[tuple[str, str, str, str], tuple[str, int]] = {}
 
 
 def _db_cache_key(conn: sqlite3.Connection) -> str:
@@ -357,36 +399,49 @@ def _db_cache_key(conn: sqlite3.Connection) -> str:
     return db_file or f"mem:{id(conn)}"
 
 
-def _raw_nodes_since_last_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> int:
-    """自上次该 L2 compaction 批次以来的原始新建节点数（无批次则全部计数）。"""
+def _raw_nodes_since_last_compaction(
+    conn: sqlite3.Connection, grade_subject: str, l1: str, l2: str
+) -> int:
+    """自上次该 (学段, L2) compaction 批次以来的原始新建节点数（无批次则全部计数）。"""
     last_batch_at = conn.execute(
-        "SELECT MAX(created_at) FROM compaction_audit_ledger WHERE l1_module = ? AND l2_entity = ?",
-        (l1, l2),
+        "SELECT MAX(created_at) FROM compaction_audit_ledger"
+        " WHERE grade_subject = ? AND l1_module = ? AND l2_entity = ?",
+        (grade_subject, l1, l2),
     ).fetchone()[0]
     if last_batch_at is None:
         row = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_nodes WHERE l1_module = ? AND l2_entity = ?",
-            (l1, l2),
+            "SELECT COUNT(*) FROM knowledge_nodes"
+            " WHERE grade_subject = ? AND l1_module = ? AND l2_entity = ?",
+            (grade_subject, l1, l2),
         ).fetchone()
     else:
         row = conn.execute(
-            "SELECT COUNT(*) FROM knowledge_nodes WHERE l1_module = ? AND l2_entity = ?"
+            "SELECT COUNT(*) FROM knowledge_nodes"
+            " WHERE grade_subject = ? AND l1_module = ? AND l2_entity = ?"
             " AND created_at > ?",
-            (l1, l2, last_batch_at),
+            (grade_subject, l1, l2, last_batch_at),
         ).fetchone()
     return int(row[0])
 
 
-def _new_nodes_since_last_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> int:
-    """自上次该 L2 compaction（含 0 合并扫描水位）以来的新建节点数。"""
-    raw_count = _raw_nodes_since_last_compaction(conn, l1, l2)
-    wm_key = (_db_cache_key(conn), l1, l2)
+def _new_nodes_since_last_compaction(
+    conn: sqlite3.Connection, grade_subject: str, l1: str, l2: str
+) -> int:
+    """自上次该 (学段, L2) compaction（含 0 合并扫描水位）以来的新建节点数。
+
+    P10-C：计数限同学段；水位线 key 为 (db_key, grade, l1, l2)。
+    """
+    raw_count = _raw_nodes_since_last_compaction(conn, grade_subject, l1, l2)
+    wm_key = (_db_cache_key(conn), grade_subject, l1, l2)
     wm = _NO_MERGE_SCAN_WATERMARKS.get(wm_key)
     if wm is None:
         return raw_count
     anchor_id, scanned_count = wm
     exists = (
-        conn.execute("SELECT 1 FROM knowledge_nodes WHERE node_id = ?", (anchor_id,)).fetchone()
+        conn.execute(
+            "SELECT 1 FROM knowledge_nodes WHERE node_id = ? AND grade_subject = ?",
+            (anchor_id, grade_subject),
+        ).fetchone()
         is not None
     )
     if not exists or raw_count < scanned_count:
@@ -400,7 +455,16 @@ def _new_nodes_since_last_compaction(conn: sqlite3.Connection, l1: str, l2: str)
 # ---------------------------------------------------------------------------
 
 
-def _build_compaction_pairs(nodes: list[sqlite3.Row]) -> list[tuple[float, str, str]]:
+def _build_compaction_pairs(
+    grade_subject: str, nodes: list[sqlite3.Row]
+) -> list[tuple[float, str, str]]:
+    """近义对预筛：输入必须已限定同一 (学段, L1, L2) 作用域（P10-C 防御断言）。"""
+    for row in nodes:
+        if row["grade_subject"] != grade_subject:
+            raise ValueError(
+                f"严禁跨学段配对: 节点 {row['node_id']!r} 属于学段 {row['grade_subject']!r}，"
+                f"作用域学段为 {grade_subject!r}"
+            )
     grams = {str(row["node_id"]): _row_grams(row) for row in nodes}
     pairs: list[tuple[float, str, str]] = []
     for older, newer in combinations(nodes, 2):  # nodes 已按 (created_at, node_id) 排序
@@ -413,30 +477,38 @@ def _build_compaction_pairs(nodes: list[sqlite3.Row]) -> list[tuple[float, str, 
 
 
 def _record_compaction_watermark(
-    conn: sqlite3.Connection, l1: str, l2: str, nodes: list[sqlite3.Row], batch_id: str | None
+    conn: sqlite3.Connection,
+    grade_subject: str,
+    l1: str,
+    l2: str,
+    nodes: list[sqlite3.Row],
+    batch_id: str | None,
 ) -> None:
-    wm_key = (_db_cache_key(conn), l1, l2)
+    wm_key = (_db_cache_key(conn), grade_subject, l1, l2)
     if batch_id is not None:
         _NO_MERGE_SCAN_WATERMARKS.pop(wm_key, None)
     elif nodes:
         _NO_MERGE_SCAN_WATERMARKS[wm_key] = (
             str(nodes[-1]["node_id"]),
-            _raw_nodes_since_last_compaction(conn, l1, l2),
+            _raw_nodes_since_last_compaction(conn, grade_subject, l1, l2),
         )
 
 
-def run_scoped_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> str | None:
-    """同 (l1, l2) 作用域内扫描近义 L3 节点并合并，返回 batch_id（无合并返回 None）。
+def run_scoped_compaction(
+    conn: sqlite3.Connection, grade_subject: str, l1: str, l2: str
+) -> str | None:
+    """同 (grade_subject, l1, l2) 作用域内扫描近义 L3 节点并合并，返回 batch_id（无合并返回 None）。
 
     近义对 = 字符 2/3-gram Jaccard 预筛（>0）+ AI 裁判确认；合并方向固定为
     较新节点并入较旧主节点（CUJ 4：node_27 -> node_12）。每对合并单 SAVEPOINT
-    小事务：路径压缩 + 标红边去自环/归并 + 审计快照。严禁跨 L1/L2 重定向。
+    小事务：路径压缩 + 标红边去自环/归并 + 审计快照。
+    P10-C：严禁跨学段 / 跨 L1/L2 重定向（三元组作用域红线）。
     """
-    nodes = _active_nodes(conn, l1, l2)
+    nodes = _active_nodes(conn, grade_subject, l1, l2)
     if len(nodes) < 2:
-        _record_compaction_watermark(conn, l1, l2, nodes, None)
+        _record_compaction_watermark(conn, grade_subject, l1, l2, nodes, None)
         return None
-    pairs = _build_compaction_pairs(nodes)
+    pairs = _build_compaction_pairs(grade_subject, nodes)
 
     batch_id: str | None = None
     for _neg_sim, to_id, from_id in pairs:
@@ -452,8 +524,8 @@ def run_scoped_compaction(conn: sqlite3.Connection, l1: str, l2: str) -> str | N
             continue
         if batch_id is None:
             batch_id = str(uuid.uuid4())
-        _merge_pair(conn, l1, l2, from_id, to_id, batch_id, verdict.evidence)
-    _record_compaction_watermark(conn, l1, l2, nodes, batch_id)
+        _merge_pair(conn, grade_subject, l1, l2, from_id, to_id, batch_id, verdict.evidence)
+    _record_compaction_watermark(conn, grade_subject, l1, l2, nodes, batch_id)
     return batch_id
 
 
@@ -461,14 +533,14 @@ _ORIG_RUN_SCOPED_COMPACTION = run_scoped_compaction
 
 
 async def _run_scoped_compaction_async(
-    conn: sqlite3.Connection, l1: str, l2: str
+    conn: sqlite3.Connection, grade_subject: str, l1: str, l2: str
 ) -> str | None:
     """run_scoped_compaction 的原生协程版：直接 await _judge_nodes，避免阻塞事件循环。"""
-    nodes = _active_nodes(conn, l1, l2)
+    nodes = _active_nodes(conn, grade_subject, l1, l2)
     if len(nodes) < 2:
-        _record_compaction_watermark(conn, l1, l2, nodes, None)
+        _record_compaction_watermark(conn, grade_subject, l1, l2, nodes, None)
         return None
-    pairs = _build_compaction_pairs(nodes)
+    pairs = _build_compaction_pairs(grade_subject, nodes)
 
     batch_id: str | None = None
     for _neg_sim, to_id, from_id in pairs:
@@ -483,8 +555,8 @@ async def _run_scoped_compaction_async(
             continue
         if batch_id is None:
             batch_id = str(uuid.uuid4())
-        _merge_pair(conn, l1, l2, from_id, to_id, batch_id, verdict.evidence)
-    _record_compaction_watermark(conn, l1, l2, nodes, batch_id)
+        _merge_pair(conn, grade_subject, l1, l2, from_id, to_id, batch_id, verdict.evidence)
+    _record_compaction_watermark(conn, grade_subject, l1, l2, nodes, batch_id)
     return batch_id
 
 
@@ -494,6 +566,7 @@ def _is_redirected(conn: sqlite3.Connection, node_id: str) -> bool:
 
 def _merge_pair(
     conn: sqlite3.Connection,
+    grade_subject: str,
     l1: str,
     l2: str,
     from_id: str,
@@ -502,7 +575,7 @@ def _merge_pair(
     evidence: str,
 ) -> None:
     """单对合并（单 SAVEPOINT 事务）：路径压缩 -> 标红边归并 -> 审计快照。"""
-    _assert_same_scope(conn, [from_id, to_id], l1, l2)
+    _assert_same_scope(conn, grade_subject, [from_id, to_id], l1, l2)
     from_row, to_row = _node_row(conn, from_id), _node_row(conn, to_id)
     if from_row["redirect_to_id"] is not None or to_row["redirect_to_id"] is not None:
         raise ValueError(f"合并双方必须均为活跃主节点: {from_id!r} -> {to_id!r}")
@@ -541,15 +614,16 @@ def _merge_pair(
             (json.dumps(merged_aliases, ensure_ascii=False), to_id),
         )
         # 3) 标红边：resolve 端点 -> 删自环 / 重合累加并 uids / 迁移新键
-        _rewrite_edges_after_merge(conn, edge_snapshot)
-        # 4) 审计快照（batch_id 同批共用 UUID）
+        _rewrite_edges_after_merge(conn, grade_subject, edge_snapshot)
+        # 4) 审计快照（batch_id 同批共用 UUID；P10-C 落 grade_subject）
         conn.execute(
-            "INSERT INTO compaction_audit_ledger (batch_id, l1_module, l2_entity,"
-            " from_node_id, to_node_id, ai_judge_evidence, previous_aliases_to_json,"
-            " affected_child_node_ids_json, previous_co_errors_snapshot_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO compaction_audit_ledger (batch_id, grade_subject, l1_module,"
+            " l2_entity, from_node_id, to_node_id, ai_judge_evidence,"
+            " previous_aliases_to_json, affected_child_node_ids_json,"
+            " previous_co_errors_snapshot_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 batch_id,
+                grade_subject,
                 l1,
                 l2,
                 from_id,
@@ -566,6 +640,7 @@ def _merge_pair(
         batch_id=batch_id,
         from_node=from_id,
         to_node=to_id,
+        grade=grade_subject,
         l1=l1,
         l2=l2,
     )
@@ -582,10 +657,13 @@ def _edges_touching(conn: sqlite3.Connection, node_ids: set[str]) -> list[sqlite
 
 
 def _rewrite_edges_after_merge(
-    conn: sqlite3.Connection, edge_snapshot: list[dict[str, Any]]
+    conn: sqlite3.Connection, grade_subject: str, edge_snapshot: list[dict[str, Any]]
 ) -> None:
-    """按合并前快照逐边重算规范化端点 (u', v') = (resolve(u), resolve(v))。"""
-    resolver = CanonicalNodeResolver(conn)
+    """按合并前快照逐边重算规范化端点 (u', v') = (resolve(u), resolve(v))。
+
+    P10-C：解析限同学段；迁移新键边 INSERT 落 grade_subject（两端点同学段由构造保证）。
+    """
+    resolver = CanonicalNodeResolver(conn, grade_subject)
     for edge in edge_snapshot:
         old_u, old_v = str(edge["node_u_id"]), str(edge["node_v_id"])
         new_u, new_v = resolver.resolve(old_u), resolver.resolve(old_v)
@@ -610,12 +688,14 @@ def _rewrite_edges_after_merge(
         )
         if target is None:
             conn.execute(
-                "INSERT INTO concept_co_errors (node_u_id, node_v_id, l1_module_u,"
-                " l1_module_v, active_error_count, total_historical_count,"
-                " source_question_uids_json, last_error_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO concept_co_errors (node_u_id, node_v_id, grade_subject,"
+                " l1_module_u, l1_module_v, active_error_count, total_historical_count,"
+                " source_question_uids_json, last_error_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     key[0],
                     key[1],
+                    grade_subject,
                     str(_node_row(conn, key[0])["l1_module"]),
                     str(_node_row(conn, key[1])["l1_module"]),
                     edge["active_error_count"],
@@ -671,9 +751,10 @@ def revert_compaction_batch(conn: sqlite3.Connection, batch_id: str) -> None:
 
 
 def _revert_single_merge(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    grade = str(row["grade_subject"])  # P10-C：学段自批次行自派生（按 batch 操作签名不变）
     l1, l2 = str(row["l1_module"]), str(row["l2_entity"])
     from_id, to_id = str(row["from_node_id"]), str(row["to_node_id"])
-    _assert_same_scope(conn, [from_id, to_id], l1, l2)
+    _assert_same_scope(conn, grade, [from_id, to_id], l1, l2)
     children = [str(c) for c in json.loads(row["affected_child_node_ids_json"])]
 
     # 标红边：删除当前受影响边（含合并新增），按快照逐字段原样恢复
@@ -686,13 +767,18 @@ def _revert_single_merge(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         [*ids, *ids],
     )
     for edge in json.loads(row["previous_co_errors_snapshot_json"]):
+        # P10-C：快照含 grade_subject 列自然逐字段恢复；P10-C 前的旧快照无此键时
+        # 回退批次行学段（P10-A 已回填），绝不丢失分区归属。
+        edge_grade = str(edge.get("grade_subject", grade))
         conn.execute(
-            "INSERT INTO concept_co_errors (node_u_id, node_v_id, l1_module_u,"
-            " l1_module_v, active_error_count, total_historical_count,"
-            " source_question_uids_json, last_error_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO concept_co_errors (node_u_id, node_v_id, grade_subject,"
+            " l1_module_u, l1_module_v, active_error_count, total_historical_count,"
+            " source_question_uids_json, last_error_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 edge["node_u_id"],
                 edge["node_v_id"],
+                edge_grade,
                 edge["l1_module_u"],
                 edge["l1_module_v"],
                 edge["active_error_count"],
@@ -727,17 +813,27 @@ def _revert_single_merge(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
 # ---------------------------------------------------------------------------
 
 
-def all_node_states(conn: sqlite3.Connection) -> dict[str, str]:
-    """批量聚合所有活跃主节点展示状态（O(N+M) 单查询，消除接口 N+1 全表扫描）。"""
-    resolver = CanonicalNodeResolver(conn)
+def all_node_states(conn: sqlite3.Connection, grade_subject: str) -> dict[str, str]:
+    """批量聚合学段内全部活跃主节点展示状态（O(N+M) 单查询，消除接口 N+1 全表扫描）。
+
+    P10-C：活跃节点与挂载步骤均限同学段（JOIN 过滤）。
+    """
+    resolver = CanonicalNodeResolver(conn, grade_subject)
     states: dict[str, str] = {
         str(row[0]): "MASTERED"
-        for row in conn.execute("SELECT node_id FROM knowledge_nodes WHERE redirect_to_id IS NULL")
+        for row in conn.execute(
+            "SELECT node_id FROM knowledge_nodes"
+            " WHERE redirect_to_id IS NULL AND grade_subject = ?",
+            (grade_subject,),
+        )
     }
     rows = conn.execute(
         "SELECT s.knowledge_node_id, q.mastery_state FROM question_steps s"
         " JOIN questions q ON q.question_uid = s.question_uid"
+        " JOIN knowledge_nodes kn ON kn.node_id = s.knowledge_node_id"
         " WHERE q.origin_type = 'USER_CANONICAL' AND s.is_blocked_step = 1"
+        " AND kn.grade_subject = ?",
+        (grade_subject,),
     ).fetchall()
     for row in rows:
         root = resolver.resolve(str(row["knowledge_node_id"]))
@@ -750,13 +846,18 @@ def node_state(conn: sqlite3.Connection, node_id: str) -> str:
 
     含重定向子节点挂载的步骤；无此类步骤 -> MASTERED（仅已掌握前缀步骤的节点
     保持绿色）。优先级 ACTIVE > PENDING_RETEST > MASTERED。
+    P10-C：签名不变，学段自节点行自派生，聚合限同学段。
     """
-    resolver = CanonicalNodeResolver(conn)
+    grade = str(_node_row(conn, node_id)["grade_subject"])
+    resolver = CanonicalNodeResolver(conn, grade)
     root = resolver.resolve(node_id)
     rows = conn.execute(
         "SELECT s.knowledge_node_id, q.mastery_state FROM question_steps s"
         " JOIN questions q ON q.question_uid = s.question_uid"
+        " JOIN knowledge_nodes kn ON kn.node_id = s.knowledge_node_id"
         " WHERE q.origin_type = 'USER_CANONICAL' AND s.is_blocked_step = 1"
+        " AND kn.grade_subject = ?",
+        (grade,),
     ).fetchall()
     state = "MASTERED"
     for row in rows:
@@ -770,8 +871,20 @@ def node_state(conn: sqlite3.Connection, node_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _question_grade(conn: sqlite3.Connection, question_uid: str) -> str:
+    """P10-C：题目学段（questions.target_grade_and_subject，uid 操作函数的自派生源）。"""
+    row = conn.execute(
+        "SELECT target_grade_and_subject FROM questions WHERE question_uid = ?",
+        (question_uid,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"questions 中不存在题目: {question_uid!r}")
+    return str(row[0])
+
+
 def _question_canonical_nodes(conn: sqlite3.Connection, question_uid: str) -> list[str]:
-    resolver = CanonicalNodeResolver(conn)
+    """P10-C：学段自题目行自派生，解析限同学段。"""
+    resolver = CanonicalNodeResolver(conn, _question_grade(conn, question_uid))
     rows = conn.execute(
         "SELECT DISTINCT knowledge_node_id FROM question_steps WHERE question_uid = ?",
         (question_uid,),
@@ -780,10 +893,15 @@ def _question_canonical_nodes(conn: sqlite3.Connection, question_uid: str) -> li
 
 
 def record_co_error_edges(conn: sqlite3.Connection, question_uid: str) -> None:
-    """该题 >=2 个不同 resolve 后节点 -> 两两边 (u<v)：active+1、historical+1、uids 并入。"""
+    """该题 >=2 个不同 resolve 后节点 -> 两两边 (u<v)：active+1、historical+1、uids 并入。
+
+    P10-C：签名不变，学段自题目行自派生并落边（INSERT/UPDATE 均写 grade_subject；
+    两端点同学段由构造保证：步骤挂载同学段节点，解析器限同学段）。
+    """
     nodes = _question_canonical_nodes(conn, question_uid)
     if len(nodes) < 2:
         return
+    grade = _question_grade(conn, question_uid)
     for u, v in combinations(nodes, 2):  # nodes 已排序 -> 天然 u < v，DB CHECK 兜底
         existing = conn.execute(
             "SELECT * FROM concept_co_errors WHERE node_u_id = ? AND node_v_id = ?",
@@ -791,12 +909,13 @@ def record_co_error_edges(conn: sqlite3.Connection, question_uid: str) -> None:
         ).fetchone()
         if existing is None:
             conn.execute(
-                "INSERT INTO concept_co_errors (node_u_id, node_v_id, l1_module_u,"
-                " l1_module_v, active_error_count, total_historical_count,"
-                " source_question_uids_json) VALUES (?, ?, ?, ?, 1, 1, ?)",
+                "INSERT INTO concept_co_errors (node_u_id, node_v_id, grade_subject,"
+                " l1_module_u, l1_module_v, active_error_count, total_historical_count,"
+                " source_question_uids_json) VALUES (?, ?, ?, ?, ?, 1, 1, ?)",
                 (
                     u,
                     v,
+                    grade,
                     str(_node_row(conn, u)["l1_module"]),
                     str(_node_row(conn, v)["l1_module"]),
                     json.dumps([question_uid], ensure_ascii=False),
@@ -809,22 +928,27 @@ def record_co_error_edges(conn: sqlite3.Connection, question_uid: str) -> None:
             conn.execute(
                 "UPDATE concept_co_errors SET active_error_count = active_error_count + 1,"
                 " total_historical_count = total_historical_count + 1,"
-                " source_question_uids_json = ?, last_error_at = CURRENT_TIMESTAMP"
+                " source_question_uids_json = ?, grade_subject = ?,"
+                " last_error_at = CURRENT_TIMESTAMP"
                 " WHERE node_u_id = ? AND node_v_id = ?",
-                (json.dumps(uids, ensure_ascii=False), u, v),
+                (json.dumps(uids, ensure_ascii=False), grade, u, v),
             )
     log_event(
         logger,
         "graph.co_error",
         action="record",
         question_uid=question_uid,
+        grade=grade,
         nodes=nodes,
         edges=len(nodes) * (len(nodes) - 1) // 2,
     )
 
 
 def decrement_co_error_edges_on_mastery(conn: sqlite3.Connection, question_uid: str) -> None:
-    """销账时对应边 active-1（下限 0）；historical 与 uids 溯源不动。"""
+    """销账时对应边 active-1（下限 0）；historical 与 uids 溯源不动。
+
+    P10-C：按 uid 操作签名不变，学段经 _question_canonical_nodes 自题目行自派生。
+    """
     nodes = _question_canonical_nodes(conn, question_uid)
     for u, v in combinations(nodes, 2):
         conn.execute(
@@ -847,27 +971,33 @@ def decrement_co_error_edges_on_mastery(conn: sqlite3.Connection, question_uid: 
 # ---------------------------------------------------------------------------
 
 
-def compute_graph_metrics(conn: sqlite3.Connection, l1_module: str) -> GraphMetricsDTO:
-    """按 L1 模块独立核算双指标（设计 §3.4 第 3 条，冷启动无除零 NaN）。
+def compute_graph_metrics(
+    conn: sqlite3.Connection, grade_subject: str, l1_module: str
+) -> GraphMetricsDTO:
+    """按 (学段, L1 模块) 独立核算双指标（设计 §3.4 第 3 条，冷启动无除零 NaN）。
 
     - MasteryRate = (mastered + 0.5 * pending) / total * 100，仅统计挂载
       USER_CANONICAL 题目的活跃主节点（含经重定向子节点挂载）。
     - Convergence = rho * (0.4 + 0.6 * eta) * 100：rho 取最近 W=20 道题的复用
       比例（w<5 -> 0）；eta 为节点步骤分布归一化熵（N<3 -> 0，0 ln 0 = 0）。
+    P10-C：节点/步骤/最近 W=20 题统计全部限 (grade_subject, l1_module) 分区。
     """
     active_ids = [
         str(row[0])
         for row in conn.execute(
-            "SELECT node_id FROM knowledge_nodes WHERE l1_module = ?"
+            "SELECT node_id FROM knowledge_nodes WHERE grade_subject = ? AND l1_module = ?"
             " AND redirect_to_id IS NULL ORDER BY node_id",
-            (l1_module,),
+            (grade_subject, l1_module),
         )
     ]
     n = len(active_ids)
-    resolver = CanonicalNodeResolver(conn)
+    resolver = CanonicalNodeResolver(conn, grade_subject)
     module_by_node = {
         str(row["node_id"]): str(row["l1_module"])
-        for row in conn.execute("SELECT node_id, l1_module FROM knowledge_nodes")
+        for row in conn.execute(
+            "SELECT node_id, l1_module FROM knowledge_nodes WHERE grade_subject = ?",
+            (grade_subject,),
+        )
     }
 
     mounted: set[str] = set()
@@ -876,7 +1006,9 @@ def compute_graph_metrics(conn: sqlite3.Connection, l1_module: str) -> GraphMetr
     step_rows = conn.execute(
         "SELECT s.knowledge_node_id, s.is_blocked_step, q.mastery_state"
         " FROM question_steps s JOIN questions q ON q.question_uid = s.question_uid"
-        " WHERE q.origin_type = 'USER_CANONICAL'"
+        " JOIN knowledge_nodes kn ON kn.node_id = s.knowledge_node_id"
+        " WHERE q.origin_type = 'USER_CANONICAL' AND kn.grade_subject = ?",
+        (grade_subject,),
     ).fetchall()
     for row in step_rows:
         root = resolver.resolve(str(row["knowledge_node_id"]))
@@ -906,9 +1038,10 @@ def compute_graph_metrics(conn: sqlite3.Connection, l1_module: str) -> GraphMetr
     recent = conn.execute(
         "SELECT EXISTS(SELECT 1 FROM question_steps s WHERE s.question_uid = q.question_uid"
         " AND s.reused_existing_node = 1) AS has_reuse FROM questions q"
-        " WHERE q.origin_type = 'USER_CANONICAL' AND q.primary_l1_module = ?"
+        " WHERE q.origin_type = 'USER_CANONICAL' AND q.target_grade_and_subject = ?"
+        " AND q.primary_l1_module = ?"
         " ORDER BY q.created_at DESC, q.question_uid DESC LIMIT ?",
-        (l1_module, _RECENT_WINDOW),
+        (grade_subject, l1_module, _RECENT_WINDOW),
     ).fetchall()
     w = len(recent)
     k_reuse = sum(1 for row in recent if row["has_reuse"])

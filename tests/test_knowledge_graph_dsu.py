@@ -5,6 +5,11 @@ Alternative 2A/2B；任务契约 docs/tasks/P3-A_knowledge_graph.md 测试要求
 
 约束：USE_MOCK_LLM=True 全程零真实网络；题目/步骤行直接 SQL 构造（不依赖
 ingest_service）；tmp_db 夹具隔离；Elo 账本零变化逐字段断言。
+
+P10-C（docs/tasks/P10-C_graph_grade_scoping.md）预授权机械性期望演进：作用域类
+函数调用补 grade 实参（默认 GRADE）；raw SQL 种子节点/边/审计/账本行补
+grade_subject；resolver 构造补 grade。既有核心断言（跨 L1/L2 硬拒、两跳回滚
+逐字段精确恢复、悲观半格、自环消除、冷启动无 NaN、Elo 正交）一律不动。
 """
 
 from __future__ import annotations
@@ -39,6 +44,11 @@ L1 = "电磁学"
 L2 = "电磁感应单双杆模型"
 L1_OTHER = "函数与导数"
 L2_OTHER = "函数极值"
+
+# P10-C：学段学科分区——默认学段与 _insert_question 的 target_grade_and_subject 一致；
+# GRADE_OTHER 用于跨学段隔离测试（真实隐患：同名 L1/L2 在两学段各自长节点）
+GRADE = "高中物理-高二"
+GRADE_OTHER = "小学奥数"
 
 # 三个近义算子（Jaccard: sim(B,C) > sim(A,B) > sim(A,C) > 0，保证先合 C->B 再合 B->A）
 NAME_A = "动量定理求电荷量"
@@ -117,6 +127,7 @@ def _insert_node(
     conn: sqlite3.Connection,
     node_id: str,
     *,
+    grade: str = GRADE,  # P10-C：种子节点补 grade_subject
     l1: str = L1,
     l2: str = L2,
     l3: str | None = None,
@@ -125,11 +136,12 @@ def _insert_node(
     created_at: str | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator,"
-        " aliases_json, redirect_to_id, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+        " l3_operator, aliases_json, redirect_to_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
         (
             node_id,
+            grade,
             l1,
             l2,
             l3 if l3 is not None else f"算子-{node_id}",
@@ -144,6 +156,7 @@ def _insert_question(
     conn: sqlite3.Connection,
     uid: str,
     *,
+    grade: str = GRADE,  # P10-C：学段参数化（原硬编码 '高中物理-高二' 即 GRADE）
     module: str = L1,
     origin: str = "USER_CANONICAL",
     mastery: str = "ACTIVE",
@@ -153,9 +166,9 @@ def _insert_question(
         "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
         " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
         " base_elo, tier, primary_l1_module, mastery_state, created_at)"
-        " VALUES (?, ?, '高中物理-高二', '题干', ?, '42', 2, 2, 2, 2, 1500,"
+        " VALUES (?, ?, ?, '题干', ?, '42', 2, 2, 2, 2, 1500,"
         " 'L3_综合中档', ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
-        (uid, origin, f"hash-{uid}", module, mastery, created_at),
+        (uid, origin, grade, f"hash-{uid}", module, mastery, created_at),
     )
 
 
@@ -189,17 +202,19 @@ def _insert_edge(
     last_error_at: str = "2026-01-01 00:00:00",
 ) -> None:
     assert u < v
-    mu = conn.execute(
-        "SELECT l1_module FROM knowledge_nodes WHERE node_id = ?", (u,)
-    ).fetchone()[0]
+    # P10-C：种子边补 grade_subject，自 u 端点派生（与 P10-A 回填规则一致）
+    u_row = conn.execute(
+        "SELECT l1_module, grade_subject FROM knowledge_nodes WHERE node_id = ?", (u,)
+    ).fetchone()
+    mu, grade = u_row[0], u_row[1]
     mv = conn.execute(
         "SELECT l1_module FROM knowledge_nodes WHERE node_id = ?", (v,)
     ).fetchone()[0]
     conn.execute(
-        "INSERT INTO concept_co_errors (node_u_id, node_v_id, l1_module_u, l1_module_v,"
-        " active_error_count, total_historical_count, source_question_uids_json, last_error_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (u, v, mu, mv, active, historical, json.dumps(list(uids), ensure_ascii=False),
+        "INSERT INTO concept_co_errors (node_u_id, node_v_id, grade_subject,"
+        " l1_module_u, l1_module_v, active_error_count, total_historical_count,"
+        " source_question_uids_json, last_error_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (u, v, grade, mu, mv, active, historical, json.dumps(list(uids), ensure_ascii=False),
          last_error_at),
     )
 
@@ -242,12 +257,13 @@ def _assert_hops_le_one(conn: sqlite3.Connection) -> None:
 def _seed_elo_rows(conn: sqlite3.Connection) -> None:
     """直接 SQL 构造 Elo 账本与托管池行（不依赖 elo_engine），用于零变化断言。"""
     conn.execute(
-        "INSERT INTO elo_mutation_ledger (idempotency_key, l1_module, question_uid,"
-        " mutation_trigger, eval_difficulty_elo, watermark_gamma, coverage_elo_before,"
-        " coverage_elo_after, combat_elo_before, combat_elo_after, explanation_text)"
-        " VALUES ('q1:s1:MASTERED_INIT', ?, 'q1', 'MASTERED_INIT', 1500, 1.0,"
+        "INSERT INTO elo_mutation_ledger (idempotency_key, grade_subject, l1_module,"
+        " question_uid, mutation_trigger, eval_difficulty_elo, watermark_gamma,"
+        " coverage_elo_before, coverage_elo_after, combat_elo_before, combat_elo_after,"
+        " explanation_text)"
+        " VALUES ('q1:s1:MASTERED_INIT', ?, ?, 'q1', 'MASTERED_INIT', 1500, 1.0,"
         " 1200.0, 1216.0, 1200.0, 1216.0, '测试账本行')",
-        (L1,),
+        (GRADE, L1),  # P10-C：种子账本行补 grade_subject（零变化断言本身不动）
     )
     conn.execute(
         "INSERT INTO question_escrow_pool (question_uid, l1_module,"
@@ -291,19 +307,19 @@ def _build_merge_scenario(conn: sqlite3.Connection) -> None:
 
 def test_resolver_active_returns_self(conn: sqlite3.Connection) -> None:
     _insert_node(conn, "A")
-    assert CanonicalNodeResolver(conn).resolve("A") == "A"
+    assert CanonicalNodeResolver(conn, GRADE).resolve("A") == "A"
 
 
 def test_resolver_follows_redirect_chain(conn: sqlite3.Connection) -> None:
     _insert_node(conn, "A")
     _insert_node(conn, "B", redirect="A")
     _insert_node(conn, "C", redirect="B")
-    assert CanonicalNodeResolver(conn).resolve("C") == "A"
+    assert CanonicalNodeResolver(conn, GRADE).resolve("C") == "A"
 
 
 def test_resolver_unknown_node_raises(conn: sqlite3.Connection) -> None:
     with pytest.raises(KeyError):
-        CanonicalNodeResolver(conn).resolve("ghost")
+        CanonicalNodeResolver(conn, GRADE).resolve("ghost")
 
 
 def test_resolver_cycle_raises(conn: sqlite3.Connection) -> None:
@@ -312,7 +328,7 @@ def test_resolver_cycle_raises(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE knowledge_nodes SET redirect_to_id = 'B' WHERE node_id = 'A'")
     conn.execute("UPDATE knowledge_nodes SET redirect_to_id = 'A' WHERE node_id = 'B'")
     with pytest.raises(ValueError, match="环"):
-        CanonicalNodeResolver(conn).resolve("A")
+        CanonicalNodeResolver(conn, GRADE).resolve("A")
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +339,7 @@ def test_resolver_cycle_raises(conn: sqlite3.Connection) -> None:
 async def test_first_node_created_without_judge(
     conn: sqlite3.Connection, judge: JudgeSpy
 ) -> None:
-    node_id, reused = await match_or_create_l3_node(conn, L1, L2, "全新算子", ["别名1"])
+    node_id, reused = await match_or_create_l3_node(conn, GRADE, L1, L2, "全新算子", ["别名1"])
     assert reused is False
     assert judge.calls == []
     row = conn.execute(
@@ -337,7 +353,7 @@ async def test_first_node_created_without_judge(
 async def test_default_mock_fixture_routes_and_creates_new(conn: sqlite3.Connection) -> None:
     """不打桩：走真实网关 Mock 路由，验证追加的 node_judge fixture 可用且保守未命中。"""
     _insert_node(conn, "A", l3=NAME_A)
-    node_id, reused = await match_or_create_l3_node(conn, L1, L2, NAME_B, [])
+    node_id, reused = await match_or_create_l3_node(conn, GRADE, L1, L2, NAME_B, [])
     assert reused is False and node_id != "A"
     assert conn.execute("SELECT COUNT(*) FROM knowledge_nodes").fetchone()[0] == 2
 
@@ -348,7 +364,7 @@ async def test_reuse_merges_aliases_dedup_and_excludes_primary(
     _insert_node(conn, "A", l3="主算子", aliases=("旧别名",))
     judge.decide = lambda payload: "A"
     node_id, reused = await match_or_create_l3_node(
-        conn, L1, L2, "新名称", ["旧别名", "另一别名"]
+        conn, GRADE, L1, L2, "新名称", ["旧别名", "另一别名"]
     )
     assert (node_id, reused) == ("A", True)
     aliases = json.loads(
@@ -363,7 +379,7 @@ async def test_reuse_candidate_equal_primary_not_aliased(
 ) -> None:
     _insert_node(conn, "A", l3="主算子")
     judge.decide = lambda payload: "A"
-    _, reused = await match_or_create_l3_node(conn, L1, L2, "主算子", [])
+    _, reused = await match_or_create_l3_node(conn, GRADE, L1, L2, "主算子", [])
     assert reused is True
     assert json.loads(
         conn.execute("SELECT aliases_json FROM knowledge_nodes WHERE node_id='A'").fetchone()[0]
@@ -374,7 +390,7 @@ async def test_reuse_alias_cap_8(conn: sqlite3.Connection, judge: JudgeSpy) -> N
     full = tuple(f"别名{i}" for i in range(settings.MAX_ALIASES_PER_NODE))
     _insert_node(conn, "A", aliases=full)
     judge.decide = lambda payload: "A"
-    _, reused = await match_or_create_l3_node(conn, L1, L2, "溢出新名称", [])
+    _, reused = await match_or_create_l3_node(conn, GRADE, L1, L2, "溢出新名称", [])
     assert reused is True
     aliases = json.loads(
         conn.execute("SELECT aliases_json FROM knowledge_nodes WHERE node_id='A'").fetchone()[0]
@@ -387,7 +403,7 @@ async def test_judge_hit_outside_candidates_creates_new(
 ) -> None:
     _insert_node(conn, "A")
     judge.decide = lambda payload: "ghost-not-sent"
-    node_id, reused = await match_or_create_l3_node(conn, L1, L2, "新算子", [])
+    node_id, reused = await match_or_create_l3_node(conn, GRADE, L1, L2, "新算子", [])
     assert reused is False and node_id != "A"
 
 
@@ -398,7 +414,7 @@ async def test_judge_hit_cross_scope_creates_new(
     _insert_node(conn, "A")
     _insert_node(conn, "E", l2=L2_OTHER, l3=NAME_A)
     judge.decide = lambda payload: "E"
-    node_id, reused = await match_or_create_l3_node(conn, L1, L2, NAME_A, [])
+    node_id, reused = await match_or_create_l3_node(conn, GRADE, L1, L2, NAME_A, [])
     assert reused is False and node_id not in ("A", "E")
     assert _redirects(conn) == {"A": None, "E": None, node_id: None}
 
@@ -415,14 +431,14 @@ async def test_reuse_revalidates_match_still_active(
         return "A"
 
     judge.decide = decide
-    node_id, reused = await match_or_create_l3_node(conn, L1, L2, NAME_B, [])
+    node_id, reused = await match_or_create_l3_node(conn, GRADE, L1, L2, NAME_B, [])
     assert reused is False and node_id not in ("A", "R")
 
 
 async def test_recall_25_nodes_all_sent(conn: sqlite3.Connection, judge: JudgeSpy) -> None:
     for i in range(settings.L3_LOCAL_RECALL_TRIGGER_COUNT):
         _insert_node(conn, f"n{i:02d}", l3=f"动量定理电荷量算子{i:02d}")
-    _, reused = await match_or_create_l3_node(conn, L1, L2, "动量定理电荷量", [])
+    _, reused = await match_or_create_l3_node(conn, GRADE, L1, L2, "动量定理电荷量", [])
     assert reused is False
     assert len(judge.match_calls) == 1
     assert len(judge.match_calls[0]["existing_nodes"]) == 25
@@ -436,7 +452,7 @@ async def test_recall_30_nodes_jaccard_top15(
         _insert_node(conn, f"hi{i:02d}", l3=f"动量定理电荷量计算变体{i:02d}")
     for i in range(15):
         _insert_node(conn, f"lo{i:02d}", l3=f"无关算子{i:02d}")
-    await match_or_create_l3_node(conn, L1, L2, "动量定理电荷量计算", [])
+    await match_or_create_l3_node(conn, GRADE, L1, L2, "动量定理电荷量计算", [])
     assert len(judge.match_calls) == 1
     sent = judge.match_calls[0]["existing_nodes"]
     assert len(sent) == settings.L3_TOP_K_CANDIDATES == 15
@@ -450,7 +466,7 @@ async def test_recall_thresholds_respect_settings(
     monkeypatch.setattr(settings, "L3_TOP_K_CANDIDATES", 5)
     for i in range(12):
         _insert_node(conn, f"n{i:02d}", l3=f"动量定理电荷量变体{i:02d}")
-    await match_or_create_l3_node(conn, L1, L2, "动量定理电荷量", [])
+    await match_or_create_l3_node(conn, GRADE, L1, L2, "动量定理电荷量", [])
     assert len(judge.match_calls[0]["existing_nodes"]) == 5
 
 
@@ -465,15 +481,15 @@ async def test_auto_compaction_triggers_at_15(
     calls: list[tuple[str, str]] = []
     original = kg.run_scoped_compaction
 
-    def wrapped(c: sqlite3.Connection, l1: str, l2: str) -> str | None:
+    def wrapped(c: sqlite3.Connection, grade: str, l1: str, l2: str) -> str | None:
         calls.append((l1, l2))
-        return original(c, l1, l2)
+        return original(c, grade, l1, l2)
 
     monkeypatch.setattr(kg, "run_scoped_compaction", wrapped)
     for name in DISJOINT_NAMES[:14]:
-        await match_or_create_l3_node(conn, L1, L2, name, [])
+        await match_or_create_l3_node(conn, GRADE, L1, L2, name, [])
     assert calls == []
-    await match_or_create_l3_node(conn, L1, L2, DISJOINT_NAMES[14], [])
+    await match_or_create_l3_node(conn, GRADE, L1, L2, DISJOINT_NAMES[14], [])
     assert calls == [(L1, L2)]
 
 
@@ -481,23 +497,28 @@ async def test_threshold_counts_only_since_last_batch(
     conn: sqlite3.Connection, judge: JudgeSpy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        kg, "run_scoped_compaction", lambda c, l1, l2: calls.append((l1, l2)) or None
-    )
+
+    # P10-C：补 grade 形参；原 lambda 的 append-or-None 写法有 mypy func-returns-value
+    # 存量告警（门禁仅查 backend/ 未暴露），改等价具名函数，行为不变
+    def spy(c: sqlite3.Connection, grade: str, l1: str, l2: str) -> None:
+        calls.append((l1, l2))
+
+    monkeypatch.setattr(kg, "run_scoped_compaction", spy)
     for i in range(10):
         _insert_node(conn, f"old-{i}", l3=DISJOINT_NAMES[i], created_at="1999-01-01 00:00:00")
     conn.execute(
-        "INSERT INTO compaction_audit_ledger (batch_id, l1_module, l2_entity,"
-        " from_node_id, to_node_id, ai_judge_evidence, previous_aliases_to_json,"
-        " affected_child_node_ids_json, previous_co_errors_snapshot_json, created_at)"
-        " VALUES ('old-batch', ?, ?, 'old-0', 'old-1', '证据', '[]', '[]', '[]',"
+        "INSERT INTO compaction_audit_ledger (batch_id, grade_subject, l1_module,"
+        " l2_entity, from_node_id, to_node_id, ai_judge_evidence,"
+        " previous_aliases_to_json, affected_child_node_ids_json,"
+        " previous_co_errors_snapshot_json, created_at)"
+        " VALUES ('old-batch', ?, ?, ?, 'old-0', 'old-1', '证据', '[]', '[]', '[]',"
         " '2000-01-01 00:00:00')",
-        (L1, L2),
+        (GRADE, L1, L2),  # P10-C：种子审计行补 grade_subject（水位线查询限同学段）
     )
     for name in DISJOINT_NAMES[:14]:
-        await match_or_create_l3_node(conn, L1, L2, f"新{name}", [])
+        await match_or_create_l3_node(conn, GRADE, L1, L2, f"新{name}", [])
     assert calls == []  # 旧批次前的 10 个节点不计入
-    await match_or_create_l3_node(conn, L1, L2, "新寅亥", [])
+    await match_or_create_l3_node(conn, GRADE, L1, L2, "新寅亥", [])
     assert calls == [(L1, L2)]
 
 
@@ -507,10 +528,10 @@ async def test_auto_compaction_merges_similar_pair(
     """新建满 15 自动 compaction，Mock 裁判确认近义对 -> 真实合并 + 审计。"""
     judge.decide = _confirm_compaction
     for name in DISJOINT_NAMES[:13]:
-        await match_or_create_l3_node(conn, L1, L2, name, [])
-    older_id, _ = await match_or_create_l3_node(conn, L1, L2, NAME_A, [])
+        await match_or_create_l3_node(conn, GRADE, L1, L2, name, [])
+    older_id, _ = await match_or_create_l3_node(conn, GRADE, L1, L2, NAME_A, [])
     assert conn.execute("SELECT COUNT(*) FROM compaction_audit_ledger").fetchone()[0] == 0
-    newer_id, _ = await match_or_create_l3_node(conn, L1, L2, NAME_B, [])
+    newer_id, _ = await match_or_create_l3_node(conn, GRADE, L1, L2, NAME_B, [])
     # 同秒创建时 (created_at, node_id) 排序决定主从方向，按 DB 排序断言
     ordered = conn.execute(
         "SELECT node_id FROM knowledge_nodes WHERE node_id IN (?, ?)"
@@ -535,9 +556,9 @@ async def test_auto_compaction_merges_similar_pair(
 def test_compaction_empty_or_single_returns_none(
     conn: sqlite3.Connection, judge: JudgeSpy
 ) -> None:
-    assert run_scoped_compaction(conn, L1, L2) is None
+    assert run_scoped_compaction(conn, GRADE, L1, L2) is None
     _insert_node(conn, "A")
-    assert run_scoped_compaction(conn, L1, L2) is None
+    assert run_scoped_compaction(conn, GRADE, L1, L2) is None
     assert judge.calls == []
 
 
@@ -546,7 +567,7 @@ def test_compaction_zero_jaccard_skips_judge(
 ) -> None:
     _insert_node(conn, "A", l3="甲子")
     _insert_node(conn, "B", l3="乙丑")
-    assert run_scoped_compaction(conn, L1, L2) is None
+    assert run_scoped_compaction(conn, GRADE, L1, L2) is None
     assert judge.compaction_calls == []
 
 
@@ -555,7 +576,7 @@ def test_compaction_judge_reject_no_merge(
 ) -> None:
     _insert_node(conn, "A", l3=NAME_A)
     _insert_node(conn, "B", l3=NAME_B)
-    assert run_scoped_compaction(conn, L1, L2) is None
+    assert run_scoped_compaction(conn, GRADE, L1, L2) is None
     assert len(judge.compaction_calls) == 1
     assert _redirects(conn) == {"A": None, "B": None}
     assert conn.execute("SELECT COUNT(*) FROM compaction_audit_ledger").fetchone()[0] == 0
@@ -569,7 +590,7 @@ def test_compaction_cross_l1_judge_hard_rejected(
     _insert_node(conn, "B", l3=NAME_B)
     _insert_node(conn, "E", l1=L1_OTHER, l3=NAME_A)
     judge.decide = lambda payload: "E"
-    assert run_scoped_compaction(conn, L1, L2) is None
+    assert run_scoped_compaction(conn, GRADE, L1, L2) is None
     assert _redirects(conn) == {"A": None, "B": None, "E": None}
     assert conn.execute("SELECT COUNT(*) FROM compaction_audit_ledger").fetchone()[0] == 0
 
@@ -581,7 +602,7 @@ def test_compaction_cross_l2_judge_hard_rejected(
     _insert_node(conn, "B", l3=NAME_B)
     _insert_node(conn, "E", l2=L2_OTHER, l3=NAME_A)
     judge.decide = lambda payload: "E"
-    assert run_scoped_compaction(conn, L1, L2) is None
+    assert run_scoped_compaction(conn, GRADE, L1, L2) is None
     assert _redirects(conn) == {"A": None, "B": None, "E": None}
 
 
@@ -590,8 +611,8 @@ def test_compaction_scope_isolation(conn: sqlite3.Connection, judge: JudgeSpy) -
     _insert_node(conn, "A", l3=NAME_A)
     _insert_node(conn, "E", l2=L2_OTHER, l3=NAME_B)
     judge.decide = _confirm_compaction
-    assert run_scoped_compaction(conn, L1, L2) is None
-    assert run_scoped_compaction(conn, L1, L2_OTHER) is None
+    assert run_scoped_compaction(conn, GRADE, L1, L2) is None
+    assert run_scoped_compaction(conn, GRADE, L1, L2_OTHER) is None
     assert _redirects(conn) == {"A": None, "E": None}
 
 
@@ -600,14 +621,14 @@ def test_scope_guard_raises_on_cross_scope(conn: sqlite3.Connection) -> None:
     _insert_node(conn, "A")
     _insert_node(conn, "E", l1=L1_OTHER)
     with pytest.raises(ValueError, match="严禁跨 L1/L2"):
-        kg._assert_same_scope(conn, ["A", "E"], L1, L2)
+        kg._assert_same_scope(conn, GRADE, ["A", "E"], L1, L2)
 
 
 def test_merge_pair_rejects_inactive_nodes(conn: sqlite3.Connection) -> None:
     _insert_node(conn, "A")
     _insert_node(conn, "B", redirect="A")
     with pytest.raises(ValueError, match="活跃主节点"):
-        kg._merge_pair(conn, L1, L2, "B", "A", "batch-x", "证据")
+        kg._merge_pair(conn, GRADE, L1, L2, "B", "A", "batch-x", "证据")
 
 
 def test_merge_pair_savepoint_atomic_on_failure(
@@ -622,12 +643,12 @@ def test_merge_pair_savepoint_atomic_on_failure(
     before_nodes = _dump(conn, "knowledge_nodes", "node_id")
     before_edges = _dump(conn, "concept_co_errors", "node_u_id, node_v_id")
 
-    def boom(c: sqlite3.Connection, snapshot: list[dict[str, Any]]) -> None:
+    def boom(c: sqlite3.Connection, grade: str, snapshot: list[dict[str, Any]]) -> None:
         raise RuntimeError("边归并中途失败")
 
     monkeypatch.setattr(kg, "_rewrite_edges_after_merge", boom)
     with pytest.raises(RuntimeError, match="边归并中途失败"):
-        run_scoped_compaction(conn, L1, L2)
+        run_scoped_compaction(conn, GRADE, L1, L2)
     assert _dump(conn, "knowledge_nodes", "node_id") == before_nodes
     assert _dump(conn, "concept_co_errors", "node_u_id, node_v_id") == before_edges
     assert conn.execute("SELECT COUNT(*) FROM compaction_audit_ledger").fetchone()[0] == 0
@@ -641,11 +662,11 @@ def test_path_compression_two_hop_pointers(
     _insert_node(conn, "A", l3=NAME_A, created_at="2026-01-01 00:00:01")
     _insert_node(conn, "B", l3=NAME_B, created_at="2026-01-01 00:00:02")
     _insert_node(conn, "C", l3=NAME_C, created_at="2026-01-01 00:00:03")
-    batch_id = run_scoped_compaction(conn, L1, L2)
+    batch_id = run_scoped_compaction(conn, GRADE, L1, L2)
     assert isinstance(batch_id, str) and batch_id
     assert _redirects(conn) == {"A": None, "B": "A", "C": "A"}
     _assert_hops_le_one(conn)
-    resolver = CanonicalNodeResolver(conn)
+    resolver = CanonicalNodeResolver(conn, GRADE)
     assert resolver.resolve("C") == "A" and resolver.resolve("B") == "A"
     ledger = conn.execute(
         "SELECT * FROM compaction_audit_ledger ORDER BY merge_id"
@@ -664,7 +685,7 @@ def test_merge_direction_newer_into_older(
     judge.decide = _confirm_compaction
     _insert_node(conn, "Z-older", l3=NAME_A, created_at="2026-01-01 00:00:01")
     _insert_node(conn, "A-newer", l3=NAME_B, created_at="2026-01-02 00:00:01")
-    batch_id = run_scoped_compaction(conn, L1, L2)
+    batch_id = run_scoped_compaction(conn, GRADE, L1, L2)
     assert batch_id is not None
     assert _redirects(conn) == {"Z-older": None, "A-newer": "Z-older"}
 
@@ -679,7 +700,7 @@ def test_merge_removes_self_loop(conn: sqlite3.Connection, judge: JudgeSpy) -> N
     _insert_node(conn, "A", l3=NAME_A, created_at="2026-01-01 00:00:01")
     _insert_node(conn, "B", l3=NAME_B, created_at="2026-01-01 00:00:02")
     _insert_edge(conn, "A", "B")
-    run_scoped_compaction(conn, L1, L2)
+    run_scoped_compaction(conn, GRADE, L1, L2)
     assert conn.execute("SELECT COUNT(*) FROM concept_co_errors").fetchone()[0] == 0
 
 
@@ -694,7 +715,7 @@ def test_merge_accumulates_overlapping_edges(
                  last_error_at="2026-01-02 00:00:00")
     _insert_edge(conn, "B", "X", active=1, historical=2, uids=("q3",),
                  last_error_at="2026-01-03 00:00:00")
-    run_scoped_compaction(conn, L1, L2)
+    run_scoped_compaction(conn, GRADE, L1, L2)
     edges = _dump(conn, "concept_co_errors", "node_u_id, node_v_id")
     assert len(edges) == 1
     edge = edges[0]
@@ -713,7 +734,7 @@ def test_merge_migrates_edge_to_new_key_preserving_u_lt_v(
     _insert_node(conn, "z-sub", l3=NAME_B, created_at="2026-01-01 00:00:02")
     _insert_node(conn, "m-other", l2=L2_OTHER)
     _insert_edge(conn, "m-other", "z-sub", active=2, historical=4, uids=("q9",))
-    run_scoped_compaction(conn, L1, L2)
+    run_scoped_compaction(conn, GRADE, L1, L2)
     edges = _dump(conn, "concept_co_errors", "node_u_id, node_v_id")
     assert len(edges) == 1
     assert (edges[0]["node_u_id"], edges[0]["node_v_id"]) == ("a-main", "m-other")
@@ -870,7 +891,7 @@ def test_revert_exact_field_by_field_restoration(
     _build_merge_scenario(conn)
     before = _snapshot_all(conn)
 
-    batch_id = run_scoped_compaction(conn, L1, L2)
+    batch_id = run_scoped_compaction(conn, GRADE, L1, L2)
     assert batch_id is not None
     # 合并确实发生：两跳压缩、自环删除、边归并、别名扩充
     assert _redirects(conn)["B"] == "A" and _redirects(conn)["C"] == "A"
@@ -911,7 +932,7 @@ def test_revert_idempotent_second_call_noop(
 ) -> None:
     judge.decide = _confirm_compaction
     _build_merge_scenario(conn)
-    batch_id = run_scoped_compaction(conn, L1, L2)
+    batch_id = run_scoped_compaction(conn, GRADE, L1, L2)
     assert batch_id is not None
     revert_compaction_batch(conn, batch_id)
     snapshot = _snapshot_all(conn)
@@ -935,7 +956,7 @@ def test_revert_restores_two_hop_child_pointers(
     _insert_node(conn, "A", l3=NAME_A, created_at="2026-01-01 00:00:01")
     _insert_node(conn, "B", l3=NAME_B, created_at="2026-01-01 00:00:02")
     _insert_node(conn, "C", l3=NAME_C, redirect="B", created_at="2026-01-01 00:00:03")
-    batch_id = run_scoped_compaction(conn, L1, L2)
+    batch_id = run_scoped_compaction(conn, GRADE, L1, L2)
     assert batch_id is not None
     assert _redirects(conn) == {"A": None, "B": "A", "C": "A"}
     revert_compaction_batch(conn, batch_id)
@@ -951,7 +972,7 @@ def test_revert_elo_ledger_zero_change_isolated(
     _build_merge_scenario(conn)
     elo_before = _dump(conn, "elo_mutation_ledger", "event_id")
     pool_before = _dump(conn, "question_escrow_pool", "question_uid")
-    batch_id = run_scoped_compaction(conn, L1, L2)
+    batch_id = run_scoped_compaction(conn, GRADE, L1, L2)
     assert batch_id is not None
     revert_compaction_batch(conn, batch_id)
     assert _dump(conn, "elo_mutation_ledger", "event_id") == elo_before
@@ -964,7 +985,7 @@ def test_revert_elo_ledger_zero_change_isolated(
 
 
 def test_metrics_empty_module_no_nan(conn: sqlite3.Connection) -> None:
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert isinstance(dto, GraphMetricsDTO)
     assert dto.mastery_rate == 0.0 and dto.convergence == 0.0 and dto.active_nodes == 0
     assert math.isfinite(dto.mastery_rate) and math.isfinite(dto.convergence)
@@ -975,7 +996,7 @@ def test_metrics_cold_start_n1_w2(conn: sqlite3.Connection) -> None:
     for uid in ("q1", "q2"):
         _insert_question(conn, uid, mastery="ACTIVE")
         _insert_step(conn, f"{uid}-s1", uid, "A", blocked=1, reused=1)
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert dto.active_nodes == 1
     assert dto.mastery_rate == 0.0
     assert dto.convergence == 0.0  # w=2 < 5 -> rho=0；N=1 < 3 -> eta=0
@@ -997,7 +1018,7 @@ def test_metrics_mastery_rate_mixed_states(conn: sqlite3.Connection) -> None:
     _insert_step(conn, "spre", "qpre", "n5", blocked=0)
     _insert_question(conn, "qsyn", origin="AI_SYNTHETIC_VARIANT", mastery="ACTIVE")
     _insert_step(conn, "ssyn", "qsyn", "n6", blocked=1)  # 合成题不计入分母
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert dto.active_nodes == 6
     assert dto.mastery_rate == pytest.approx(50.0)  # (2 + 0.5*1) / 5 * 100
     assert dto.convergence == 0.0  # k_reuse=0
@@ -1009,7 +1030,7 @@ def test_metrics_uniform_distribution_eta_1(conn: sqlite3.Connection) -> None:
     for i in range(6):
         _insert_question(conn, f"q{i}")
         _insert_step(conn, f"s{i}", f"q{i}", f"n{i % 3 + 1}", blocked=1, reused=1)
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert dto.convergence == pytest.approx(100.0)  # rho=1, eta=1
     assert dto.mastery_rate == 0.0
 
@@ -1020,7 +1041,7 @@ def test_metrics_single_point_collapse_eta_0(conn: sqlite3.Connection) -> None:
     for i in range(6):
         _insert_question(conn, f"q{i}")
         _insert_step(conn, f"s{i}", f"q{i}", "n1", blocked=1, reused=1)
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert dto.convergence == pytest.approx(40.0)  # rho=1, eta=0 -> 0.4*100
     assert dto.active_nodes == 3
 
@@ -1032,7 +1053,7 @@ def test_metrics_window_only_recent_20(conn: sqlite3.Connection) -> None:
         _insert_step(
             conn, f"s{i:02d}", f"q{i:02d}", "A", blocked=1, reused=1 if i < 5 else 0
         )
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert dto.convergence == 0.0  # 最近 20 道全部未复用，最早 5 道复用不计入
 
 
@@ -1041,11 +1062,11 @@ def test_metrics_min_sample_boundary(conn: sqlite3.Connection) -> None:
     for i in range(4):
         _insert_question(conn, f"q{i}")
         _insert_step(conn, f"s{i}", f"q{i}", "A", blocked=1, reused=1)
-    assert compute_graph_metrics(conn, L1).convergence == 0.0  # w=4 < 5
+    assert compute_graph_metrics(conn, GRADE, L1).convergence == 0.0  # w=4 < 5
     _insert_question(conn, "q4")
     _insert_step(conn, "s4", "q4", "A", blocked=1, reused=1)
     # w=5, rho=1；N=1 < 3 -> eta=0 -> 40.0
-    assert compute_graph_metrics(conn, L1).convergence == pytest.approx(40.0)
+    assert compute_graph_metrics(conn, GRADE, L1).convergence == pytest.approx(40.0)
 
 
 def test_metrics_redirected_steps_count_to_parent(conn: sqlite3.Connection) -> None:
@@ -1057,7 +1078,7 @@ def test_metrics_redirected_steps_count_to_parent(conn: sqlite3.Connection) -> N
     for i, nid in enumerate(mounts):
         _insert_question(conn, f"q{i}")
         _insert_step(conn, f"s{i}", f"q{i}", nid, blocked=1, reused=1)
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert dto.active_nodes == 3  # C 已重定向，不计活跃主节点
     assert dto.convergence == pytest.approx(100.0)  # A/B/D 各 2 步均匀分布
 
@@ -1068,10 +1089,10 @@ def test_metrics_cross_module_steps_excluded(conn: sqlite3.Connection) -> None:
     _insert_node(conn, "D", l1=L1_OTHER, l2=L2_OTHER)
     _insert_question(conn, "q1", mastery="MASTERED")
     _insert_step(conn, "s1", "q1", "D", blocked=1, reused=1)
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert dto.mastery_rate == 0.0  # A 无挂载，D 的步骤归属其他模块
     assert dto.active_nodes == 1
-    dto_other = compute_graph_metrics(conn, L1_OTHER)
+    dto_other = compute_graph_metrics(conn, GRADE, L1_OTHER)
     assert dto_other.mastery_rate == 100.0
     assert dto_other.active_nodes == 1
 
@@ -1081,7 +1102,7 @@ def test_metrics_synthetic_excluded_from_window(conn: sqlite3.Connection) -> Non
     for i in range(6):
         _insert_question(conn, f"q{i}", origin="AI_SYNTHETIC_SCAFFOLD")
         _insert_step(conn, f"s{i}", f"q{i}", "A", blocked=1, reused=1)
-    dto = compute_graph_metrics(conn, L1)
+    dto = compute_graph_metrics(conn, GRADE, L1)
     assert dto.convergence == 0.0
     assert dto.mastery_rate == 0.0
     assert dto.active_nodes == 1
@@ -1130,7 +1151,7 @@ def test_all_node_states_matches_node_state(conn: sqlite3.Connection) -> None:
     _insert_question(conn, "q-pen", mastery="PENDING_RETEST")
     _insert_step(conn, "s1", "q-act", "A1-sub", blocked=1)
     _insert_step(conn, "s2", "q-pen", "P1", blocked=1)
-    bulk = kg.all_node_states(conn)
+    bulk = kg.all_node_states(conn, GRADE)
     for nid in ("M0", "A1", "P1"):
         assert bulk[nid] == node_state(conn, nid)
     assert bulk["M0"] == "MASTERED"
@@ -1151,13 +1172,271 @@ async def test_compaction_zero_merge_watermark_skips_rescan(
         "日月", "星辰", "天地", "玄黄", "宇宙",
     ]
     for name in names[:15]:
-        await match_or_create_l3_node(conn, "天文", "星象", f"定理{name}", [])
+        await match_or_create_l3_node(conn, GRADE, "天文", "星象", f"定理{name}", [])
     compactions_at_15 = len(judge.compaction_calls)
     assert compactions_at_15 > 0
 
     for name in names[15:29]:
-        await match_or_create_l3_node(conn, "天文", "星象", f"定理{name}", [])
+        await match_or_create_l3_node(conn, GRADE, "天文", "星象", f"定理{name}", [])
     assert len(judge.compaction_calls) == compactions_at_15
 
-    await match_or_create_l3_node(conn, "天文", "星象", f"定理{names[29]}", [])
+    await match_or_create_l3_node(conn, GRADE, "天文", "星象", f"定理{names[29]}", [])
     assert len(judge.compaction_calls) > compactions_at_15
+
+
+# ---------------------------------------------------------------------------
+# P10-C：学段学科分区（docs/tasks/P10-C_graph_grade_scoping.md 新增测试 1~5）
+# ---------------------------------------------------------------------------
+
+
+async def test_cross_grade_same_path_nodes_independent(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    """P10-C 新增 1：两学段同名 (L1, L2, L3) 各自独立长节点，学段落库正确。"""
+    id_a, reused_a = await match_or_create_l3_node(conn, GRADE, L1, L2, NAME_A, [])
+    id_b, reused_b = await match_or_create_l3_node(conn, GRADE_OTHER, L1, L2, NAME_A, [])
+    assert reused_a is False and reused_b is False
+    assert id_a != id_b
+    assert judge.calls == []  # 各自作用域内首个节点：无候选不触发裁判，更不跨学段召回
+    grades = {
+        str(r["node_id"]): r["grade_subject"]
+        for r in conn.execute("SELECT node_id, grade_subject FROM knowledge_nodes")
+    }
+    assert grades == {id_a: GRADE, id_b: GRADE_OTHER}
+
+
+async def test_recall_never_reuses_cross_grade(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    """P10-C 新增 1：召回限同学段——异学段同名节点既不进候选集也不可复用。"""
+    _insert_node(conn, "A", l3=NAME_A)
+    _insert_node(conn, "E", grade=GRADE_OTHER, l3=NAME_B)  # 同 L1/L2 异学段
+    judge.decide = lambda payload: "A"  # 恶意裁判返回异学段节点 ID
+    node_id, reused = await match_or_create_l3_node(conn, GRADE_OTHER, L1, L2, NAME_A, [])
+    assert reused is False and node_id not in ("A", "E")
+    # 候选集仅含同学段 E；跨学段 A 从未被召回
+    assert len(judge.match_calls) == 1
+    assert {n["node_id"] for n in judge.match_calls[0]["existing_nodes"]} == {"E"}
+    row = conn.execute(
+        "SELECT grade_subject, redirect_to_id FROM knowledge_nodes WHERE node_id = ?",
+        (node_id,),
+    ).fetchone()
+    assert row["grade_subject"] == GRADE_OTHER and row["redirect_to_id"] is None
+    assert _redirects(conn) == {"A": None, "E": None, node_id: None}
+
+
+def test_compaction_scan_never_pairs_cross_grade(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    """P10-C 新增 1：高 Jaccard 近义对分属两学段 -> 各作用域零配对零裁判零合并。"""
+    _insert_node(conn, "A", l3=NAME_A)
+    _insert_node(conn, "B", grade=GRADE_OTHER, l3=NAME_B)
+    judge.decide = _confirm_compaction
+    assert run_scoped_compaction(conn, GRADE, L1, L2) is None
+    assert run_scoped_compaction(conn, GRADE_OTHER, L1, L2) is None
+    assert judge.compaction_calls == []
+    assert _redirects(conn) == {"A": None, "B": None}
+    assert conn.execute("SELECT COUNT(*) FROM compaction_audit_ledger").fetchone()[0] == 0
+
+
+def test_scope_guard_raises_on_cross_grade(conn: sqlite3.Connection) -> None:
+    """P10-C 新增 1：跨学段合并与跨 L1/L2 同级红线——写入前硬闸 ValueError。"""
+    _insert_node(conn, "A")
+    _insert_node(conn, "E", grade=GRADE_OTHER)  # 同 L1/L2，仅学段不同
+    with pytest.raises(ValueError, match="严禁跨学段"):
+        kg._assert_same_scope(conn, GRADE, ["A", "E"], L1, L2)
+    with pytest.raises(ValueError, match="严禁跨学段"):
+        kg._merge_pair(conn, GRADE, L1, L2, "E", "A", "batch-x", "证据")
+    assert _redirects(conn) == {"A": None, "E": None}
+    assert conn.execute("SELECT COUNT(*) FROM compaction_audit_ledger").fetchone()[0] == 0
+
+
+def test_build_pairs_rejects_cross_grade_input(conn: sqlite3.Connection) -> None:
+    """P10-C 新增 1：配对预筛防御断言——混入异学段节点立即 ValueError。"""
+    _insert_node(conn, "A", l3=NAME_A)
+    _insert_node(conn, "B", grade=GRADE_OTHER, l3=NAME_B)
+    rows = conn.execute("SELECT * FROM knowledge_nodes ORDER BY node_id").fetchall()
+    with pytest.raises(ValueError, match="严禁跨学段配对"):
+        kg._build_compaction_pairs(GRADE, rows)
+
+
+def test_resolver_cross_grade_node_is_unknown(conn: sqlite3.Connection) -> None:
+    """P10-C 新增 1：解析器 SQL grade 过滤防御——异学段节点视为未知（KeyError）。"""
+    _insert_node(conn, "A")
+    _insert_node(conn, "E", grade=GRADE_OTHER)
+    assert CanonicalNodeResolver(conn, GRADE).resolve("A") == "A"
+    with pytest.raises(KeyError):
+        CanonicalNodeResolver(conn, GRADE).resolve("E")
+
+
+def test_grade_scoped_compaction_audit_and_exact_revert(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    """P10-C 新增 2：同学段近义合并全链——审计/边 grade 正确；回滚逐字段恢复（含 grade 列）。"""
+    judge.decide = _confirm_compaction
+    _insert_node(conn, "A", l3=NAME_A, created_at="2026-01-01 00:00:01")
+    _insert_node(conn, "B", l3=NAME_B, created_at="2026-01-01 00:00:02")
+    _insert_node(conn, "C", redirect="B", created_at="2026-01-01 00:00:03")
+    _insert_node(conn, "X", l2=L2_OTHER)
+    _insert_node(conn, "A-decoy", grade=GRADE_OTHER, l3=NAME_B)  # 异学段诱饵：绝不被触碰
+    _insert_edge(conn, "B", "X", active=2, historical=3, uids=("q1",))
+    before = _snapshot_all(conn)
+
+    batch_id = run_scoped_compaction(conn, GRADE, L1, L2)
+    assert batch_id is not None
+    assert _redirects(conn)["B"] == "A" and _redirects(conn)["C"] == "A"
+    _assert_hops_le_one(conn)
+    assert _redirects(conn)["A-decoy"] is None
+    ledger = conn.execute(
+        "SELECT * FROM compaction_audit_ledger WHERE batch_id = ?", (batch_id,)
+    ).fetchall()
+    assert len(ledger) == 1
+    assert ledger[0]["grade_subject"] == GRADE  # 审计行学段正确
+    # 迁移新键边 (B,X)->(A,X) 的 grade_subject 落库正确
+    edge = conn.execute(
+        "SELECT * FROM concept_co_errors WHERE node_u_id = 'A' AND node_v_id = 'X'"
+    ).fetchone()
+    assert edge["grade_subject"] == GRADE
+    assert edge["active_error_count"] == 2 and edge["total_historical_count"] == 3
+
+    revert_compaction_batch(conn, batch_id)
+    after = _snapshot_all(conn)
+    for table, rows in before.items():
+        assert after[table] == rows, f"{table} 未逐字段精确恢复（含 grade_subject）"
+    restored = conn.execute(
+        "SELECT grade_subject FROM concept_co_errors WHERE node_u_id = 'B' AND node_v_id = 'X'"
+    ).fetchone()
+    assert restored[0] == GRADE  # 快照含 grade 列自然恢复
+
+
+def test_record_edges_grade_from_question_and_lifecycle(conn: sqlite3.Connection) -> None:
+    """P10-C 新增 3：标红边学段自题目行派生（uid 签名不变）；同学段边生长/销账正常。"""
+    _insert_node(conn, "A")
+    _insert_node(conn, "B")
+    _insert_node(conn, "A2", grade=GRADE_OTHER)
+    _insert_node(conn, "B2", grade=GRADE_OTHER)
+    _insert_question(conn, "q1")
+    _insert_step(conn, "q1-s1", "q1", "A")
+    _insert_step(conn, "q1-s2", "q1", "B", index=2)
+    _insert_question(conn, "q2", grade=GRADE_OTHER)
+    _insert_step(conn, "q2-s1", "q2", "A2")
+    _insert_step(conn, "q2-s2", "q2", "B2", index=2)
+
+    record_co_error_edges(conn, "q1")
+    record_co_error_edges(conn, "q2")
+    edges = {
+        (e["node_u_id"], e["node_v_id"]): e
+        for e in _dump(conn, "concept_co_errors", "node_u_id, node_v_id")
+    }
+    assert set(edges) == {("A", "B"), ("A2", "B2")}  # 无跨学段边
+    assert edges[("A", "B")]["grade_subject"] == GRADE
+    assert edges[("A2", "B2")]["grade_subject"] == GRADE_OTHER
+
+    record_co_error_edges(conn, "q1")  # 同学段生长：计数递增，学段不变
+    edge = conn.execute(
+        "SELECT * FROM concept_co_errors WHERE node_u_id = 'A' AND node_v_id = 'B'"
+    ).fetchone()
+    assert edge["active_error_count"] == 2 and edge["total_historical_count"] == 2
+    assert edge["grade_subject"] == GRADE
+    decrement_co_error_edges_on_mastery(conn, "q1")  # 按 uid 销账：签名不变
+    edge = conn.execute(
+        "SELECT * FROM concept_co_errors WHERE node_u_id = 'A' AND node_v_id = 'B'"
+    ).fetchone()
+    assert edge["active_error_count"] == 1 and edge["total_historical_count"] == 2
+    assert edge["grade_subject"] == GRADE
+    other = conn.execute(
+        "SELECT * FROM concept_co_errors WHERE node_u_id = 'A2' AND node_v_id = 'B2'"
+    ).fetchone()
+    assert other["active_error_count"] == 1 and other["grade_subject"] == GRADE_OTHER
+
+
+def test_metrics_grade_partition_independent(conn: sqlite3.Connection) -> None:
+    """P10-C 新增 4：两学段同名 L1 双指标各自独立；最近窗口不被跨学段稀释。"""
+    for i in (1, 2, 3):
+        _insert_node(conn, f"g{i}")
+        _insert_node(conn, f"o{i}", grade=GRADE_OTHER)
+    for i in range(6):
+        _insert_question(
+            conn, f"qg{i}", mastery="MASTERED", created_at=f"2026-01-01 00:0{i}:00"
+        )
+        _insert_step(conn, f"sg{i}", f"qg{i}", f"g{i % 3 + 1}", blocked=1, reused=1)
+    for i in range(6):
+        _insert_question(
+            conn, f"qo{i}", grade=GRADE_OTHER, mastery="ACTIVE",
+            created_at=f"2026-01-02 00:0{i}:00",
+        )
+        _insert_step(conn, f"so{i}", f"qo{i}", f"o{i % 3 + 1}", blocked=1, reused=0)
+
+    dto = compute_graph_metrics(conn, GRADE, L1)
+    assert dto.active_nodes == 3
+    assert dto.mastery_rate == pytest.approx(100.0)
+    # 若窗口未按学段分区，异学段 6 道更新的未复用题会把 rho 稀释到 6/12
+    assert dto.convergence == pytest.approx(100.0)
+    dto_other = compute_graph_metrics(conn, GRADE_OTHER, L1)
+    assert dto_other.active_nodes == 3
+    assert dto_other.mastery_rate == 0.0
+    assert dto_other.convergence == 0.0  # rho=0（全部未复用）
+
+
+def test_metrics_cold_start_grade_no_nan(conn: sqlite3.Connection) -> None:
+    """P10-C 新增 4：零节点零题目的学段返回全 0，无除零 NaN。"""
+    _insert_node(conn, "A")  # 仅 GRADE 有节点
+    dto = compute_graph_metrics(conn, GRADE_OTHER, L1)
+    assert isinstance(dto, GraphMetricsDTO)
+    assert dto.mastery_rate == 0.0 and dto.convergence == 0.0 and dto.active_nodes == 0
+    assert math.isfinite(dto.mastery_rate) and math.isfinite(dto.convergence)
+
+
+def test_all_node_states_grade_partition(conn: sqlite3.Connection) -> None:
+    """P10-C 新增 4：批量状态聚合只返回同学段活跃主节点；node_state 学段自派生。"""
+    _insert_node(conn, "A")
+    _insert_node(conn, "A2", grade=GRADE_OTHER)
+    _insert_question(conn, "q1", mastery="ACTIVE")
+    _insert_step(conn, "s1", "q1", "A", blocked=1)
+    _insert_question(conn, "q2", grade=GRADE_OTHER, mastery="PENDING_RETEST")
+    _insert_step(conn, "s2", "q2", "A2", blocked=1)
+    assert kg.all_node_states(conn, GRADE) == {"A": "ACTIVE"}
+    assert kg.all_node_states(conn, GRADE_OTHER) == {"A2": "PENDING_RETEST"}
+    assert node_state(conn, "A") == "ACTIVE"  # 按 uid 签名不变，学段自节点行派生
+    assert node_state(conn, "A2") == "PENDING_RETEST"
+
+
+async def test_watermark_grade_partition(
+    conn: sqlite3.Connection, judge: JudgeSpy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P10-C 新增 5：(db, gradeA, l1, l2) 0 合并水位不影响 gradeB 同 (l1, l2) 触发计数。"""
+    kg._NO_MERGE_SCAN_WATERMARKS.clear()
+    calls: list[tuple[str, str, str]] = []
+    original = kg.run_scoped_compaction
+
+    def wrapped(c: sqlite3.Connection, grade: str, l1: str, l2: str) -> str | None:
+        calls.append((grade, l1, l2))
+        return original(c, grade, l1, l2)
+
+    monkeypatch.setattr(kg, "run_scoped_compaction", wrapped)
+    names = DISJOINT_NAMES  # 15 个互零 Jaccard 名称
+    for name in names[:14]:
+        await match_or_create_l3_node(conn, GRADE, "天文", "星象", f"定理{name}", [])
+    assert calls == []
+    await match_or_create_l3_node(conn, GRADE, "天文", "星象", f"定理{names[14]}", [])
+    assert calls == [(GRADE, "天文", "星象")]  # gradeA 第 15 个触发 0 合并扫描
+    # 水位线 key 升级为 (db_key, grade, l1, l2) 四元组
+    assert (kg._db_cache_key(conn), GRADE, "天文", "星象") in kg._NO_MERGE_SCAN_WATERMARKS
+
+    # gradeB 同 (l1, l2) 独立计数：不被 gradeA 水位压制
+    for name in names[:14]:
+        await match_or_create_l3_node(conn, GRADE_OTHER, "天文", "星象", f"定理{name}", [])
+    assert calls == [(GRADE, "天文", "星象")]
+    await match_or_create_l3_node(conn, GRADE_OTHER, "天文", "星象", f"定理{names[14]}", [])
+    assert calls == [(GRADE, "天文", "星象"), (GRADE_OTHER, "天文", "星象")]
+
+    # gradeA 水位仍有效：再增 14 不触发，第 15 个再触发（与 gradeB 互不干扰）
+    round2 = [
+        "乾坤", "坎离", "震巽", "艮兑", "风雷", "水火", "日月", "星辰",
+        "天地", "玄黄", "宇宙", "阴阳", "山河", "草木", "金石",
+    ]
+    for name in round2[:14]:
+        await match_or_create_l3_node(conn, GRADE, "天文", "星象", name, [])
+    assert len(calls) == 2
+    await match_or_create_l3_node(conn, GRADE, "天文", "星象", round2[14], [])
+    assert len(calls) == 3 and calls[-1] == (GRADE, "天文", "星象")
