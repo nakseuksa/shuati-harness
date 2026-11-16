@@ -33,6 +33,9 @@
       <button class="tab-btn" role="tab" id="tab-elo" data-tab="elo" aria-selected="false" aria-controls="view-elo">📈 双轨 Elo</button>
     </nav>
     <div class="topbar-right">
+      <select id="grade-select" class="grade-select" aria-label="当前学段学科"></select>
+      <button class="icon-btn" id="settings-btn" type="button" data-action="open-settings"
+              title="学段学科设置" aria-label="打开学段学科设置">⚙️</button>
       <button class="icon-btn" id="theme-toggle" data-action="toggle-theme"
               title="切换深色 / 浅色" aria-label="切换深色或浅色主题">🌙</button>
     </div>
@@ -106,14 +109,6 @@
                 <div class="slot-tip">纸质演算草稿拍照 / 截图，仅首轮 VLM 转录一次。</div>
                 <div class="slot-thumbs" data-thumbs></div>
                 <input type="file" accept="image/*" multiple hidden data-file-input />
-              </div>
-            </div>
-
-            <div class="meta-row" style="margin-top:16px">
-              <div>
-                <label class="field-label" for="grade-input">target_grade（学段学科）</label>
-                <input type="text" id="grade-input" value="高中物理-高二"
-                       placeholder="如：高中物理-高二 / 高中数学-高三" />
               </div>
             </div>
 
@@ -209,6 +204,29 @@
   <div class="toasts" id="toasts" aria-live="polite"></div>
   <div class="lightbox" id="lightbox" hidden data-action="close-lightbox">
     <img id="lightbox-img" alt="配图放大预览" />
+  </div>
+
+  <!-- ======= ⚙️ 学段学科设置弹窗（条目行由 app.js 渲染） ======= -->
+  <div class="modal-overlay" id="settings-modal" hidden role="dialog" aria-modal="true"
+       aria-labelledby="settings-title">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 class="modal-title" id="settings-title">⚙️ 学段学科设置</h2>
+        <button class="icon-btn" type="button" data-action="close-settings"
+                title="关闭" aria-label="关闭学段学科设置">✕</button>
+      </div>
+      <p class="modal-sub">每个学段学科独立核算知识网与双轨 Elo；顶栏下拉框切换当前学段。</p>
+      <div class="settings-list" id="settings-list"></div>
+      <div class="settings-add">
+        <input type="text" id="settings-new-name" placeholder="如：小学奥数 / 高中物理-高二"
+               aria-label="新学段学科名称" />
+        <button class="btn btn-primary" type="button" data-action="settings-add">添加</button>
+      </div>
+      <div class="modal-foot">
+        <span class="field-help">条目下有题目时禁止删除（需先清理题目）；重命名会级联改标全部相关记录。</span>
+        <button class="btn btn-sm btn-ghost" type="button" data-action="close-settings">关闭</button>
+      </div>
+    </div>
   </div>
 
   <script type="module" src="./app.js"></script>

@@ -17,6 +17,9 @@ const API = '/api/v1';
 const MARKED_CDN = 'https://cdn.jsdelivr.net/npm/marked@12.0.2/lib/marked.esm.js';
 const LS_SESSION = 'shuati:session:v1';
 const LS_THEME = 'shuati:theme';
+// P10-F：当前激活学段学科（per-browser；条目本体在服务端 grade_subjects 表）
+const LS_GRADE = 'shuati_grade_subject';
+const GRADE_EMPTY_HINT = '请先在 ⚙️ 设置中创建学段学科';
 
 const STAGE_LABELS = {
   STAGE_0_CONFIRM_GATE: '确认门禁',
@@ -76,6 +79,10 @@ const ESCROW_META = {
 const state = {
   tab: 'ingest',
   marked: null,
+  // 学段学科分区（P10-F）：当前激活项 / 条目列表 / 当前训练会话所属学段
+  gradeSubject: '',
+  gradeOptions: [],
+  sessionGrade: null,
   // 录入
   previewOn: false,
   lastMastered: null,    // P7-B：已掌握成功卡对应的 GateCardDTO（marked 就绪后重渲染）
@@ -87,6 +94,7 @@ const state = {
   gateCategory: 'CONCEPT_BOTTLENECK',
   gateConfirmed: false,
   gateParams: null,      // {session_id, stalled_step_index, error_category}
+  gateGrade: null,       // P10-F：确认卡所属学段（会话归属以它为准，不随顶栏切换改标）
   // 训练
   session: null,         // SessionStepResponse
   feedback: null,        // 提交后同阶段停留的反馈
@@ -356,6 +364,11 @@ function errorMessage(err) {
   }
   return `前端异常：${err && err.message ? err.message : String(err)}`;
 }
+/** 后端 detail 原文（设置类操作 toast 用：409 含题目计数，不加前缀）。 */
+function apiDetail(err) {
+  if (err instanceof ApiError) return err.message || `HTTP ${err.status}`;
+  return err && err.message ? String(err.message) : String(err);
+}
 
 function showRetryBar(err, retryFn) {
   state.lastRetry = retryFn || null;
@@ -418,6 +431,239 @@ function initTheme() {
   try { saved = localStorage.getItem(LS_THEME); } catch { /* ignore */ }
   const prefer = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
   applyTheme(saved === 'dark' || saved === 'light' ? saved : prefer);
+}
+
+/* ================================================================
+ * ⓪ 学段学科分区（P10-F）：顶栏下拉框 + ⚙️ 设置弹窗
+ * 所有 scoped 数据（知识网 / 双轨 Elo / 每日盲测 / 训练会话）均按激活学段隔离。
+ * ================================================================ */
+/** 学段引导文案（无条目时各个 scoped 视图统一渲染）。 */
+function gradeHintHtml(icon) {
+  return `
+    <div class="card empty-state">
+      <div class="big" aria-hidden="true">${icon || '🎓'}</div>
+      <h3>尚未创建学段学科</h3>
+      <p>${esc(GRADE_EMPTY_HINT)}，创建后在顶栏下拉框选择当前学段，本页数据即按学段独立核算。</p>
+      <button class="btn btn-primary" type="button" data-action="open-settings">⚙️ 打开学段学科设置</button>
+    </div>`;
+}
+
+/** 当前学段的查询串后缀（scoped 请求统一拼接）。 */
+function gradeQuery(sep = '?') {
+  return `${sep}grade_subject=${encodeURIComponent(state.gradeSubject)}`;
+}
+
+/** 无激活学段时：三个 scoped 页签均置为引导态（初次加载用）。 */
+function renderGradeHints() {
+  const targets = [['drill-root', '🎯'], ['graph-root', '🕸️'], ['elo-root', '📈']];
+  for (const [id, icon] of targets) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = gradeHintHtml(icon);
+  }
+}
+
+/** GET /settings/grade-subjects → state.gradeOptions（失败不抛出，调用方决定提示）。 */
+async function fetchGradeOptions() {
+  const raw = await apiFetch(`${API}/settings/grade-subjects`);
+  state.gradeOptions = asArray(raw)
+    .map((it) => ({
+      grade_subject: String(pick(it, 'grade_subject') || '').trim(),
+      question_count: Number(pick(it, 'question_count') ?? 0) || 0,
+      created_at: pick(it, 'created_at') || '',
+    }))
+    .filter((it) => it.grade_subject);
+  return state.gradeOptions;
+}
+
+/** 把 state.gradeOptions + state.gradeSubject 同步到顶栏下拉框。 */
+function syncGradeSelect() {
+  const sel = $('#grade-select');
+  if (!sel) return;
+  const names = state.gradeOptions.map((it) => it.grade_subject);
+  if (state.gradeSubject && !names.includes(state.gradeSubject)) names.unshift(state.gradeSubject);
+  if (!names.length) {
+    sel.innerHTML = '<option value="">（无学段条目）</option>';
+    sel.value = '';
+    return;
+  }
+  sel.innerHTML = names
+    .map((n) => `<option value="${esc(n)}"${n === state.gradeSubject ? ' selected' : ''}>${esc(n)}</option>`)
+    .join('');
+  sel.value = state.gradeSubject || names[0];
+}
+
+/** 启动时加载条目并恢复激活学段（LS 值∈列表则用，否则取首项，无条目则 ''）。 */
+async function loadGradeOptions() {
+  try {
+    await fetchGradeOptions();
+  } catch (err) {
+    state.gradeOptions = [];
+    toast(`学段学科条目加载失败：${errorMessage(err)}`, 'warn', 5000);
+  }
+  let saved = '';
+  try { saved = localStorage.getItem(LS_GRADE) || ''; } catch { /* 隐私模式忽略 */ }
+  const names = state.gradeOptions.map((it) => it.grade_subject);
+  state.gradeSubject = names.includes(saved) ? saved : (names[0] || '');
+  try { localStorage.setItem(LS_GRADE, state.gradeSubject); } catch { /* ignore */ }
+  syncGradeSelect();
+  return state.gradeSubject;
+}
+
+/** 学段切换：写 LS + 重置全部 scoped 状态 + 按当前页签重新懒加载。 */
+function changeGrade(next) {
+  const g = String(next == null ? '' : next);
+  if (g === state.gradeSubject) { syncGradeSelect(); return; }
+  state.gradeSubject = g;
+  try { localStorage.setItem(LS_GRADE, g); } catch { /* ignore */ }
+  syncGradeSelect();
+  // 清空 scoped 缓存（避免旧学段数据残留在视图里）
+  state.graph = null;
+  state.graphLoaded = false;
+  state.elo = null;
+  state.eloLoaded = false;
+  state.eloModule = '';
+  state.eloModuleOptions = [];
+  state.drill.items = [];
+  state.drill.outcomes = {};
+  state.drill.loaded = false;
+  for (const id of ['drill-root', 'graph-root', 'elo-root']) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '';
+  }
+  stopPrewarmPoll();
+  // 训练会话属于具体学段：切走即隐藏（服务端会话不动，切回可续）
+  if (state.session && state.sessionGrade !== g) {
+    state.session = null;
+    state.feedback = null;
+  }
+  renderTraining();
+  renderResumeBanner();
+  // 按当前页签重新懒加载（学段已就绪）
+  if (state.tab === 'drill') loadDrill();
+  else if (state.tab === 'graph') loadGraph();
+  else if (state.tab === 'elo') loadElo();
+}
+
+/* ---------------- ⚙️ 设置弹窗：条目增 / 改名 / 删 ---------------- */
+function renderSettingsList() {
+  const box = $('#settings-list');
+  if (!box) return;
+  const items = state.gradeOptions;
+  if (!items.length) {
+    box.innerHTML = `
+      <div class="settings-empty">
+        还没有学段学科条目。在下方输入名称（如「高中物理-高二」）后点击「添加」即可创建。<br />
+        首次运行会自动收录库内已有题目所属的学段。
+      </div>`;
+    return;
+  }
+  box.innerHTML = items.map((it) => {
+    const name = it.grade_subject;
+    const count = Number(it.question_count || 0);
+    const active = name === state.gradeSubject;
+    return `
+      <div class="settings-row${active ? ' is-active' : ''}" data-name="${esc(name)}">
+        <span class="settings-name">${esc(name)}</span>
+        ${active ? '<span class="badge badge-blue">当前</span>' : ''}
+        <span class="badge ${count ? 'badge-gray' : 'badge-green'}">${count} 题</span>
+        <span class="spacer"></span>
+        <button class="btn btn-sm btn-ghost" type="button" data-action="settings-rename"
+                data-name="${esc(name)}" title="重命名" aria-label="重命名 ${esc(name)}">✏️</button>
+        <button class="btn btn-sm btn-ghost" type="button" data-action="settings-delete"
+                data-name="${esc(name)}" title="删除" aria-label="删除 ${esc(name)}">🗑</button>
+      </div>`;
+  }).join('');
+}
+
+function openSettings() {
+  const modal = $('#settings-modal');
+  if (!modal) return;
+  modal.hidden = false;
+  renderSettingsList();
+  fetchGradeOptions()
+    .then(() => { syncGradeSelect(); renderSettingsList(); })
+    .catch((err) => toast(`条目刷新失败：${apiDetail(err)}`, 'err', 5000));
+  const input = $('#settings-new-name');
+  if (input) setTimeout(() => input.focus(), 30);
+}
+
+function closeSettings() {
+  const modal = $('#settings-modal');
+  if (!modal) return;
+  modal.hidden = true;
+}
+
+async function addGradeSubject(btn) {
+  const input = $('#settings-new-name');
+  const name = (input ? input.value : '').trim();
+  if (!name) { toast('请先输入学段学科名称', 'warn'); if (input) input.focus(); return; }
+  await runTask(btn, async () => {
+    try {
+      const resp = await apiFetch(`${API}/settings/grade-subjects`, {
+        method: 'POST', json: { grade_subject: name },
+      });
+      const created = Boolean(resp && resp.created);
+      toast(created ? `✅ 已创建学段学科「${name}」` : `ℹ️ 学段学科「${name}」已存在（幂等）`, created ? 'ok' : 'info');
+      if (input) input.value = '';
+      await fetchGradeOptions();
+      if (!state.gradeSubject && state.gradeOptions.length) {
+        // 之前没有任何激活学段（首次运行 / 删空后）：落到首项，与 loadGradeOptions 的回退语义一致
+        changeGrade(state.gradeOptions[0].grade_subject);
+      } else {
+        syncGradeSelect(); // 已有激活项时绝不自动切换
+      }
+      renderSettingsList();
+    } catch (err) {
+      toast(apiDetail(err), 'err', 6000);
+    }
+  });
+}
+
+async function renameGradeSubject(btn, old) {
+  if (!old) return;
+  const input = window.prompt('新名称', old);
+  if (input == null) return;
+  const newName = String(input).trim();
+  if (!newName || newName === old) return;
+  await runTask(btn, async () => {
+    try {
+      const resp = await apiFetch(`${API}/settings/grade-subjects/${encodeURIComponent(old)}`, {
+        method: 'PATCH', json: { new_name: newName },
+      });
+      const renamed = (resp && resp.renamed) || newName;
+      const affected = (resp && resp.affected) || {};
+      const total = Object.values(affected).reduce((acc, v) => acc + (Number(v) || 0), 0);
+      toast(`✏️ 已重命名为「${renamed}」（级联改标 ${total} 行）`, 'ok');
+      await fetchGradeOptions();
+      if (old === state.gradeSubject) changeGrade(renamed);
+      else syncGradeSelect();
+      renderSettingsList();
+    } catch (err) {
+      toast(apiDetail(err), 'err', 6000);
+    }
+  });
+}
+
+async function deleteGradeSubject(btn, name) {
+  if (!name) return;
+  const ok = window.confirm(
+    `确认删除学段学科「${name}」？\n\n仅当该学段下没有任何题目时可删除；相关节点 / 账本 / 标红边记录会一并清理。`
+  );
+  if (!ok) return;
+  await runTask(btn, async () => {
+    try {
+      await apiFetch(`${API}/settings/grade-subjects/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      toast(`🗑 已删除学段学科「${name}」`, 'ok');
+      const wasActive = name === state.gradeSubject;
+      await fetchGradeOptions();
+      if (wasActive) changeGrade((state.gradeOptions[0] && state.gradeOptions[0].grade_subject) || '');
+      else syncGradeSelect();
+      renderSettingsList();
+    } catch (err) {
+      // 409（有题目禁止删除）/ 400：保持弹窗打开，toast 后端 detail（含题目计数）
+      toast(apiDetail(err), 'err', 7000);
+    }
+  });
 }
 
 /* ================================================================
@@ -533,12 +779,18 @@ function togglePreview() {
 
 async function submitIngest(btn) {
   const stemMd = $('#stem-input').value.trim();
-  const grade = $('#grade-input').value.trim() || '未指定学段';
+  const grade = state.gradeSubject;
   const errEl = $('#ingest-error');
   errEl.hidden = true;
   if (!stemMd && !state.slots.stem.length) {
     errEl.textContent = '请粘贴题干文本，或在「题干与配图槽」上传原题截图后再提交。';
     errEl.hidden = false;
+    return;
+  }
+  // P10-F：学段归属随顶栏全局选择；无条目时先引导创建，不发请求
+  if (!grade) {
+    toast(`${GRADE_EMPTY_HINT}，再提交入库`, 'warn', 4200);
+    openSettings();
     return;
   }
   const userAnswer = $('#ingest-answer').value.trim();
@@ -567,6 +819,8 @@ async function submitIngest(btn) {
     state.lastMastered = null;
     state.gate = dto;
     state.gateConfirmed = false;
+    state.gateGrade = state.gradeSubject; // 确认卡属于录入时的学段
+    state.sessionGrade = state.gradeSubject; // 会话归属当前学段（LS_SESSION 续传校验用）
     const blocked = (dto.steps || []).find((s) => s.status === 'blocked');
     state.gateSel = blocked ? blocked.step_index : Math.max(1, (dto.steps || []).length);
     state.gateCategory = dto.error_category || 'CONCEPT_BOTTLENECK';
@@ -640,8 +894,6 @@ function resetIngestForm() {
   const chk = $('#mastered-check');
   if (chk) chk.checked = false;
   syncMasteredCheck();
-  const grade = $('#grade-input');
-  if (grade) grade.value = grade.defaultValue;
   for (const key of ['stem', 'draft']) {
     for (const f of state.slots[key]) URL.revokeObjectURL(f.url);
     state.slots[key] = [];
@@ -651,6 +903,7 @@ function resetIngestForm() {
   if (errEl) errEl.hidden = true;
   state.gate = null;
   state.gateConfirmed = false;
+  state.gateGrade = null;
   state.lastMastered = null;
   $('#gate-slot').innerHTML = `
     <div class="card empty-state">
@@ -757,6 +1010,8 @@ async function confirmGate(btn) {
     state.gateParams = params;
     state.gateConfirmed = true;
     state.session = resp;
+    // P10-F：会话所属学段取确认卡录入时的学段（用户可能中途切过顶栏下拉框）
+    state.sessionGrade = state.gateGrade || state.gradeSubject;
     state.feedback = null;
     persistSession();
     renderGate();
@@ -768,7 +1023,12 @@ async function confirmGate(btn) {
 
 /* 回车确认门禁：仅在录入页、确认卡可见、焦点不在可编辑控件时生效 */
 function onGlobalKeydown(e) {
-  if (e.key === 'Escape') { closeLightbox(); return; }
+  if (e.key === 'Escape') {
+    const modal = $('#settings-modal');
+    if (modal && !modal.hidden) { closeSettings(); return; }
+    closeLightbox();
+    return;
+  }
   if (e.key !== 'Enter' || e.isComposing || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
   if (state.tab !== 'ingest' || !state.gate || state.gateConfirmed) return;
   if (!(e.target instanceof Element) || isEditable(e.target) || e.target.closest('button')) return;
@@ -787,6 +1047,7 @@ function persistSession() {
     if (state.session) {
       localStorage.setItem(LS_SESSION, JSON.stringify({
         resp: state.session, gateParams: state.gateParams, savedAt: Date.now(),
+        grade: state.gradeSubject, // P10-F：续传横幅按学段匹配
       }));
     } else {
       localStorage.removeItem(LS_SESSION);
@@ -803,10 +1064,23 @@ function loadPersistedSession() {
   return null;
 }
 
+/** P10-F：历史 payload（P10-F 之前写入，无 grade 字段）→ 兼容显示。 */
+function persistedMatchesGrade(persisted) {
+  if (!persisted) return false;
+  const g = persisted.grade;
+  if (g == null || g === '') return true; // legacy 兼容
+  return g === state.gradeSubject;
+}
+
 function renderResumeBanner() {
   const slot = $('#resume-slot');
   const persisted = loadPersistedSession();
-  const sess = state.session || (persisted && persisted.resp);
+  let sess = null;
+  if (state.session && state.sessionGrade === state.gradeSubject) {
+    sess = state.session;
+  } else if (persistedMatchesGrade(persisted)) {
+    sess = persisted.resp;
+  }
   if (!sess || sess.micro_stage === 'SESSION_COMPLETED') { slot.innerHTML = ''; return; }
   slot.innerHTML = `
     <div class="resume-banner">
@@ -1230,8 +1504,17 @@ function normalizeDrillItems(raw) {
 async function loadDrill(btn) {
   const dateInput = $('#drill-date');
   if (dateInput && dateInput.value) state.drill.date = dateInput.value;
+  if (!state.gradeSubject) { // 无激活学段：不发请求，渲染引导文案
+    state.drill.items = [];
+    state.drill.outcomes = {};
+    state.drill.loaded = false;
+    renderDrill();
+    return;
+  }
   await runTask(btn || null, async () => {
-    const raw = await apiFetch(`${API}/drills/daily?active_date=${encodeURIComponent(state.drill.date)}`);
+    const raw = await apiFetch(
+      `${API}/drills/daily?active_date=${encodeURIComponent(state.drill.date)}${gradeQuery('&')}`
+    );
     state.drill.items = normalizeDrillItems(raw);
     state.drill.outcomes = {};
     state.drill.loaded = true;
@@ -1321,6 +1604,7 @@ function drillCardHtml(item, idx) {
 
 function renderDrill() {
   const root = $('#drill-root');
+  if (!state.gradeSubject) { root.innerHTML = gradeHintHtml('🎯'); return; }
   const { items, outcomes } = state.drill;
   if (!items.length) {
     root.innerHTML = `
@@ -1379,6 +1663,7 @@ async function openRetrainSession(btn, sessionId) {
     state.session = next;
     state.gateParams = null;
     state.feedback = null;
+    state.sessionGrade = state.gradeSubject;
     persistSession();
     switchTab('training');
     if (next && (next.prewarm_status === 'RUNNING' || next.prewarm_status === 'IDLE')) {
@@ -1515,6 +1800,7 @@ function gaugeSvg(pct) {
 
 function renderGraph() {
   const root = $('#graph-root');
+  if (!state.gradeSubject) { root.innerHTML = gradeHintHtml('🕸️'); return; }
   const g = state.graph;
   if (!g) { root.innerHTML = ''; return; }
   const treeHtml = g.tree.length ? g.tree.map((m, mi) => {
@@ -1616,8 +1902,14 @@ function renderGraph() {
 }
 
 async function loadGraph(btn) {
+  if (!state.gradeSubject) { // 无激活学段：不发请求，渲染引导文案
+    state.graph = null;
+    state.graphLoaded = false;
+    renderGraph();
+    return;
+  }
   await runTask(btn || null, async () => {
-    const graphRaw = await apiFetch(`${API}/knowledge-graph`);
+    const graphRaw = await apiFetch(`${API}/knowledge-graph${gradeQuery()}`);
     state.graph = normalizeGraph(graphRaw);
     state.graphLoaded = true;
     renderGraph();
@@ -1632,7 +1924,7 @@ async function unmergeBatch(btn, batchId) {
   await runTask(btn, async () => {
     await apiFetch(`${API}/knowledge-graph/compaction/${encodeURIComponent(batchId)}/revert`, { method: 'POST' });
     toast('↩️ Un-merge 完成：已精确恢复至合并前快照', 'ok');
-    const graphRaw = await apiFetch(`${API}/knowledge-graph`);
+    const graphRaw = await apiFetch(`${API}/knowledge-graph${gradeQuery()}`);
     state.graph = normalizeGraph(graphRaw);
     renderGraph();
   });
@@ -1743,8 +2035,16 @@ function eloChartSvg(mod) {
 }
 
 async function loadElo(btn) {
+  if (!state.gradeSubject) { // 无激活学段：不发请求，渲染引导文案
+    state.elo = null;
+    state.eloLoaded = false;
+    renderElo();
+    return;
+  }
   await runTask(btn || null, async () => {
-    const eloRaw = await apiFetch(`${API}/elo/ledger${state.eloModule ? `?l1_module=${encodeURIComponent(state.eloModule)}` : ''}`);
+    const eloRaw = await apiFetch(
+      `${API}/elo/ledger${gradeQuery()}${state.eloModule ? `&l1_module=${encodeURIComponent(state.eloModule)}` : ''}`
+    );
     state.elo = normalizeElo(eloRaw);
     if (!state.eloModule && state.elo.modules.length) {
       state.eloModuleOptions = state.elo.modules.map((m) => m.l1);
@@ -1756,6 +2056,7 @@ async function loadElo(btn) {
 
 function renderElo() {
   const root = $('#elo-root');
+  if (!state.gradeSubject) { root.innerHTML = gradeHintHtml('📈'); return; }
   const elo = state.elo;
   if (!elo) { root.innerHTML = ''; return; }
   const options = state.eloModuleOptions.length ? state.eloModuleOptions : elo.modules.map((m) => m.l1);
@@ -1766,7 +2067,7 @@ function renderElo() {
         <option value="" ${state.eloModule === '' ? 'selected' : ''}>全部模块</option>
         ${options.map((m) => `<option value="${esc(m)}" ${state.eloModule === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}
       </select>
-      <span class="field-help">GET /elo/ledger${state.eloModule ? `?l1_module=${esc(state.eloModule)}` : ''}</span>
+      <span class="field-help">GET /elo/ledger?grade_subject=${esc(state.gradeSubject)}${state.eloModule ? `&l1_module=${esc(state.eloModule)}` : ''}</span>
     </div>`;
   const cards = elo.modules.length ? elo.modules.map((mod) => {
     const water = Math.max(0, mod.cov - mod.combat);
@@ -1864,6 +2165,11 @@ function onDocumentClick(e) {
     case 'toggle-theme':
       applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
       break;
+    case 'open-settings': openSettings(); break;
+    case 'close-settings': closeSettings(); break;
+    case 'settings-add': addGradeSubject(el); break;
+    case 'settings-rename': renameGradeSubject(el, el.dataset.name); break;
+    case 'settings-delete': deleteGradeSubject(el, el.dataset.name); break;
     case 'retry-last': {
       const fn = state.lastRetry;
       hideRetryBar();
@@ -1896,7 +2202,15 @@ function onDocumentClick(e) {
     case 'resume-training': {
       if (!state.session) {
         const persisted = loadPersistedSession();
-        if (persisted) { state.session = persisted.resp; state.gateParams = persisted.gateParams || null; }
+        if (persisted) {
+          state.session = persisted.resp;
+          state.gateParams = persisted.gateParams || null;
+          // P10-F：legacy payload 无 grade → 归当前学段
+          state.sessionGrade = persisted.grade == null || persisted.grade === ''
+            ? state.gradeSubject : persisted.grade;
+        }
+      } else if (state.sessionGrade == null) {
+        state.sessionGrade = state.gradeSubject;
       }
       switchTab('training');
       refreshSessionFromServer();
@@ -1906,6 +2220,7 @@ function onDocumentClick(e) {
       stopPrewarmPoll();
       state.session = null;
       state.gateParams = null;
+      state.sessionGrade = null;
       persistSession();
       renderResumeBanner();
       renderTraining();
@@ -1966,13 +2281,24 @@ function bindStaticEvents() {
     loadDrill();
   });
 
-  // Elo 模块过滤（select 用 change 事件）
+  // Elo 模块过滤 / 学段切换（select 用 change 事件）
   document.addEventListener('change', (e) => {
-    if (e.target && e.target.id === 'elo-module-select') {
+    if (!e.target) return;
+    if (e.target.id === 'elo-module-select') {
       state.eloModule = e.target.value || '';
       loadElo();
+    } else if (e.target.id === 'grade-select') {
+      changeGrade(e.target.value || '');
     }
   });
+
+  // ⚙️ 设置弹窗：点击遮罩自身关闭（点卡片内部不关闭）
+  const settingsModal = $('#settings-modal');
+  if (settingsModal) {
+    settingsModal.addEventListener('click', (e) => {
+      if (e.target === settingsModal) closeSettings();
+    });
+  }
 
   // 全局 paste 路由：焦点不在槽内/可编辑控件时，路由到最后聚焦的槽（严格不混槽）
   document.addEventListener('paste', (e) => {
@@ -2012,14 +2338,17 @@ async function loadMarked() {
   }
 }
 
-function init() {
+async function init() {
   initTheme();
   setupSlot('stem');
   setupSlot('draft');
   bindStaticEvents();
   syncMasteredCheck();
+  // P10-F：学段学科先就绪，再做任何 scoped 视图/请求（否则 grade_subject 缺失 → 422）
+  await loadGradeOptions();
   renderResumeBanner();
   renderTraining();
+  if (!state.gradeSubject) renderGradeHints();
   loadMarked().then(() => {
     // marked 就绪后刷新已渲染的富文本区域（当前可见视图）
     if (state.previewOn) {
