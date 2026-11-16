@@ -14,14 +14,14 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232743a6'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='white' font-family='Georgia'%3E%E2%88%91%3C/text%3E%3C/svg%3E" />
 </head>
 <body>
-  <!-- ======= 顶栏：品牌 + 四大视图页签 ======= -->
+  <!-- ======= 顶栏：品牌 + 五大视图页签 ======= -->
   <header class="topbar">
     <div class="brand" aria-label="刷题 Harness">
       <span class="sigma" aria-hidden="true">∑</span>
       刷题 Harness
       <small>LOCAL · ADAPTIVE</small>
     </div>
-    <nav class="tabs" role="tablist" aria-label="四大视图">
+    <nav class="tabs" role="tablist" aria-label="五大视图">
       <button class="tab-btn" role="tab" id="tab-ingest" data-tab="ingest"
               aria-selected="true" aria-controls="view-ingest">📥 录入</button>
       <button class="tab-btn" role="tab" id="tab-training" data-tab="training"
@@ -29,7 +29,8 @@
       <button class="tab-btn" role="tab" id="tab-drill" data-tab="drill"
               aria-selected="false" aria-controls="view-drill">🎯 每日盲测</button>
       <button class="tab-btn" role="tab" id="tab-graph" data-tab="graph"
-              aria-selected="false" aria-controls="view-graph">🕸️ 知识网 · Elo</button>
+              aria-selected="false" aria-controls="view-graph">🕸️ 知识网</button>
+      <button class="tab-btn" role="tab" id="tab-elo" data-tab="elo" aria-selected="false" aria-controls="view-elo">📈 双轨 Elo</button>
     </nav>
     <div class="topbar-right">
       <button class="icon-btn" id="theme-toggle" data-action="toggle-theme"
@@ -165,20 +166,31 @@
       <div id="drill-root"></div>
     </section>
 
-    <!-- ======= ④ 知识网与 Elo 看板（CUJ 4） ======= -->
+    <!-- ======= ④ 知识网看板（CUJ 4） ======= -->
     <section class="view" id="view-graph" role="tabpanel" aria-labelledby="tab-graph" hidden>
       <div class="view-head">
-        <h1>三层知识网 · 双轨 Elo 看板</h1>
-        <p class="sub">L1 模块 / L2 实体定理 / L3 原子算子 · 同域并查集 Compaction 可一键回滚 · 覆盖分与实战分水分区可视化</p>
+        <h1>三层知识网看板</h1>
+        <p class="sub">L1 模块 / L2 实体定理 / L3 原子算子 · 同域并查集 Compaction 可一键回滚</p>
       </div>
       <div class="btn-row" style="margin-bottom:16px">
-        <button class="btn" type="button" data-action="graph-refresh">🔄 刷新知识网与账本</button>
+        <button class="btn" type="button" data-action="graph-refresh">🔄 刷新知识网</button>
         <span class="chip">🔴 攻坚中</span>
         <span class="chip">🟡 待复测</span>
         <span class="chip">🟢 已掌握</span>
       </div>
       <div id="graph-root"></div>
-      <div id="elo-root" style="margin-top:18px"></div>
+    </section>
+
+    <!-- ======= ⑤ 双轨 Elo 看板（P9-D：自知识网页签拆出，独立懒加载） ======= -->
+    <section class="view" id="view-elo" role="tabpanel" aria-labelledby="tab-elo" hidden>
+      <div class="view-head">
+        <h1>双轨 Elo 看板</h1>
+        <p class="sub">按 L1 模块独立核算 · 覆盖分 / 实战分水分区可视化 · Escrow 待兑现明细 · 事件溯源账本解释</p>
+      </div>
+      <div class="btn-row" style="margin-bottom:16px">
+        <button class="btn" type="button" data-action="elo-refresh">🔄 刷新 Elo 账本</button>
+      </div>
+      <div id="elo-root"></div>
     </section>
   </main>
 

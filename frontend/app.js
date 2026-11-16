@@ -99,6 +99,7 @@ const state = {
   eloModule: '',
   eloModuleOptions: [],
   graphLoaded: false,
+  eloLoaded: false,
   redEdgesCollapsed: true, // P9-C：跨考点标红边列表默认折叠（仅内存态，刷新/切页签保持，不持久化）
   // 重试条
   lastRetry: null,
@@ -401,7 +402,8 @@ function switchTab(name) {
   $$('.view').forEach((v) => { v.hidden = v.id !== `view-${name}`; });
   if (name === 'training') renderTraining();
   if (name === 'drill' && !state.drill.loaded) loadDrill();
-  if (name === 'graph' && !state.graphLoaded) { state.graphLoaded = true; loadGraphAndElo(); }
+  if (name === 'graph' && !state.graphLoaded) { state.graphLoaded = true; loadGraph(); }
+  if (name === 'elo' && !state.eloLoaded) { state.eloLoaded = true; loadElo(); }
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -1613,20 +1615,12 @@ function renderGraph() {
   </div>`;
 }
 
-async function loadGraphAndElo(btn) {
+async function loadGraph(btn) {
   await runTask(btn || null, async () => {
-    const [graphRaw, eloRaw] = await Promise.all([
-      apiFetch(`${API}/knowledge-graph`),
-      apiFetch(`${API}/elo/ledger${state.eloModule ? `?l1_module=${encodeURIComponent(state.eloModule)}` : ''}`),
-    ]);
+    const graphRaw = await apiFetch(`${API}/knowledge-graph`);
     state.graph = normalizeGraph(graphRaw);
-    state.elo = normalizeElo(eloRaw);
-    if (!state.eloModule && state.elo.modules.length) {
-      state.eloModuleOptions = state.elo.modules.map((m) => m.l1);
-    }
     state.graphLoaded = true;
     renderGraph();
-    renderElo();
   });
 }
 
@@ -1746,6 +1740,18 @@ function eloChartSvg(mod) {
     <text x="${padL}" y="${H - 8}" font-size="10" fill="var(--ink-faint)" style="font-family:var(--font-mono)">#${pts[0].event_id}</text>
     <text x="${W - padR}" y="${H - 8}" text-anchor="end" font-size="10" fill="var(--ink-faint)" style="font-family:var(--font-mono)">#${last.event_id}（event_id）</text>
   </svg>`;
+}
+
+async function loadElo(btn) {
+  await runTask(btn || null, async () => {
+    const eloRaw = await apiFetch(`${API}/elo/ledger${state.eloModule ? `?l1_module=${encodeURIComponent(state.eloModule)}` : ''}`);
+    state.elo = normalizeElo(eloRaw);
+    if (!state.eloModule && state.elo.modules.length) {
+      state.eloModuleOptions = state.elo.modules.map((m) => m.l1);
+    }
+    state.eloLoaded = true;
+    renderElo();
+  });
 }
 
 function renderElo() {
@@ -1923,7 +1929,8 @@ function onDocumentClick(e) {
     case 'drill-refresh': loadDrill(el); break;
     case 'drill-submit': submitDrill(el, el.dataset.uid); break;
     case 'drill-retrain': openRetrainSession(el, el.dataset.session); break;
-    case 'graph-refresh': loadGraphAndElo(el); break;
+    case 'graph-refresh': loadGraph(el); break;
+    case 'elo-refresh': loadElo(el); break;
     case 'toggle-red-edges': {
       // P9-C：原地切换折叠态（不整卡重渲染，避免滚动跳动）
       state.redEdgesCollapsed = !state.redEdgesCollapsed;
@@ -1963,7 +1970,7 @@ function bindStaticEvents() {
   document.addEventListener('change', (e) => {
     if (e.target && e.target.id === 'elo-module-select') {
       state.eloModule = e.target.value || '';
-      loadGraphAndElo();
+      loadElo();
     }
   });
 
@@ -2023,7 +2030,8 @@ function init() {
     if (state.gate) renderGate();
     if (state.tab === 'training') renderTraining();
     if (state.tab === 'drill' && state.drill.loaded) renderDrill();
-    if (state.tab === 'graph' && state.graphLoaded) { renderGraph(); renderElo(); }
+    if (state.tab === 'graph' && state.graphLoaded) renderGraph();
+    if (state.tab === 'elo' && state.eloLoaded) renderElo();
   });
 }
 
