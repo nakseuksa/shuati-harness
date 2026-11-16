@@ -227,3 +227,4 @@ flowchart LR
 | 2026-11-16 | P9-B 验收交付（1af3051）：全量门禁 912 测试/96.97%，真实用例 11/11（真实题答案回归+仿真题结构消元+LaTeX+红线） | 期望演进 1 条：x**2 vs x False→True（x²=0 与 x=0 解集同为 {0}，严格语义数学正当）；x=2;y=3 vs x=2 仍 False 仅注释更新；注释日期 01-14→01-16 修正 |
 | 2026-11-16 | 用户 UI 需求两项：①标红边列表折叠（P9-C）②Elo 看板拆独立同级页签（P9-D） | P9-C 交付并验收（076613e）：默认折叠+统计徽章+原地切换，.edge-list[hidden] 陷阱已处理，worker 离线 vm 29 断言+PM diff 审查；P9-D 待 P9-C 提交后串行派发（app.js 所有权互斥） |
 | 2026-11-16 | P9-D 派发：双轨 Elo 看板拆为独立页签「📈 双轨 Elo」 | loadGraphAndElo 拆 loadGraph/loadElo 独立懒加载；模块过滤只刷 Elo；renderElo 内容不动 |
+| 2026-11-16 | P9-D 验收交付：diff 审查与契约一致 + 本地服务冒烟（五页签↔五视图 aria 配对、elo-root 唯一、双 API 200、零残留） | unmergeBatch 本就只刷图（Elo 正交）无需改；styles.css 零改动；前端五页签各自独立懒加载；本轮全部需求（backlog 三项 + UI 两项）交付完毕 |
