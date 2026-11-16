@@ -1,6 +1,6 @@
 # 项目状态与交接备忘录（HANDOFF）
 
-**更新**: 2026-11-14 会话（P8 状态补记 + 小项 backlog 清理启动）
+**更新**: 2026-11-16 会话（P8 状态补记 + 小项 backlog 清理启动）
 **用途**: 新会话记忆入口。开始工作前先读本文件。
 
 ## 一、项目概况
@@ -16,7 +16,7 @@
 
 - 设计全部功能已交付（M1~M4）+ 交付后 7 轮增强/修复（P5~P8，见第七节提交链）
 - **P8（Review 修复，7 份契约）已实施并提交**（`0d0d1a2`，22 文件 +1571 行）：测试日志隔离 / 前后端契约断链（对比卡解包、force 换题、SKIP、escrow 徽章、L≥2 列式骨架）/ 图谱 O(N·M) 消除 + 0-merge 水位线 + compaction 异步化 + httpx 连接池复用 / 录入不跨网络持写锁 + 双盲并发 + 共享母题升层歧义 / XSS·路径穿越·解压炸弹·上传限额·VLM 钳制 / 盲测重训入口+预热·LaTeX 扩展 / 中文「标签+数值」答案等价
-- 最新 commit: `0d0d1a2`；**871 测试全绿，覆盖率 96.96%**（2026-11-14 PM 独立复跑核验），ruff/mypy 零告警；唯一 warning 为第三方 starlette testclient 弃用提示（非本项目代码）
+- 最新 commit: `0d0d1a2`；**871 测试全绿，覆盖率 96.96%**（2026-11-16 PM 独立复跑核验），ruff/mypy 零告警；唯一 warning 为第三方 starlette testclient 弃用提示（非本项目代码）
 - 服务由用户以开发模式自管: `uvicorn --reload`（127.0.0.1:8000）；若未运行需手动启动
 - **真实网关已配置**（`.env`，已 gitignore）:
   - `LLM_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`（来源: pi `models.json` 真实 provider 配置，非代理）
@@ -68,9 +68,10 @@ nohup .venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8000 > /tmp/har
 - [ ] 重入库卡 `auto_mastered` 恒 False（零漂移决策）；如需回显掌握态属后续增量
 - [ ] Compaction 同秒平局以 uuid 决序（测试钉住时间戳）；方向不确定但无害
 - [ ] 多方程「消去中间变量比对解集」完全体延后（现为切分+逐方程等价）
-- [ ] 题目 `a01b47d7` 题干含「答：9小时36分」（用户粘贴时答案泄漏进题干，数据质量问题，未清理）
+- [x] 题目 `a01b47d7` 题干答案泄漏（2026-11-16 已清理；顺带发现并裁决同题双记录：删 MASTERED 重复记录 30c6afbd、账本重基，保留 a01b47d7 训练进度；注意无 frontmatter 重录干净正文仍会复活 30c6afbd）
 - [ ] 真实 VLM 转录/诊断质量待校准：建议 3~5 道真实错题（含真实手写照片）走查 CUJ1~3
 - [x] 前端「跳过」降级题 SKIP（P8-1B 已修复：二阶 fallback SKIP → 直回原题；四阶不可跳过仅换题）
+- [ ] 等价引擎解析链保留字母隐患（P9-B 发现，既有问题非本轮引入）：sympy parse_expr 默认命名空间保留 S/E/I/N/Q，物理题常用这些字母作符号（距离 S/能量 E/电流 I/支持力 N/电荷 Q）时无法解析为自由符号；改命名空间需独立设计裁决（E/I 数学语义冲突风险）
 - [ ] Future（设计 Future Improvements）: AnkiConnect 防坑闪卡同步、KST 日志校准（>300 题后）
 
 ## 七、今日提交链（2026-11-13）

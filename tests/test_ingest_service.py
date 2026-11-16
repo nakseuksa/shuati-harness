@@ -975,6 +975,163 @@ async def test_reimport_mastered_no_double_settlement(
     assert q["mastery_state"] == "MASTERED"
 
 
+# ---------------------------------------------------------------------------
+# P9-A：重入库已掌握题的掌握态回显（零 Elo 漂移）
+# ---------------------------------------------------------------------------
+
+
+async def test_reimport_mastered_echo_zero_drift(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P9-A：MASTERED 题同内容无草稿重入库 → 回显掌握态，账本/会话零漂移。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image], mastered_claim=True)
+    _assert_auto_mastered(tmp_db, first)
+    ledger_before = [dict(r) for r in _query(tmp_db, "SELECT * FROM elo_mutation_ledger")]
+    sessions_before = _count(tmp_db, "diagnostic_sessions")
+
+    with caplog.at_level(logging.INFO):
+        caplog.clear()
+        second = await _ingest(tmp_db, draft_images=[draft_image], mastered_claim=True)
+
+    assert second.auto_mastered is True
+    assert second.is_reimport is True
+    assert second.session_id == first.session_id
+    assert second.mastery_explanation is not None
+    assert "未重复结算" in second.mastery_explanation
+    # 回显解释条 = 固定前缀 + 最新账本解释条（首次录入的 MASTERED_INIT）
+    assert second.mastery_explanation == "幂等重入库，未重复结算。" + str(first.mastery_explanation)
+    assert second.steps and [s.status for s in second.steps] == ["completed"] * len(second.steps)
+    assert second.floor_preview_elo is None
+    # 零漂移：账本/会话行数与账本内容均不变，不新建会话、不改掌握态
+    assert _count(tmp_db, "elo_mutation_ledger") == len(ledger_before)
+    assert [dict(r) for r in _query(tmp_db, "SELECT * FROM elo_mutation_ledger")] == ledger_before
+    assert _count(tmp_db, "diagnostic_sessions") == sessions_before
+    assert _count(tmp_db, "question_escrow_pool") == 0
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["mastery_state"] == "MASTERED"
+    # 审计：ingest.reimport 事件携带 mastery_echoed=True
+    reimport = [
+        r for r in caplog.records if getattr(r, "event", None) == "ingest.reimport"
+    ]
+    assert len(reimport) == 1
+    assert getattr(reimport[0], "fields", {})["mastery_echoed"] is True
+
+
+async def test_reimport_mastered_stem_typo_fix_echo(
+    tmp_db: Path, cas_dir: Path, draft_image: Path
+) -> None:
+    """P9-A：MASTERED 题仅题干错别字修正重入库（stem_updated）→ 同样回显，零漂移。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image], mastered_claim=True)
+    _assert_auto_mastered(tmp_db, first)
+    uid = first.question_uid
+    old_hash = _query(tmp_db, "SELECT stem_hash FROM questions")[0]["stem_hash"]
+    ledger_n = _count(tmp_db, "elo_mutation_ledger")
+    sessions_n = _count(tmp_db, "diagnostic_sessions")
+
+    fixed_body = STEM_MD.replace("拱形桥", "拱桥")
+    assert fixed_body != STEM_MD
+    card = await _ingest(tmp_db, stem_md=_with_uid(uid, fixed_body))
+
+    assert card.auto_mastered is True
+    assert card.is_reimport is True
+    assert card.session_id == first.session_id
+    assert card.mastery_explanation is not None
+    assert "未重复结算" in card.mastery_explanation
+    assert [s.status for s in card.steps] == ["completed"] * len(card.steps)
+    assert card.floor_preview_elo is None
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["stem_hash"] != old_hash  # 题干哈希已更新
+    assert "拱桥" in q["stem_md"]
+    assert q["mastery_state"] == "MASTERED"
+    assert _count(tmp_db, "elo_mutation_ledger") == ledger_n
+    assert _count(tmp_db, "diagnostic_sessions") == sessions_n
+
+
+async def test_reimport_active_no_echo(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P9-A 回归：ACTIVE 题重入库不回显（auto_mastered=False），行为与现状一致。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image])
+    assert first.auto_mastered is False
+    with caplog.at_level(logging.INFO):
+        caplog.clear()
+        second = await _ingest(tmp_db, draft_images=[draft_image])
+    assert second.auto_mastered is False
+    assert second.mastery_explanation is None
+    assert second.is_reimport is True
+    assert second == first.model_copy(update={"is_reimport": True})
+    assert _count(tmp_db, "elo_mutation_ledger") == 0
+    reimport = [
+        r for r in caplog.records if getattr(r, "event", None) == "ingest.reimport"
+    ]
+    assert len(reimport) == 1
+    assert getattr(reimport[0], "fields", {})["mastery_echoed"] is False
+
+
+async def test_reimport_pending_retest_no_echo(
+    tmp_db: Path, cas_dir: Path, draft_image: Path
+) -> None:
+    """P9-A：PENDING_RETEST 题重入库不回显（仅 MASTERED 才回显）。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image])
+    uid = first.question_uid
+    with get_db_connection(tmp_db) as conn:
+        conn.execute(
+            "UPDATE questions SET mastery_state='PENDING_RETEST' WHERE question_uid=?",
+            (uid,),
+        )
+    second = await _ingest(tmp_db, draft_images=[draft_image])
+    assert second.auto_mastered is False
+    assert second.mastery_explanation is None
+    assert second.is_reimport is True
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["mastery_state"] == "PENDING_RETEST"  # 重入库不改掌握态
+    assert _count(tmp_db, "elo_mutation_ledger") == 0
+
+
+async def test_reimport_mastered_new_draft_re_diagnoses_no_echo(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, tmp_path: Path
+) -> None:
+    """P9-A 范围钉住：MASTERED 题带新草稿重入库 → 新建诊断会话，不回显不结算。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image], mastered_claim=True)
+    _assert_auto_mastered(tmp_db, first)
+    uid = first.question_uid
+    ledger_n = _count(tmp_db, "elo_mutation_ledger")
+    new_draft = _make_image(tmp_path / "draft2.png", (0, 255, 0))
+
+    card = await _ingest(tmp_db, stem_md=_with_uid(uid, STEM_MD), draft_images=[new_draft])
+
+    assert card.is_reimport is True
+    assert card.auto_mastered is False  # 新草稿 = 重新诊断，不回显掌握态
+    assert card.mastery_explanation is None
+    assert card.session_id != first.session_id
+    assert _count(tmp_db, "diagnostic_sessions") == 2  # 新建会话，旧会话保留
+    assert _count(tmp_db, "elo_mutation_ledger") == ledger_n  # 不重复结算
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["mastery_state"] == "MASTERED"  # 掌握态不被重入库改写
+
+
+async def test_reimport_mastered_without_ledger_fallback_text(
+    tmp_db: Path, cas_dir: Path
+) -> None:
+    """P9-A：MASTERED 但无账本行（历史数据）→ 兜底文案回显，仍零写入。"""
+    first = await _ingest(tmp_db)
+    uid = first.question_uid
+    with get_db_connection(tmp_db) as conn:
+        conn.execute(
+            "UPDATE questions SET mastery_state='MASTERED' WHERE question_uid=?",
+            (uid,),
+        )
+    second = await _ingest(tmp_db)
+    assert second.auto_mastered is True
+    assert second.is_reimport is True
+    fallback = "该题已掌握；幂等重入库保留历史进度与 Elo 账本，未重复结算。"
+    assert second.mastery_explanation == fallback
+    assert [s.status for s in second.steps] == ["completed"] * len(second.steps)
+    assert second.floor_preview_elo is None
+    assert _count(tmp_db, "elo_mutation_ledger") == 0  # 只读回显，绝不补写账本
+    assert _count(tmp_db, "diagnostic_sessions") == 1
+
+
 async def test_equivalence_failure_does_not_break_ingest(
     tmp_db: Path, cas_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

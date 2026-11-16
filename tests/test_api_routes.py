@@ -340,6 +340,27 @@ async def test_ingest_reimport_idempotent(client: AsyncClient) -> None:
     assert _one("SELECT COUNT(*) AS n FROM diagnostic_sessions")["n"] == 1
 
 
+async def test_ingest_reimport_mastered_echo(client: AsyncClient) -> None:
+    """P9-A：首次 mastered_claim=true 后同题干二次 POST → 掌握态回显，零重复结算。"""
+    first = await _ingest(client, mastered_claim=True)
+    assert first["auto_mastered"] is True
+    assert first["is_reimport"] is False
+    ledger_n = _one("SELECT COUNT(*) AS n FROM elo_mutation_ledger")["n"]
+
+    second = await _ingest(client, mastered_claim=True)
+    assert second["auto_mastered"] is True
+    assert second["is_reimport"] is True
+    assert second["question_uid"] == first["question_uid"]
+    assert second["session_id"] == first["session_id"]
+    assert second["mastery_explanation"] and "未重复结算" in second["mastery_explanation"]
+    assert second["floor_preview_elo"] is None
+    assert [s["status"] for s in second["steps"]] == ["completed"] * len(second["steps"])
+    # 零漂移：账本/会话行数不变
+    assert _one("SELECT COUNT(*) AS n FROM elo_mutation_ledger")["n"] == ledger_n
+    assert _one("SELECT COUNT(*) AS n FROM diagnostic_sessions")["n"] == 1
+    assert _one("SELECT mastery_state FROM questions")["mastery_state"] == "MASTERED"
+
+
 async def test_ingest_invalid_initial_state_422(client: AsyncClient) -> None:
     resp = await client.post(
         "/api/v1/questions/ingest",

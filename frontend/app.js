@@ -557,7 +557,7 @@ async function submitIngest(btn) {
       state.gateConfirmed = false;
       state.lastMastered = dto;
       renderMasteredCard(dto);
-      toast('✅ 已掌握入库：知识点已提取，Elo 水位线已结算', 'ok');
+      toast(dto.is_reimport ? '♻️ 幂等重入库：该题已掌握，历史进度与 Elo 账本已保留（未重复结算）' : '✅ 已掌握入库：知识点已提取，Elo 水位线已结算', 'ok');
       $('#gate-slot').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       return;
     }
@@ -583,8 +583,8 @@ function renderMasteredCard(dto) {
     <div class="mastered-hero">
       <div class="mastered-seal" aria-hidden="true">✅</div>
       <div class="mastered-head">
-        <h2 class="mastered-title">已掌握入库</h2>
-        <p class="mastered-sub">跳过脚手架练习 · 知识点已提取 · Elo 水位线已结算，归档为 🟢MASTERED</p>
+        <h2 class="mastered-title">${g.is_reimport ? '已掌握（重入库回显）' : '已掌握入库'}</h2>
+        <p class="mastered-sub">${g.is_reimport ? '幂等重入库 · 历史进度与 Elo 账本已保留 · 未重复结算' : '跳过脚手架练习 · 知识点已提取 · Elo 水位线已结算，归档为 🟢MASTERED'}</p>
       </div>
     </div>
     <div class="gate-meta">

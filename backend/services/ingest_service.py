@@ -11,7 +11,11 @@ Target File #5/#8；API 签名与落库流程按 PM 契约 docs/tasks/P2-D_inges
   携带新草稿截图 → 新建一条 diagnostic_sessions（设计 §3.1 第 1 条，旧会话保留；
   契约「相同 stem_hash 一律短路」与设计「补充新草稿即新建会话」冲突时以设计为准，
   故 stem_hash 相同但草稿有增量时仍新建会话）；
-- 重入库绝不触碰 mastery_state / 盲测字段 / Elo 相关数据；
+- 重入库绝不写入 mastery_state / 盲测字段 / Elo 相关数据（零漂移）；
+  P9-A：无新草稿的幂等重入库（短路/题干更新）对已 MASTERED 题只读回显掌握态
+  （auto_mastered=True + 最新账本解释条前缀「幂等重入库，未重复结算。」，
+  无账本行时用保留历史进度的兜底文案），绝不重复结算、不新建会话；
+  带新草稿的重入库仍新建诊断会话重新诊断，不回显掌握态；
 - 未掌握题录入阶段不结算 Elo（保底结算发生在 confirm-gate，P2-E 负责）；
   已掌握题（P7-A：mastered_claim 勾选 / 作答「已掌握」类短文本 / 正确答案代数等价 /
   initial_state='已掌握' 旧开关）在录入单事务内即结算：elo_engine.record_mastered_init
@@ -129,7 +133,8 @@ async def ingest_question(
       判定异常按未掌握处理并 logger.warning，绝不击穿录入）任一命中 →
       error_category='ALREADY_MASTERED'，录入单事务内 record_mastered_init 结算，
       返回 auto_mastered=True + mastery_explanation 账本解释条，跳过门禁练习流；
-    - 未掌握路径行为与既有完全一致；重入库幂等短路/增量逻辑不变，不重复结算。
+    - 未掌握路径行为与既有完全一致；无新草稿的幂等重入库对 MASTERED 题只读回显
+      掌握态（P9-A，零 Elo 漂移），不重复结算；带新草稿重入库行为不变。
 
     Raises:
         LLMGatewayError: VLM 诊断失败（事务回滚，无残留）。
@@ -166,6 +171,7 @@ async def ingest_question(
             stem_changed = existing["stem_hash"] != stem_hash
             has_new_drafts = _has_new_drafts(draft_uris, latest)
             if not stem_changed and not has_new_drafts:
+                echoed, explanation = _reimport_mastery_echo(conn, existing)
                 log_event(
                     logger,
                     "ingest.reimport",
@@ -173,14 +179,23 @@ async def ingest_question(
                     session_id=str(latest["session_id"]),
                     mode="short_circuit",
                     stem_changed=False,
+                    mastery_echoed=echoed,
                 )
-                return _gate_card_from_db(conn, existing, latest, is_reimport=True)
+                return _gate_card_from_db(
+                    conn,
+                    existing,
+                    latest,
+                    is_reimport=True,
+                    auto_mastered=echoed,
+                    mastery_explanation=explanation,
+                )
             if stem_changed and not has_new_drafts:
                 conn.execute(
                     "UPDATE questions SET stem_md = ?, stem_hash = ?, "
                     "updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
                     (normalized_md, stem_hash, uid),
                 )
+                echoed, explanation = _reimport_mastery_echo(conn, existing)
                 log_event(
                     logger,
                     "ingest.reimport",
@@ -188,6 +203,7 @@ async def ingest_question(
                     session_id=str(latest["session_id"]),
                     mode="stem_updated",
                     stem_changed=True,
+                    mastery_echoed=echoed,
                 )
                 log_event(
                     logger,
@@ -198,7 +214,14 @@ async def ingest_question(
                     tier=str(existing["tier"]),
                     is_reimport=True,
                 )
-                return _gate_card_from_db(conn, existing, latest, is_reimport=True)
+                return _gate_card_from_db(
+                    conn,
+                    existing,
+                    latest,
+                    is_reimport=True,
+                    auto_mastered=echoed,
+                    mastery_explanation=explanation,
+                )
         tree = _build_l1_l2_tree(conn)
 
     # 释放数据库连接与 SQLite 锁后，再跨网络执行耗时 VLM 诊断与沙盒判定
@@ -466,6 +489,29 @@ def _persist_reimport_draft_session(
     return _gate_card_from_db(conn, existing, new_session, is_reimport=True)
 
 
+def _reimport_mastery_echo(
+    conn: sqlite3.Connection, existing: sqlite3.Row
+) -> tuple[bool, str | None]:
+    """P9-A：幂等重入库（无新草稿）的掌握态只读回显，零 Elo 漂移。
+
+    仅当 mastery_state='MASTERED' 时返回 (True, 解释条)：取该 uid 最新账本
+    （event_id 最大）解释条加前缀「幂等重入库，未重复结算。」；无账本行时
+    用保留历史进度的兜底文案。ACTIVE / PENDING_RETEST 返回 (False, None)，
+    组装行为与既有完全一致。本函数只读不写：不触碰 mastery_state / 账本 /
+    托管池，不新建会话，绝不重复结算。
+    """
+    if str(existing["mastery_state"]) != "MASTERED":
+        return False, None
+    row = conn.execute(
+        "SELECT explanation_text FROM elo_mutation_ledger "
+        "WHERE question_uid = ? ORDER BY event_id DESC LIMIT 1",
+        (existing["question_uid"],),
+    ).fetchone()
+    if row is not None:
+        return True, "幂等重入库，未重复结算。" + str(row["explanation_text"])
+    return True, "该题已掌握；幂等重入库保留历史进度与 Elo 账本，未重复结算。"
+
+
 def _has_new_drafts(draft_uris: list[str], latest_session: sqlite3.Row) -> bool:
     """本次草稿是否含最新会话未见过的 CAS URI（设计 §3.1 第 1 条「补充了新草稿截图」）。"""
     if not draft_uris:
@@ -627,7 +673,8 @@ def _gate_card_from_db(
     """由落库行组装确认卡：steps 取 matched 分支（缺失回退 canonical）。
 
     auto_mastered（P7-A 录入即结算）时步骤全 completed、floor_preview_elo=None；
-    重入库路径不传该标记，组装行为与既有完全一致（零漂移）。
+    P9-A：无新草稿的幂等重入库对 MASTERED 题回显该标记（只读，零 Elo 漂移）；
+    带新草稿的重入库不传该标记（重新诊断），组装行为与既有完全一致。
     """
     uid = question["question_uid"]
     branch_id = session["matched_branch_id"]
