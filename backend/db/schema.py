@@ -1,18 +1,25 @@
-"""SQLite Schema 基座：9 张核心表 + 1 张 PM 批准扩展表与结构化索引的幂等初始化。
+"""SQLite Schema 基座：9 张核心表 + 2 张 PM 批准扩展表与结构化索引的幂等初始化。
 
 DDL 逐字段照抄设计文档 docs/designs/adaptive_practice_harness.md §2（唯一权威规格），
 仅按契约将 CREATE TABLE 改为 CREATE TABLE IF NOT EXISTS 以保证幂等。
 路径配置一律取自 backend.config.settings。
+
+P10-A（docs/tasks/P10-A_grade_schema_settings.md）：新增第 11 张表 grade_subjects
+（学段学科条目），并为 knowledge_nodes / elo_mutation_ledger / compaction_audit_ledger /
+concept_co_errors 四表幂等加列 grade_subject + 回填（_migrate_grade_scoping）。
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from backend.config import settings
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 表 DDL（设计 §2.1 ~ §2.4，按文档顺序；SQLite 允许外键前向引用建表）
@@ -243,9 +250,18 @@ CREATE TABLE IF NOT EXISTS blind_drill_attempts (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """,
+    # PM 批准扩展（P10-A），见 docs/tasks/P10-A_grade_schema_settings.md：
+    # 学段学科条目表（自由单字符串，如 '小学奥数'、'高中数学-高一'）。
+    "grade_subjects": """
+CREATE TABLE IF NOT EXISTS grade_subjects (
+    grade_subject TEXT PRIMARY KEY,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+""",
 }
 
-# 表名清单：9 张核心表 + 1 张 PM 批准扩展表 blind_drill_attempts（与 DDL 定义顺序一致）
+# 表名清单：9 张核心表 + 2 张 PM 批准扩展表 blind_drill_attempts / grade_subjects
+# （与 DDL 定义顺序一致）
 TABLE_NAMES: tuple[str, ...] = tuple(TABLE_DDLS)
 
 # ---------------------------------------------------------------------------
@@ -270,19 +286,176 @@ INDEX_DDLS: tuple[str, ...] = (
     # PM 批准扩展（P3-C）：变式曝光追踪按 (原题, 活跃日) 检索
     "CREATE INDEX IF NOT EXISTS idx_blind_drill_attempts_question_date"
     " ON blind_drill_attempts(question_uid, active_date);",
+    # P10-A 学段学科分区索引（grade_subject 列由 _migrate_grade_scoping 在建索引前补齐）
+    "CREATE INDEX IF NOT EXISTS idx_questions_target_grade_and_subject"
+    " ON questions(target_grade_and_subject);",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_nodes_grade_l1_l2"
+    " ON knowledge_nodes(grade_subject, l1_module, l2_entity);",
+    "CREATE INDEX IF NOT EXISTS idx_elo_mutation_ledger_grade_l1"
+    " ON elo_mutation_ledger(grade_subject, l1_module);",
+    "CREATE INDEX IF NOT EXISTS idx_concept_co_errors_grade ON concept_co_errors(grade_subject);",
+    "CREATE INDEX IF NOT EXISTS idx_compaction_audit_ledger_grade"
+    " ON compaction_audit_ledger(grade_subject);",
+)
+
+# P10-A：需要加列回填 grade_subject 的四张分区表
+# （questions 自带 target_grade_and_subject，无需加列）。
+_GRADE_SCOPED_TABLES: tuple[str, ...] = (
+    "knowledge_nodes",
+    "elo_mutation_ledger",
+    "compaction_audit_ledger",
+    "concept_co_errors",
 )
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """PRAGMA table_info 检测表是否已有指定列（表名仅来自模块内常量）。"""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row["name"] == column for row in rows)
+
+
+def _migrate_grade_scoping(conn: sqlite3.Connection) -> None:
+    """P10-A 学段学科分区迁移：四表加 grade_subject 列并回填（幂等、纯增量非破坏）。
+
+    规则（契约 docs/tasks/P10-A_grade_schema_settings.md §修改方案 1.3）：
+    - 仅回填 grade_subject = '' 的行，重复调用零变化；不删改任何既有数据值；
+    - knowledge_nodes 经 question_steps JOIN questions 取挂载题的 DISTINCT 学段；
+      同一节点出现多个不同学段 → ValueError（数据违约，绝不静默择一，先全量校验再写入）；
+    - 无自身步骤的 redirect 子节点继承其 redirect 目标的学段（迭代至不动点，
+      兼容多跳链；目标学段为 '' 时保持 ''）；
+    - elo_mutation_ledger 按 question_uid、compaction_audit_ledger 按 from_node_id
+      （节点回填之后）、concept_co_errors 按 node_u_id 回填；
+    - 无步骤且无目标学段的节点保持 ''（计数告警汇报，真实数据不应存在）；
+    - questions 的 DISTINCT 学段自动注册为 grade_subjects 条目（INSERT OR IGNORE）。
+
+    调用方管理事务（init_db 同一连接）；违约抛错时由连接上下文整体回滚。
+    """
+    for table in _GRADE_SCOPED_TABLES:
+        if not _has_column(conn, table, "grade_subject"):
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN grade_subject TEXT NOT NULL DEFAULT ''"
+            )
+
+    # 1) knowledge_nodes：先全量收集 '' 节点的挂载题学段并校验跨学段违约，再回填。
+    rows = conn.execute(
+        """
+        SELECT DISTINCT s.knowledge_node_id AS node_id, q.target_grade_and_subject AS grade
+        FROM question_steps s
+        JOIN questions q ON q.question_uid = s.question_uid
+        JOIN knowledge_nodes kn ON kn.node_id = s.knowledge_node_id
+        WHERE kn.grade_subject = ''
+        ORDER BY s.knowledge_node_id, q.target_grade_and_subject
+        """
+    ).fetchall()
+    node_grades: dict[str, list[str]] = {}
+    for row in rows:
+        node_grades.setdefault(row["node_id"], []).append(row["grade"])
+    conflicts = {node: grades for node, grades in node_grades.items() if len(grades) > 1}
+    if conflicts:
+        detail = "; ".join(f"{node} -> {grades}" for node, grades in sorted(conflicts.items()))
+        raise ValueError(f"知识节点跨学段共享（数据违约，拒绝回填）: {detail}")
+    for node_id, grades in node_grades.items():
+        conn.execute(
+            "UPDATE knowledge_nodes SET grade_subject = ?"
+            " WHERE node_id = ? AND grade_subject = ''",
+            (grades[0], node_id),
+        )
+
+    # 2) 无自身步骤的 redirect 子节点继承目标学段（迭代至不动点；目标为 '' 则保持 ''）。
+    while True:
+        cur = conn.execute(
+            """
+            UPDATE knowledge_nodes
+            SET grade_subject = (
+                SELECT t.grade_subject FROM knowledge_nodes t
+                WHERE t.node_id = knowledge_nodes.redirect_to_id
+            )
+            WHERE grade_subject = ''
+              AND redirect_to_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM question_steps s
+                  WHERE s.knowledge_node_id = knowledge_nodes.node_id
+              )
+              AND COALESCE((
+                  SELECT t.grade_subject FROM knowledge_nodes t
+                  WHERE t.node_id = knowledge_nodes.redirect_to_id
+              ), '') <> ''
+            """
+        )
+        if cur.rowcount == 0:
+            break
+
+    # 3) elo_mutation_ledger：按 question_uid JOIN questions 回填。
+    conn.execute(
+        """
+        UPDATE elo_mutation_ledger
+        SET grade_subject = (
+            SELECT q.target_grade_and_subject FROM questions q
+            WHERE q.question_uid = elo_mutation_ledger.question_uid
+        )
+        WHERE grade_subject = ''
+        """
+    )
+
+    # 4) compaction_audit_ledger：按 from_node_id 回填（节点回填之后执行）。
+    conn.execute(
+        """
+        UPDATE compaction_audit_ledger
+        SET grade_subject = (
+            SELECT kn.grade_subject FROM knowledge_nodes kn
+            WHERE kn.node_id = compaction_audit_ledger.from_node_id
+        )
+        WHERE grade_subject = ''
+        """
+    )
+
+    # 5) concept_co_errors：按 node_u_id 回填。
+    conn.execute(
+        """
+        UPDATE concept_co_errors
+        SET grade_subject = (
+            SELECT kn.grade_subject FROM knowledge_nodes kn
+            WHERE kn.node_id = concept_co_errors.node_u_id
+        )
+        WHERE grade_subject = ''
+        """
+    )
+
+    # 6) 现有学段自动注册为条目（DISTINCT 幂等；空串学段不构成合法条目，不注册）。
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO grade_subjects (grade_subject, created_at)
+        SELECT DISTINCT target_grade_and_subject, CURRENT_TIMESTAMP
+        FROM questions
+        WHERE target_grade_and_subject <> ''
+        """
+    )
+
+    # 7) 无学段来源的节点保持 ''：计数汇报（真实数据不应存在）。
+    orphan_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM knowledge_nodes WHERE grade_subject = ''"
+    ).fetchone()
+    orphan_count = int(orphan_row["n"])
+    if orphan_count:
+        logger.warning(
+            "P10-A 迁移：%d 个知识节点无挂载步骤且无 redirect 目标学段，grade_subject 保持 ''",
+            orphan_count,
+        )
+
+
 def init_db(db_path: Path | None = None) -> None:
-    """幂等初始化数据库：自动创建父目录并建立 9 张核心表 + 1 张 PM 批准扩展表与全部索引。
+    """幂等初始化数据库：自动创建父目录并建立 9 张核心表 + 2 张 PM 批准扩展表与全部索引。
 
     db_path 缺省取 backend.config.settings.SQLITE_PATH；重复调用不报错、不丢数据。
+    建表后在同一连接内执行 P10-A 学段分区迁移（加列回填，幂等），再建索引
+    （新索引引用 grade_subject 列，必须先完成加列）。
     """
     path = db_path if db_path is not None else settings.SQLITE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     with get_db_connection(path) as conn:
         for ddl in TABLE_DDLS.values():
             conn.execute(ddl)
+        _migrate_grade_scoping(conn)
         for ddl in INDEX_DDLS:
             conn.execute(ddl)
 

@@ -1,14 +1,24 @@
-"""P1-A Schema 基座测试：建表完整性 / PRAGMA / 约束拦截 / 幂等 / 默认值 / 事务语义。"""
+"""P1-A Schema 基座测试：建表完整性 / PRAGMA / 约束拦截 / 幂等 / 默认值 / 事务语义。
+
+P10-A 追加：grade_subjects 表结构 / 四表加列 / 学段回填迁移（幂等 / 跨学段违约 /
+redirect 继承 / 自动注册），契约 docs/tasks/P10-A_grade_schema_settings.md。
+"""
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from backend.config import settings
-from backend.db.schema import TABLE_NAMES, get_db_connection, init_db
+from backend.db.schema import (
+    TABLE_NAMES,
+    _migrate_grade_scoping,
+    get_db_connection,
+    init_db,
+)
 
 # 最小合法 questions 行（其余字段走 DEFAULT）
 _INSERT_QUESTION_SQL = """
@@ -51,13 +61,14 @@ def _insert_node(conn: sqlite3.Connection, node_id: str) -> None:
 
 
 def test_all_core_and_extension_tables_exist(tmp_db: Path) -> None:
-    """9 张核心表 + 1 张 PM 批准扩展表 blind_drill_attempts 全部存在且无多余业务表。"""
+    """9 张核心表 + 2 张 PM 批准扩展表（blind_drill_attempts / grade_subjects）全部存在。"""
     with get_db_connection(tmp_db) as conn:
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
     assert {row["name"] for row in rows} == set(TABLE_NAMES)
-    assert len(TABLE_NAMES) == 10
+    # P10-A 预授权期望演进：+ grade_subjects（10 → 11）
+    assert len(TABLE_NAMES) == 11
 
 
 def test_required_indexes_exist(tmp_db: Path) -> None:
@@ -72,6 +83,12 @@ def test_required_indexes_exist(tmp_db: Path) -> None:
         "idx_diagnostic_sessions_question_uid",
         "idx_elo_mutation_ledger_l1_module",
         "idx_question_relations_target_type",
+        # P10-A 学段学科分区索引
+        "idx_questions_target_grade_and_subject",
+        "idx_knowledge_nodes_grade_l1_l2",
+        "idx_elo_mutation_ledger_grade_l1",
+        "idx_concept_co_errors_grade",
+        "idx_compaction_audit_ledger_grade",
     }
     with get_db_connection(tmp_db) as conn:
         rows = conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
@@ -248,3 +265,271 @@ def test_connection_rolls_back_on_exception(tmp_db: Path) -> None:
         ).fetchone()
     assert kept is not None
     assert rolled is None
+
+
+# ---------------------------------------------------------------------------
+# P10-A 学段学科分区基座：grade_subjects 表结构 / 四表加列 / 回填迁移
+# 契约 docs/tasks/P10-A_grade_schema_settings.md
+# ---------------------------------------------------------------------------
+
+_GRADE_SCOPED_TABLES = (
+    "knowledge_nodes",
+    "elo_mutation_ledger",
+    "compaction_audit_ledger",
+    "concept_co_errors",
+)
+
+_INSERT_QUESTION_GRADED_SQL = """
+INSERT INTO questions (
+    question_uid, origin_type, target_grade_and_subject, stem_md, stem_hash,
+    standard_answer_latex, c_score, s_score, t_score, l_score, base_elo, tier,
+    primary_l1_module
+) VALUES (?, 'USER_CANONICAL', ?, '题干', 'hash', 'x=1',
+          1, 1, 1, 1, 1000, 'L1_基础直达', '代数')
+"""
+
+_INSERT_NODE_GRADED_SQL = """
+INSERT INTO knowledge_nodes (
+    node_id, l1_module, l2_entity, l3_operator, redirect_to_id, grade_subject
+) VALUES (?, '代数', '函数与方程', '换元转化', ?, ?)
+"""
+
+_INSERT_STEP_INDEXED_SQL = """
+INSERT INTO question_steps (
+    step_id, question_uid, step_index, step_goal_desc, step_formula_latex,
+    knowledge_node_id, masked_conditions_json, probe_question_md,
+    c_sub, s_sub, t_sub, l_sub, sub_elo
+) VALUES (?, ?, ?, '子目标', 'x=1', ?, '[]', '反问句', 1, 1, 1, 1, 850)
+"""
+
+_INSERT_LEDGER_GRADED_SQL = """
+INSERT INTO elo_mutation_ledger (
+    idempotency_key, l1_module, question_uid, mutation_trigger, eval_difficulty_elo,
+    coverage_elo_before, coverage_elo_after, combat_elo_before, combat_elo_after,
+    explanation_text, grade_subject
+) VALUES (?, '代数', ?, 'MASTERED_INIT', 1000, 1200.0, 1224.0, 1200.0, 1224.0, '解释', ?)
+"""
+
+_INSERT_AUDIT_GRADED_SQL = """
+INSERT INTO compaction_audit_ledger (
+    batch_id, l1_module, l2_entity, from_node_id, to_node_id, ai_judge_evidence,
+    previous_aliases_to_json, previous_co_errors_snapshot_json, grade_subject
+) VALUES ('batch-1', '代数', '函数与方程', ?, ?, '证据', '[]', '[]', ?)
+"""
+
+_INSERT_CO_ERROR_GRADED_SQL = """
+INSERT INTO concept_co_errors (
+    node_u_id, node_v_id, l1_module_u, l1_module_v, source_question_uids_json, grade_subject
+) VALUES (?, ?, '代数', '代数', '[]', ?)
+"""
+
+
+def _seed_legacy_partition_rows(conn: sqlite3.Connection) -> None:
+    """种子两学段 legacy 行（grade_subject=''）：节点/步骤/题目/账本/审计/边。
+
+    学段 A「小学奥数」：q-a1/q-a2 → n-a1/n-a2；redirect 子 n-a-child → n-a1，
+    二跳 n-a-grandchild → n-a-child；账本 1 条；审计 2 条（含 from redirect 子）；边 1 条。
+    学段 B「高中数学-高一」：q-b1 → n-b1/n-b2（同题两步）；账本 1 条；边 1 条。
+    另有孤儿节点 n-orphan（无步骤无 redirect，应保持 ''）。
+    """
+    conn.execute(_INSERT_QUESTION_GRADED_SQL, ("q-a1", "小学奥数"))
+    conn.execute(_INSERT_QUESTION_GRADED_SQL, ("q-a2", "小学奥数"))
+    conn.execute(_INSERT_QUESTION_GRADED_SQL, ("q-b1", "高中数学-高一"))
+    for node_id in ("n-a1", "n-a2", "n-b1", "n-b2", "n-orphan"):
+        conn.execute(_INSERT_NODE_GRADED_SQL, (node_id, None, ""))
+    conn.execute(_INSERT_NODE_GRADED_SQL, ("n-a-child", "n-a1", ""))
+    conn.execute(_INSERT_NODE_GRADED_SQL, ("n-a-grandchild", "n-a-child", ""))
+    conn.execute(_INSERT_STEP_INDEXED_SQL, ("s-a1", "q-a1", 1, "n-a1"))
+    conn.execute(_INSERT_STEP_INDEXED_SQL, ("s-a2", "q-a2", 1, "n-a2"))
+    conn.execute(_INSERT_STEP_INDEXED_SQL, ("s-b1", "q-b1", 1, "n-b1"))
+    conn.execute(_INSERT_STEP_INDEXED_SQL, ("s-b2", "q-b1", 2, "n-b2"))
+    conn.execute(_INSERT_LEDGER_GRADED_SQL, ("q-a1:sess:MASTERED_INIT", "q-a1", ""))
+    conn.execute(_INSERT_LEDGER_GRADED_SQL, ("q-b1:sess:MASTERED_INIT", "q-b1", ""))
+    conn.execute(_INSERT_AUDIT_GRADED_SQL, ("n-a1", "n-a2", ""))
+    conn.execute(_INSERT_AUDIT_GRADED_SQL, ("n-a-child", "n-a1", ""))
+    conn.execute(_INSERT_CO_ERROR_GRADED_SQL, ("n-a1", "n-a2", ""))
+    conn.execute(_INSERT_CO_ERROR_GRADED_SQL, ("n-b1", "n-b2", ""))
+
+
+def _grade_snapshot(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
+    """四表学段标签 + 条目全量快照（用于重复迁移零变化比对）。"""
+    snapshot: dict[str, list[tuple[object, ...]]] = {}
+    for table, key in (
+        ("knowledge_nodes", "node_id"),
+        ("elo_mutation_ledger", "event_id"),
+        ("compaction_audit_ledger", "merge_id"),
+        ("concept_co_errors", "node_u_id || '|' || node_v_id"),
+    ):
+        rows = conn.execute(
+            f"SELECT {key} AS k, grade_subject FROM {table} ORDER BY k"
+        ).fetchall()
+        snapshot[table] = [(row["k"], row["grade_subject"]) for row in rows]
+    entries = conn.execute(
+        "SELECT grade_subject, created_at FROM grade_subjects ORDER BY grade_subject"
+    ).fetchall()
+    snapshot["grade_subjects"] = [(row["grade_subject"], row["created_at"]) for row in entries]
+    return snapshot
+
+
+def test_grade_subjects_table_structure(tmp_db: Path) -> None:
+    """P10-A：grade_subjects 列结构（grade_subject TEXT 主键 + created_at 默认值）。"""
+    with get_db_connection(tmp_db) as conn:
+        cols = {row["name"]: row for row in conn.execute("PRAGMA table_info(grade_subjects)")}
+    assert set(cols) == {"grade_subject", "created_at"}
+    assert cols["grade_subject"]["type"] == "TEXT"
+    assert cols["grade_subject"]["pk"] == 1
+    assert cols["created_at"]["type"] == "DATETIME"
+    assert cols["created_at"]["notnull"] == 1
+    assert cols["created_at"]["dflt_value"] == "CURRENT_TIMESTAMP"
+
+
+def test_grade_subject_columns_added_to_four_tables(tmp_db: Path) -> None:
+    """P10-A：四张分区表均含 grade_subject TEXT NOT NULL DEFAULT ''。"""
+    with get_db_connection(tmp_db) as conn:
+        for table in _GRADE_SCOPED_TABLES:
+            cols = {row["name"]: row for row in conn.execute(f"PRAGMA table_info({table})")}
+            assert "grade_subject" in cols, table
+            assert cols["grade_subject"]["type"] == "TEXT", table
+            assert cols["grade_subject"]["notnull"] == 1, table
+            assert cols["grade_subject"]["dflt_value"] == "''", table
+
+
+def test_migration_backfills_legacy_rows_per_table(tmp_db: Path) -> None:
+    """P10-A：legacy '' 行逐表按来源回填；redirect 子继承目标学段；DISTINCT 自动注册。"""
+    with get_db_connection(tmp_db) as conn:
+        _seed_legacy_partition_rows(conn)
+    with get_db_connection(tmp_db) as conn:
+        _migrate_grade_scoping(conn)
+    with get_db_connection(tmp_db) as conn:
+        node_grades = {
+            row["node_id"]: row["grade_subject"]
+            for row in conn.execute("SELECT node_id, grade_subject FROM knowledge_nodes")
+        }
+        ledger_grades = {
+            row["question_uid"]: row["grade_subject"]
+            for row in conn.execute("SELECT question_uid, grade_subject FROM elo_mutation_ledger")
+        }
+        audit_grades = [
+            row["grade_subject"]
+            for row in conn.execute(
+                "SELECT grade_subject FROM compaction_audit_ledger ORDER BY merge_id"
+            )
+        ]
+        edge_grades = {
+            (row["node_u_id"], row["node_v_id"]): row["grade_subject"]
+            for row in conn.execute(
+                "SELECT node_u_id, node_v_id, grade_subject FROM concept_co_errors"
+            )
+        }
+        question_grades = {
+            row["question_uid"]: row["target_grade_and_subject"]
+            for row in conn.execute("SELECT question_uid, target_grade_and_subject FROM questions")
+        }
+        registered = conn.execute(
+            "SELECT grade_subject, created_at FROM grade_subjects ORDER BY grade_subject"
+        ).fetchall()
+    assert node_grades == {
+        "n-a1": "小学奥数",
+        "n-a2": "小学奥数",
+        "n-a-child": "小学奥数",  # 无自身步骤的 redirect 子继承目标
+        "n-a-grandchild": "小学奥数",  # 二跳链传递继承
+        "n-b1": "高中数学-高一",
+        "n-b2": "高中数学-高一",
+        "n-orphan": "",  # 无步骤且无目标学段 → 保持 ''
+    }
+    assert ledger_grades == {"q-a1": "小学奥数", "q-b1": "高中数学-高一"}
+    assert audit_grades == ["小学奥数", "小学奥数"]  # 第二条 from redirect 子，节点回填后继承
+    assert edge_grades == {
+        ("n-a1", "n-a2"): "小学奥数",
+        ("n-b1", "n-b2"): "高中数学-高一",
+    }
+    # 迁移纯增量：questions 学段值不变
+    assert question_grades == {
+        "q-a1": "小学奥数",
+        "q-a2": "小学奥数",
+        "q-b1": "高中数学-高一",
+    }
+    # DISTINCT 自动注册：学段 A 两题只注册一条条目
+    assert [row["grade_subject"] for row in registered] == ["小学奥数", "高中数学-高一"]
+    assert all(row["created_at"] for row in registered)
+
+
+def test_migration_idempotent_second_run_zero_change(tmp_db: Path) -> None:
+    """P10-A：回填完成后重复 init_db / 迁移零变化（含条目 created_at 不被刷新）。"""
+    with get_db_connection(tmp_db) as conn:
+        _seed_legacy_partition_rows(conn)
+    with get_db_connection(tmp_db) as conn:
+        _migrate_grade_scoping(conn)
+    with get_db_connection(tmp_db) as conn:
+        before = _grade_snapshot(conn)
+    init_db(tmp_db)  # 第二次完整路径（建表/迁移/索引）
+    with get_db_connection(tmp_db) as conn:
+        _migrate_grade_scoping(conn)  # 第三次：直接调迁移亦零变化
+        after = _grade_snapshot(conn)
+    assert after == before
+
+
+def test_migration_cross_grade_node_raises_and_rolls_back(tmp_db: Path) -> None:
+    """P10-A：同一节点挂载两学段题目 → ValueError（绝不静默择一），且无任何部分回填残留。"""
+    with get_db_connection(tmp_db) as conn:
+        conn.execute(_INSERT_QUESTION_GRADED_SQL, ("q-a1", "小学奥数"))
+        conn.execute(_INSERT_QUESTION_GRADED_SQL, ("q-b1", "高中数学-高一"))
+        conn.execute(_INSERT_NODE_GRADED_SQL, ("n-ok", None, ""))
+        conn.execute(_INSERT_NODE_GRADED_SQL, ("n-x", None, ""))
+        conn.execute(_INSERT_STEP_INDEXED_SQL, ("s-ok", "q-a1", 1, "n-ok"))
+        conn.execute(_INSERT_STEP_INDEXED_SQL, ("s-xa", "q-a1", 2, "n-x"))
+        conn.execute(_INSERT_STEP_INDEXED_SQL, ("s-xb", "q-b1", 1, "n-x"))
+        conn.execute(_INSERT_LEDGER_GRADED_SQL, ("q-a1:sess:MASTERED_INIT", "q-a1", ""))
+    with pytest.raises(ValueError, match="跨学段"):
+        with get_db_connection(tmp_db) as conn:
+            _migrate_grade_scoping(conn)
+    with get_db_connection(tmp_db) as conn:
+        grades = {
+            row["node_id"]: row["grade_subject"]
+            for row in conn.execute("SELECT node_id, grade_subject FROM knowledge_nodes")
+        }
+        ledger_grade = conn.execute(
+            "SELECT grade_subject FROM elo_mutation_ledger"
+        ).fetchone()["grade_subject"]
+        entry_count = conn.execute("SELECT COUNT(*) AS n FROM grade_subjects").fetchone()["n"]
+    # 校验先于写入 + 异常整体回滚：合法节点 n-ok 也不回填，条目不注册
+    assert grades == {"n-ok": "", "n-x": ""}
+    assert ledger_grade == ""
+    assert entry_count == 0
+
+
+def test_migration_only_touches_empty_grade_rows(tmp_db: Path) -> None:
+    """P10-A：回填仅针对 grade_subject='' 的行；预填行绝不被覆盖（纯增量非破坏）。"""
+    with get_db_connection(tmp_db) as conn:
+        conn.execute(_INSERT_QUESTION_GRADED_SQL, ("q-a1", "小学奥数"))
+        conn.execute(_INSERT_NODE_GRADED_SQL, ("n-pre", None, "预填学段"))
+        conn.execute(_INSERT_STEP_INDEXED_SQL, ("s-pre", "q-a1", 1, "n-pre"))
+        conn.execute(_INSERT_LEDGER_GRADED_SQL, ("q-a1:sess:MASTERED_INIT", "q-a1", "预填学段"))
+    with get_db_connection(tmp_db) as conn:
+        _migrate_grade_scoping(conn)
+    with get_db_connection(tmp_db) as conn:
+        node_grade = conn.execute(
+            "SELECT grade_subject FROM knowledge_nodes WHERE node_id='n-pre'"
+        ).fetchone()["grade_subject"]
+        ledger_grade = conn.execute(
+            "SELECT grade_subject FROM elo_mutation_ledger"
+        ).fetchone()["grade_subject"]
+    assert node_grade == "预填学段"
+    assert ledger_grade == "预填学段"
+
+
+def test_migration_orphan_nodes_stay_empty_and_warn(
+    tmp_db: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P10-A：无步骤且无 redirect 目标学段的节点保持 ''，并计数告警汇报。"""
+    with get_db_connection(tmp_db) as conn:
+        conn.execute(_INSERT_NODE_GRADED_SQL, ("n-orphan", None, ""))
+    with caplog.at_level(logging.WARNING, logger="backend.db.schema"):
+        with get_db_connection(tmp_db) as conn:
+            _migrate_grade_scoping(conn)
+    with get_db_connection(tmp_db) as conn:
+        grade = conn.execute(
+            "SELECT grade_subject FROM knowledge_nodes WHERE node_id='n-orphan'"
+        ).fetchone()["grade_subject"]
+    assert grade == ""
+    assert any("1 个知识节点" in rec.getMessage() for rec in caplog.records)

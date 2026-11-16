@@ -196,7 +196,9 @@ def _insert_edge(
         "SELECT l1_module FROM knowledge_nodes WHERE node_id = ?", (v,)
     ).fetchone()[0]
     conn.execute(
-        "INSERT INTO concept_co_errors VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO concept_co_errors (node_u_id, node_v_id, l1_module_u, l1_module_v,"
+        " active_error_count, total_historical_count, source_question_uids_json, last_error_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (u, v, mu, mv, active, historical, json.dumps(list(uids), ensure_ascii=False),
          last_error_at),
     )
