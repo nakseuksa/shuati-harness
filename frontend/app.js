@@ -99,6 +99,7 @@ const state = {
   eloModule: '',
   eloModuleOptions: [],
   graphLoaded: false,
+  redEdgesCollapsed: true, // P9-C：跨考点标红边列表默认折叠（仅内存态，刷新/切页签保持，不持久化）
   // 重试条
   lastRetry: null,
 };
@@ -1553,6 +1554,8 @@ function renderGraph() {
     </div>`).join('') : '<div class="field-help">暂无模块指标（冷启动）</div>';
 
   const edgesSorted = [...g.edges].sort((a, b) => b.active - a.active || b.historical - a.historical);
+  const activeEdgeCount = edgesSorted.filter((e) => e.active > 0).length;
+  const redCollapsed = state.redEdgesCollapsed;
   const edgesHtml = edgesSorted.length ? edgesSorted.map((e) => `
     <div class="edge-item ${e.active > 0 ? '' : 'historical'}">
       <span class="edge-node">${esc(nodeName(g, e.u))}</span>
@@ -1594,8 +1597,13 @@ function renderGraph() {
     </div>
     <div class="stack">
       <div class="card">
-        <div class="card-title">⚡ 跨考点标红边 <span class="hint">active / historical</span></div>
-        <div class="edge-list">${edgesHtml}</div>
+        <div class="card-title">⚡ 跨考点标红边 <span class="hint">active / historical</span>
+          ${edgesSorted.length ? `<span class="spacer"></span>
+          <span class="badge badge-gray">共 ${edgesSorted.length} 条 · 活跃 ${activeEdgeCount} 条</span>
+          <button type="button" class="btn btn-sm btn-ghost edge-toggle" data-action="toggle-red-edges"
+                  aria-expanded="${!redCollapsed}" aria-controls="red-edge-list">${redCollapsed ? '▸ 展开' : '▾ 收起'}</button>` : ''}
+        </div>
+        <div class="edge-list" id="red-edge-list" ${redCollapsed && edgesSorted.length ? 'hidden' : ''}>${edgesHtml}</div>
       </div>
       <div class="card">
         <div class="card-title">🧬 合并历史（Compaction 审计） <span class="hint">同域并查集 · 可逆</span></div>
@@ -1916,6 +1924,16 @@ function onDocumentClick(e) {
     case 'drill-submit': submitDrill(el, el.dataset.uid); break;
     case 'drill-retrain': openRetrainSession(el, el.dataset.session); break;
     case 'graph-refresh': loadGraphAndElo(el); break;
+    case 'toggle-red-edges': {
+      // P9-C：原地切换折叠态（不整卡重渲染，避免滚动跳动）
+      state.redEdgesCollapsed = !state.redEdgesCollapsed;
+      const collapsed = state.redEdgesCollapsed;
+      const list = $('#red-edge-list');
+      if (list) list.hidden = collapsed;
+      el.setAttribute('aria-expanded', String(!collapsed));
+      el.textContent = collapsed ? '▸ 展开' : '▾ 收起';
+      break;
+    }
     case 'unmerge': unmergeBatch(el, el.dataset.batch); break;
     default: break;
   }

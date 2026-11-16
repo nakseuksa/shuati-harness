@@ -929,6 +929,10 @@ kbd {
 .alias-count { font-size: 10.5px; color: var(--ink-faint); font-family: var(--font-mono); }
 
 .edge-list { display: grid; gap: 8px; }
+/* P9-C：跨考点标红边折叠 —— display:grid 会覆盖 UA 的 [hidden] 默认样式，必须显式隐藏 */
+.edge-list[hidden] { display: none; }
+.card-title .spacer { flex: 1; }
+.edge-toggle { white-space: nowrap; flex-shrink: 0; }
 .edge-item {
   display: flex;
   align-items: center;
