@@ -9,7 +9,8 @@ elo_engine / cas_store / schema。本文件仅负责：
   LLMGatewayError→502（含重试提示），错误体统一 ``{"detail": ...}``；
 - ``active_date`` 注入贯穿 drills 端点（E2E 时间旅行依赖）；
 - lifespan 启动 ``init_db()``；CAS 资产 ``/assets/{hash}`` 静态图像服务；
-- ``./frontend/`` 静态前端挂载（目录缺失/为空时应用仍可启动，P4-B 并行容错）。
+- ``./frontend/`` 静态前端挂载（目录缺失/为空时应用仍可启动，P4-B 并行容错）；
+  根路由为本地脚本/样式引用注入内容哈希版本号查询参数（P9-E 缓存击穿，零构建）。
 
 同源本地单机（NG2）：不加 CORS、不加鉴权。
 """
@@ -17,6 +18,7 @@ elo_engine / cas_store / schema。本文件仅负责：
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -30,7 +32,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -646,8 +648,29 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
         path = resolve_cas_uri(f"cas://{cas_hash}")  # 非法 hash→ValueError→400；缺失→404
         return FileResponse(path, media_type="image/webp")
 
-    # ---- 前端静态挂载（必须最后注册，避免 "/" 遮蔽 API 路由；目录缺失容错） ----
+    # ---- 前端根路由：本地引用注入内容哈希版本号查询参数（P9-E 缓存击穿） ----
+    # 注册顺序 API → assets → 根路由 → mount；index.html 本体不改（零构建，file:// 直开仍可用）。
     frontend = frontend_dir if frontend_dir is not None else _PROJECT_ROOT / "frontend"
+    if frontend.is_dir() and (frontend / "index.html").is_file():
+
+        @app.get("/", response_class=HTMLResponse)
+        def serve_index() -> HTMLResponse:
+            """每请求读 index.html，按文件内容 SHA-256 前 12 位注入 ?v=；内容一变 URL 即变。"""
+            try:
+                html = (frontend / "index.html").read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise HTTPException(
+                    status_code=404, detail=f"index.html 读取失败: {exc}"
+                ) from exc
+            for attr, name in (("href", "styles.css"), ("src", "app.js")):
+                try:
+                    version = hashlib.sha256((frontend / name).read_bytes()).hexdigest()[:12]
+                except OSError:
+                    continue  # 资源缺失/不可读 → 引用保持原样不注入（与挂载容错语义一致）
+                html = html.replace(f'{attr}="./{name}"', f'{attr}="./{name}?v={version}"')
+            return HTMLResponse(html)
+
+    # ---- 前端静态挂载（必须最后注册，避免 "/" 遮蔽 API 路由；目录缺失容错） ----
     if frontend.is_dir():
         app.mount("/", StaticFiles(directory=frontend, html=True), name="frontend")
 

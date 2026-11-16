@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import io
 import json
+import re
+import shutil
 import sqlite3
 from collections.abc import AsyncIterator
 from datetime import date, timedelta
@@ -946,6 +949,102 @@ async def test_frontend_index_served(tmp_path: Path) -> None:
         assert "刷题 Harness 工作台" in resp.text
         # API 路由不被 "/" 挂载遮蔽
         assert (await client.get("/api/v1/drills/daily")).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# P9-E：根路由内容哈希版本号查询参数注入（缓存击穿）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def frontend_copy(tmp_path: Path) -> Path:
+    """真实 frontend 目录复制到 tmp：版本号测试改/删副本，不触碰真实文件。"""
+    src = Path(__file__).resolve().parent.parent / "frontend"
+    dest = tmp_path / "frontend"
+    shutil.copytree(src, dest)
+    return dest
+
+
+def _content_version(path: Path) -> str:
+    """期望值从真实文件字节推导（契约：不得硬编码哈希）。"""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+
+async def test_root_injects_content_hash_versions(frontend_copy: Path) -> None:
+    """GET / → 200，app.js/styles.css 引用携带 ?v=<内容 SHA-256 前 12 位 hex>。"""
+    app = create_app(frontend_dir=frontend_copy)
+    js_v = _content_version(frontend_copy / "app.js")
+    css_v = _content_version(frontend_copy / "styles.css")
+    async for client in _with_client(app):
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert f'src="./app.js?v={js_v}"' in resp.text
+        assert f'href="./styles.css?v={css_v}"' in resp.text
+        assert re.search(r"app\.js\?v=[0-9a-f]{12}", resp.text)
+        assert re.search(r"styles\.css\?v=[0-9a-f]{12}", resp.text)
+        assert resp.text.count("?v=") == 2  # 仅两处本地引用；CDN 锁版本不受影响
+        # 确定性：内容不变 → 两次请求 HTML 完全一致（缓存友好）
+        assert (await client.get("/")).text == resp.text
+        # 根路由不遮蔽 API 与静态资源路径（mount 仍服务其余文件）
+        assert (await client.get("/api/v1/drills/daily")).status_code == 200
+        assert (await client.get("/app.js")).status_code == 200
+        assert (await client.get("/styles.css")).status_code == 200
+
+
+async def test_root_version_tracks_content_change_independently(frontend_copy: Path) -> None:
+    """修改副本 app.js → 版本号变为新内容哈希；styles.css 版本号不受影响（独立）。"""
+    app = create_app(frontend_dir=frontend_copy)
+    css_v = _content_version(frontend_copy / "styles.css")
+    async for client in _with_client(app):
+        old_js_v = _content_version(frontend_copy / "app.js")
+        assert f'src="./app.js?v={old_js_v}"' in (await client.get("/")).text
+
+        (frontend_copy / "app.js").write_text("// P9-E cache-bust probe\n", encoding="utf-8")
+        new_js_v = _content_version(frontend_copy / "app.js")
+        assert new_js_v != old_js_v
+        after = (await client.get("/")).text
+        assert f'src="./app.js?v={new_js_v}"' in after
+        assert f"app.js?v={old_js_v}" not in after
+        assert f'href="./styles.css?v={css_v}"' in after
+
+
+async def test_root_missing_js_keeps_reference_unversioned(frontend_copy: Path) -> None:
+    """副本删除 app.js → GET / 仍 200，app.js 引用保持无版本号原样（容错）。"""
+    (frontend_copy / "app.js").unlink()
+    app = create_app(frontend_dir=frontend_copy)
+    css_v = _content_version(frontend_copy / "styles.css")
+    async for client in _with_client(app):
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        assert 'src="./app.js"' in resp.text
+        assert "app.js?v=" not in resp.text
+        assert f'href="./styles.css?v={css_v}"' in resp.text  # 另一资源正常注入
+
+
+async def test_root_missing_css_keeps_reference_unversioned(frontend_copy: Path) -> None:
+    """对称容错：styles.css 缺失 → 其引用保持原样，app.js 正常注入。"""
+    (frontend_copy / "styles.css").unlink()
+    app = create_app(frontend_dir=frontend_copy)
+    js_v = _content_version(frontend_copy / "app.js")
+    async for client in _with_client(app):
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        assert 'href="./styles.css"' in resp.text
+        assert "styles.css?v=" not in resp.text
+        assert f'src="./app.js?v={js_v}"' in resp.text
+
+
+async def test_root_index_read_failure_404(frontend_copy: Path) -> None:
+    """index.html 读取失败（同名变目录 → IsADirectoryError）→ 404，不崩溃 500。"""
+    app = create_app(frontend_dir=frontend_copy)
+    index = frontend_copy / "index.html"
+    index.unlink()
+    index.mkdir()
+    async for client in _with_client(app):
+        resp = await client.get("/")
+        assert resp.status_code == 404
+        assert "detail" in resp.json()
 
 
 def test_default_app_registers_all_contract_routes() -> None:
