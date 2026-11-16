@@ -1267,3 +1267,159 @@ async def test_shared_l0_scaffold_disambiguates_original_parent_chain(
     assert resp.view_payload["micro_scaffold"]["question_uid"] == "branch-b"
     resp2 = await submit_stage_answer(card_b.session_id, "5", db_path=tmp_db)
     assert resp2.micro_stage == "STAGE_3_REDO_ORIGINAL"
+
+
+# ---------------------------------------------------------------------------
+# P11-B：跨学段本地检索隔离 + 连续多次换一题防乒乓死循环
+# ---------------------------------------------------------------------------
+
+
+def _seed_grade_isolation_fixture(conn: sqlite3.Connection) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """构造小学奥数与高中物理跨学段同考点/同陷阱标签数据，含历史跨学段关系边。"""
+    conn.execute(
+        "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator, grade_subject)"
+        " VALUES ('kn-shared', '综合', '模型', '算子', '小学奥数')"
+    )
+    questions = (
+        ("q-elem-orig", "小学奥数", 2000, '["TRAP_DOMAIN_BOUNDARY"]'),
+        ("q-hs-trap", "高中物理-高二", 2000, '["TRAP_DOMAIN_BOUNDARY"]'),
+        ("q-hs-scaf", "高中物理-高二", 1100, '["TRAP_DOMAIN_BOUNDARY"]'),
+    )
+    for uid, grade, elo, tags in questions:
+        conn.execute(
+            "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
+            " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
+            " base_elo, tier, trap_tags_json, primary_l1_module, mastery_state)"
+            " VALUES (?, 'USER_CANONICAL', ?, ?, ?, '5', 2, 2, 2, 2, ?,"
+            " 'L2_中等', ?, '综合', 'ACTIVE')",
+            (uid, grade, f"题干-{uid}", f"hash-{uid}", elo, tags),
+        )
+        conn.execute(
+            "INSERT INTO question_steps (step_id, question_uid, solution_branch_id, step_index,"
+            " step_goal_desc, step_formula_latex, knowledge_node_id, masked_conditions_json,"
+            " probe_question_md, c_sub, s_sub, t_sub, l_sub, sub_elo)"
+            " VALUES (?, ?, 'canonical', 1, '目标', 'x=5', 'kn-shared', '[]',"
+            " '反问', 1, 1, 1, 1, 1000)",
+            (f"step-{uid}", uid),
+        )
+    # 模拟历史脏边：跨学段边亦不得在检索阶段召回
+    for src, rel in (
+        ("q-hs-scaf", "SCAFFOLD_PRE"),
+        ("q-hs-trap", "ISOMORPHIC"),
+        ("q-hs-trap", "SHARED_TRAP"),
+    ):
+        conn.execute(
+            "INSERT INTO question_relations (source_question_uid, target_question_uid,"
+            " relation_type, is_directed, target_step_index, surface_sim, skeleton_sim,"
+            " containment_score, trap_overlap, confidence_source)"
+            " VALUES (?, 'q-elem-orig', ?, 0, NULL, 0.5, 0.8, 0.85, 1.0, 'HUMAN_VERIFIED')",
+            (src, rel),
+        )
+    orig = conn.execute("SELECT * FROM questions WHERE question_uid = 'q-elem-orig'").fetchone()
+    stalled_step = conn.execute(
+        "SELECT * FROM question_steps WHERE question_uid = 'q-elem-orig' AND step_index = 1"
+    ).fetchone()
+    assert orig is not None and stalled_step is not None
+    return orig, stalled_step
+
+
+def test_local_search_isolates_grades_for_scaffold_and_variants(tmp_db: Path) -> None:
+    """P11-B Bug 3：异学段存在同 TRAP_* 与同考点候选及历史关系边时，本地检索绝不命中。"""
+    with get_db_connection(tmp_db) as conn:
+        orig, stalled_step = _seed_grade_isolation_fixture(conn)
+        assert scaffold_engine._search_local_scaffold(conn, orig, stalled_step) is None
+        assert scaffold_engine._search_local_variant(conn, orig, "ISOMORPHIC") is None
+        assert scaffold_engine._search_local_variant(conn, orig, "SHARED_TRAP") is None
+
+        # 同构学段新增合格候选后应精准命中同学段候选
+        conn.execute(
+            "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
+            " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
+            " base_elo, tier, trap_tags_json, primary_l1_module, mastery_state)"
+            " VALUES ('q-elem-trap', 'USER_CANONICAL', '小学奥数', '同构小学题', 'h-et',"
+            " '5', 2, 2, 2, 2, 2000, 'L2_中等', '[\"TRAP_DOMAIN_BOUNDARY\"]', '综合', 'ACTIVE')"
+        )
+        conn.execute(
+            "INSERT INTO question_steps (step_id, question_uid, solution_branch_id, step_index,"
+            " step_goal_desc, step_formula_latex, knowledge_node_id, masked_conditions_json,"
+            " probe_question_md, c_sub, s_sub, t_sub, l_sub, sub_elo)"
+            " VALUES ('step-et', 'q-elem-trap', 'canonical', 1, '目标', 'x=5', 'kn-shared',"
+            " '[]', '反问', 1, 1, 1, 1, 1000)"
+        )
+        iso_hit = scaffold_engine._search_local_variant(conn, orig, "ISOMORPHIC")
+        trap_hit = scaffold_engine._search_local_variant(conn, orig, "SHARED_TRAP")
+        assert iso_hit is not None and iso_hit["question_uid"] == "q-elem-trap"
+        assert trap_hit is not None and trap_hit["question_uid"] == "q-elem-trap"
+
+
+async def test_retry_prewarm_force_swap_multiple_times_never_cycles_stage2(
+    tmp_db: Path, install_diagnosis: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P11-B Bug 4：二阶连续 >=3 次 force=True 换一题，每次产出 UID 均与所有历史互异。"""
+    sid, first_uid = await _reach_stage2(tmp_db, install_diagnosis)
+    seen_uids = [first_uid]
+
+    for _ in range(3):
+        resp = await retry_prewarm(sid, db_path=tmp_db, force=True)
+        assert resp.prewarm_status == "RUNNING"
+        await _drain(sid)
+        view = await get_session_view(sid, db_path=tmp_db)
+        assert view.prewarm_status in ("READY_SYMPY", "READY_FALLBACK")
+        new_uid = str(view.view_payload["micro_scaffold"]["question_uid"])
+        assert new_uid not in seen_uids
+        seen_uids.append(new_uid)
+
+    assert len(set(seen_uids)) == 4
+    sess = _one(
+        tmp_db,
+        "SELECT prewarm_excluded_uids_json FROM diagnostic_sessions WHERE session_id = ?",
+        (sid,),
+    )
+    assert set(json.loads(sess["prewarm_excluded_uids_json"])) == set(seen_uids[:3])
+
+    # 模拟第 4 次 force=True 换题失败为 FAILED 后，force=False 重试仍保留全部排除历史
+    fixtures = copy.deepcopy(llm_mocks.MOCK_RESPONSES)
+    del fixtures["scaffold_kernel"]
+    with monkeypatch.context() as m:
+        m.setattr(llm_mocks, "MOCK_RESPONSES", fixtures)
+        await retry_prewarm(sid, db_path=tmp_db, force=True)
+        await _drain(sid)
+    failed_view = await get_session_view(sid, db_path=tmp_db)
+    assert failed_view.prewarm_status == "FAILED"
+
+    await retry_prewarm(sid, db_path=tmp_db, force=False)
+    await _drain(sid)
+    recovered = await get_session_view(sid, db_path=tmp_db)
+    assert recovered.prewarm_status in ("READY_SYMPY", "READY_FALLBACK")
+    recovered_uid = str(recovered.view_payload["micro_scaffold"]["question_uid"])
+    assert recovered_uid not in seen_uids
+
+
+async def test_retry_prewarm_force_swap_multiple_times_never_cycles_stage4(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    """P11-B Bug 4：四阶连续 >=3 次 force=True 换一题，每次产出 UID 均与所有历史互异。"""
+    card = await _ingest(tmp_db, install_diagnosis, _payload(category="TRAP_OR_CALC_ERROR"))
+    sid = card.session_id
+    resp = await confirm_diagnostic_gate(sid, 2, "TRAP_OR_CALC_ERROR", db_path=tmp_db)
+    assert resp.micro_stage == "STAGE_4_DECRUTCH_VARIANT"
+    first_uid = str(resp.view_payload["variant"]["question_uid"])
+    seen_uids = [first_uid]
+
+    for _ in range(3):
+        swap_resp = await retry_prewarm(sid, db_path=tmp_db, force=True)
+        assert swap_resp.prewarm_status == "RUNNING"
+        await _drain(sid)
+        view = await get_session_view(sid, db_path=tmp_db)
+        assert view.prewarm_status in ("READY_SYMPY", "READY_FALLBACK")
+        new_uid = str(view.view_payload["variant"]["question_uid"])
+        assert new_uid not in seen_uids
+        seen_uids.append(new_uid)
+
+    assert len(set(seen_uids)) == 4
+    sess = _one(
+        tmp_db,
+        "SELECT prewarm_excluded_uids_json FROM diagnostic_sessions WHERE session_id = ?",
+        (sid,),
+    )
+    assert set(json.loads(sess["prewarm_excluded_uids_json"])) == set(seen_uids[:3])

@@ -533,3 +533,83 @@ def test_migration_orphan_nodes_stay_empty_and_warn(
         ).fetchone()["grade_subject"]
     assert grade == ""
     assert any("1 个知识节点" in rec.getMessage() for rec in caplog.records)
+
+
+def test_diagnostic_sessions_prewarm_excluded_uids_default(tmp_db: Path) -> None:
+    """P11-B：diagnostic_sessions 含 prewarm_excluded_uids_json 列且默认值为 '[]'。"""
+    with get_db_connection(tmp_db) as conn:
+        cols = {
+            row["name"]: row for row in conn.execute("PRAGMA table_info(diagnostic_sessions)")
+        }
+        assert "prewarm_excluded_uids_json" in cols
+        col = cols["prewarm_excluded_uids_json"]
+        assert col["type"] == "TEXT"
+        assert col["notnull"] == 1
+        assert col["dflt_value"] == "'[]'"
+
+        _insert_question(conn, "q-excl")
+        conn.execute(
+            "INSERT INTO diagnostic_sessions"
+            " (session_id, question_uid, draft_image_cas_uris_json,"
+            "  draft_steps_latex_json, error_category)"
+            " VALUES ('sess-excl', 'q-excl', '[]', '[]', 'CONCEPT_BOTTLENECK')"
+        )
+        row = conn.execute(
+            "SELECT prewarm_excluded_uids_json FROM diagnostic_sessions"
+            " WHERE session_id = 'sess-excl'"
+        ).fetchone()
+    assert row["prewarm_excluded_uids_json"] == "[]"
+
+
+def test_init_db_adds_prewarm_excluded_uids_column_idempotently(tmp_path: Path) -> None:
+    """P11-B：旧库缺少 prewarm_excluded_uids_json 时，init_db 可幂等补列且保留历史行。"""
+    from backend.db.schema import TABLE_DDLS
+
+    legacy_db = tmp_path / "legacy_p11b.db"
+    with sqlite3.connect(legacy_db) as conn:
+        conn.execute(TABLE_DDLS["questions"])
+        conn.execute(
+            """
+            CREATE TABLE diagnostic_sessions (
+                session_id TEXT PRIMARY KEY,
+                question_uid TEXT NOT NULL REFERENCES questions(question_uid) ON DELETE CASCADE,
+                draft_image_cas_uris_json TEXT NOT NULL,
+                draft_steps_latex_json TEXT NOT NULL,
+                matched_branch_id TEXT NOT NULL DEFAULT 'canonical',
+                last_valid_step_index INTEGER NOT NULL DEFAULT 0,
+                stalled_step_index INTEGER NOT NULL DEFAULT 1,
+                error_category TEXT NOT NULL,
+                trap_taxonomy_tag TEXT,
+                user_confirmed_gate INTEGER NOT NULL DEFAULT 0,
+                user_overridden INTEGER NOT NULL DEFAULT 0,
+                micro_stage TEXT NOT NULL DEFAULT 'STAGE_0_CONFIRM_GATE',
+                prewarm_scaffold_uid TEXT REFERENCES questions(question_uid),
+                prewarm_variant_uid TEXT REFERENCES questions(question_uid),
+                prewarm_status TEXT NOT NULL DEFAULT 'IDLE',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(_INSERT_QUESTION_SQL, ("q-legacy", 1))
+        conn.execute(
+            "INSERT INTO diagnostic_sessions"
+            " (session_id, question_uid, draft_image_cas_uris_json,"
+            "  draft_steps_latex_json, error_category)"
+            " VALUES ('sess-legacy', 'q-legacy', '[]', '[]', 'CONCEPT_BOTTLENECK')"
+        )
+        conn.commit()
+
+    init_db(legacy_db)
+    init_db(legacy_db)
+
+    with get_db_connection(legacy_db) as conn:
+        cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(diagnostic_sessions)")
+        }
+        assert "prewarm_excluded_uids_json" in cols
+        row = conn.execute(
+            "SELECT prewarm_excluded_uids_json FROM diagnostic_sessions"
+            " WHERE session_id = 'sess-legacy'"
+        ).fetchone()
+    assert row["prewarm_excluded_uids_json"] == "[]"

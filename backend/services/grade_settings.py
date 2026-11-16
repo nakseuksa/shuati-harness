@@ -142,11 +142,43 @@ def get_or_create_grade_subject(conn: sqlite3.Connection, name: str) -> str:
     return normalized
 
 
+def _rewrite_frontmatter_grade(stem_md: str, new_grade: str) -> str:
+    """仅改写顶部 YAML Frontmatter（首行 `---` 至闭合 `---`/`...`）内的学段行。
+
+    不触碰正文、不修改 question_uid；无有效闭合 frontmatter 或无该字段时原样返回。
+    """
+    lines = stem_md.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return stem_md
+    closing_idx: int | None = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() in ("---", "..."):
+            closing_idx = idx
+            break
+    if closing_idx is None:
+        return stem_md
+    changed = False
+    for idx in range(1, closing_idx):
+        line = lines[idx]
+        key, sep, _ = line.partition(":")
+        if sep and key.strip() == "target_grade_and_subject":
+            if line.endswith("\r\n"):
+                eol = "\r\n"
+            elif line.endswith("\n"):
+                eol = "\n"
+            else:
+                eol = ""
+            lines[idx] = f"{key.rstrip()}: {new_grade}{eol}"
+            changed = True
+    return "".join(lines) if changed else stem_md
+
+
 def rename_grade_subject(conn: sqlite3.Connection, old: str, new: str) -> dict[str, int]:
-    """单事务级联改标：条目主键 + questions + 四张分区表，返回各表受影响行数。
+    """单事务级联改标：条目主键 + questions（含 frontmatter 学段）+ 四张分区表，返回各表受影响行数。
 
     old 不存在 / new 已存在 / new 为空 → ValueError（写入前拦截，零残留）；
-    五处 UPDATE 在同一 SAVEPOINT 内执行，任一步失败整体回滚，绝无半截改标。
+    五处 UPDATE 在同一 SAVEPOINT 内执行，任一步失败整体回滚，绝无半截改标；
+    frontmatter 同步仅改写顶部 `target_grade_and_subject:` 行，不改 `stem_hash` 与 `question_uid`。
     """
     old_name = _normalize_name(old)
     new_name = _normalize_name(new)
@@ -167,11 +199,22 @@ def rename_grade_subject(conn: sqlite3.Connection, old: str, new: str) -> dict[s
             (new_name, old_name),
         )
         counts["grade_subjects"] = cur.rowcount
+        matched_questions = conn.execute(
+            "SELECT question_uid, stem_md FROM questions WHERE target_grade_and_subject = ?",
+            (old_name,),
+        ).fetchall()
         cur = conn.execute(
             "UPDATE questions SET target_grade_and_subject = ? WHERE target_grade_and_subject = ?",
             (new_name, old_name),
         )
         counts["questions"] = cur.rowcount
+        for row in matched_questions:
+            updated_stem = _rewrite_frontmatter_grade(str(row["stem_md"]), new_name)
+            if updated_stem != row["stem_md"]:
+                conn.execute(
+                    "UPDATE questions SET stem_md = ? WHERE question_uid = ?",
+                    (updated_stem, row["question_uid"]),
+                )
         for table in _SCOPED_TABLES:
             cur = conn.execute(
                 f"UPDATE {table} SET grade_subject = ? WHERE grade_subject = ?",

@@ -510,6 +510,19 @@ async def get_session_view(session_id: str, db_path: Path | None = None) -> Sess
     return _build_response(session_id, db_path)
 
 
+def _load_excluded_uids(raw: Any) -> set[str]:
+    """解析会话持久化的已排除题目 UID 列表；异常或空值回退为空集。"""
+    if not raw:
+        return set()
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    return {str(uid) for uid in parsed if uid}
+
+
 async def retry_prewarm(
     session_id: str,
     db_path: Path | None = None,
@@ -519,7 +532,7 @@ async def retry_prewarm(
     """FAILED / 产物缺失时重试预热（前端「重试预热 / 换一题」入口）。
 
     force=False（默认）：READY 且双产物齐全 → 幂等无操作返回当前视图；
-    force=True：作废当前阶段目标产物（排除既有 UID）并强制重生成；
+    force=True：作废当前阶段目标产物（持久化排除既有 UID）并强制重生成；
     SESSION_COMPLETED → ValueError。
     """
     with get_db_connection(db_path) as conn:
@@ -528,39 +541,39 @@ async def retry_prewarm(
     if stage == "SESSION_COMPLETED":
         raise ValueError("会话已完成，无需重试预热")
     status = str(session["prewarm_status"])
-    has_both = (
-        session["prewarm_scaffold_uid"] is not None
-        and session["prewarm_variant_uid"] is not None
-    )
+    scaffold_uid = session["prewarm_scaffold_uid"]
+    variant_uid = session["prewarm_variant_uid"]
+    has_both = scaffold_uid is not None and variant_uid is not None
     if not force and status in ("READY_SYMPY", "READY_FALLBACK") and has_both:
         return _build_response(session_id, db_path)
 
-    exclude_uids = {
-        str(uid)
-        for uid in (session["prewarm_scaffold_uid"], session["prewarm_variant_uid"])
-        if uid is not None
-    }
+    excluded = _load_excluded_uids(session["prewarm_excluded_uids_json"])
     if force:
+        clear_fields: dict[str, Any] = {"prewarm_status": "RUNNING"}
         if stage == "STAGE_2_MICRO_SCAFFOLD":
             refresh_scaffold, refresh_variant = True, False
-            _write_session_fields(
-                db_path, session_id, prewarm_scaffold_uid=None, prewarm_status="RUNNING"
-            )
+            target_uids: tuple[Any, ...] = (scaffold_uid,)
+            clear_fields["prewarm_scaffold_uid"] = None
         elif stage == "STAGE_4_DECRUTCH_VARIANT":
             refresh_scaffold, refresh_variant = False, True
-            _write_session_fields(
-                db_path, session_id, prewarm_variant_uid=None, prewarm_status="RUNNING"
-            )
+            target_uids = (variant_uid,)
+            clear_fields["prewarm_variant_uid"] = None
         else:
             refresh_scaffold, refresh_variant = True, True
-            _write_session_fields(
-                db_path,
-                session_id,
-                prewarm_scaffold_uid=None,
-                prewarm_variant_uid=None,
-                prewarm_status="RUNNING",
-            )
+            target_uids = (scaffold_uid, variant_uid)
+            clear_fields["prewarm_scaffold_uid"] = None
+            clear_fields["prewarm_variant_uid"] = None
+        for uid in target_uids:
+            if uid:
+                excluded.add(str(uid))
+        clear_fields["prewarm_excluded_uids_json"] = json.dumps(
+            sorted(excluded), ensure_ascii=False
+        )
+        _write_session_fields(db_path, session_id, **clear_fields)
     else:
+        for uid in (scaffold_uid, variant_uid):
+            if uid:
+                excluded.add(str(uid))
         refresh_scaffold, refresh_variant = True, True
         if status != "RUNNING":
             _write_session_fields(db_path, session_id, prewarm_status="RUNNING")
@@ -571,7 +584,7 @@ async def retry_prewarm(
         force_refresh=force,
         refresh_scaffold=refresh_scaffold,
         refresh_variant=refresh_variant,
-        exclude_uids=exclude_uids or None,
+        exclude_uids=excluded or None,
     )
     return _build_response(session_id, db_path)
 
@@ -626,12 +639,17 @@ async def _prewarm_impl(
 
     _write_session_fields(db_path, session_id, prewarm_status="RUNNING")
 
+    effective_exclude = set(exclude_uids or ()) | _load_excluded_uids(
+        session["prewarm_excluded_uids_json"]
+    )
+    exclude_arg = effective_exclude or None
+
     async def _keep(outcome: _PrewarmOutcome | None) -> _PrewarmOutcome | None:
         return outcome
 
     scaffold_coro = (
         _prepare_scaffold(
-            question, stalled_step, db_path, session_id=session_id, exclude_uids=exclude_uids
+            question, stalled_step, db_path, session_id=session_id, exclude_uids=exclude_arg
         )
         if refresh_scaffold or existing_scaffold is None
         else _keep(existing_scaffold)
@@ -642,7 +660,7 @@ async def _prewarm_impl(
             str(session["error_category"]),
             db_path,
             session_id=session_id,
-            exclude_uids=exclude_uids,
+            exclude_uids=exclude_arg,
         )
         if refresh_variant or existing_variant is None
         else _keep(existing_variant)
@@ -814,20 +832,23 @@ def _search_local_scaffold(
     *,
     exclude_uids: set[str] | None = None,
 ) -> sqlite3.Row | None:
-    """SCAFFOLD_PRE：既有有向边优先；否则同主考点、步数<=2、D_orig-D_cand>=200。"""
+    """SCAFFOLD_PRE：既有有向边优先；否则同主考点、同学段、步数<=2、D_orig-D_cand>=200。"""
     excluded = exclude_uids or set()
     parent_uid = str(question["question_uid"])
+    grade = str(question["target_grade_and_subject"])
     rows = conn.execute(
         "SELECT q.* FROM question_relations r "
         "JOIN questions q ON q.question_uid = r.source_question_uid "
-        "WHERE r.target_question_uid = ? AND r.relation_type = 'SCAFFOLD_PRE'",
-        (parent_uid,),
+        "WHERE r.target_question_uid = ? AND r.relation_type = 'SCAFFOLD_PRE' "
+        "AND q.target_grade_and_subject = ?",
+        (parent_uid, grade),
     ).fetchall()
     for row in rows:
         if str(row["question_uid"]) not in excluded:
             return row
     candidates = conn.execute(
-        "SELECT q.* FROM questions q WHERE q.question_uid <> ? AND q.base_elo <= ? "
+        "SELECT q.* FROM questions q WHERE q.question_uid <> ? "
+        "AND q.target_grade_and_subject = ? AND q.base_elo <= ? "
         "AND (SELECT COUNT(*) FROM question_steps s WHERE s.question_uid = q.question_uid "
         "     AND s.solution_branch_id = 'canonical') BETWEEN 1 AND ? "
         "AND EXISTS (SELECT 1 FROM question_steps s WHERE s.question_uid = q.question_uid "
@@ -835,6 +856,7 @@ def _search_local_scaffold(
         "ORDER BY q.base_elo DESC",
         (
             parent_uid,
+            grade,
             int(question["base_elo"]) - _SCAFFOLD_MIN_ELO_GAP,
             _SCAFFOLD_MAX_STEPS,
             str(stalled_step["knowledge_node_id"]),
@@ -853,18 +875,21 @@ def _search_local_variant(
     *,
     exclude_uids: set[str] | None = None,
 ) -> sqlite3.Row | None:
-    """ISOMORPHIC：同考点集且 |ΔD|<=150；SHARED_TRAP：trap_tags 交集非空。"""
+    """ISOMORPHIC：同学段同考点集且 |ΔD|<=150；SHARED_TRAP：同学段且 trap_tags 交集非空。"""
     excluded = exclude_uids or set()
     parent_uid = str(question["question_uid"])
+    grade = str(question["target_grade_and_subject"])
     for sql in (
         "SELECT q.* FROM question_relations r "
         "JOIN questions q ON q.question_uid = r.source_question_uid "
-        "WHERE r.target_question_uid = ? AND r.relation_type = ?",
+        "WHERE r.target_question_uid = ? AND r.relation_type = ? "
+        "AND q.target_grade_and_subject = ?",
         "SELECT q.* FROM question_relations r "
         "JOIN questions q ON q.question_uid = r.target_question_uid "
-        "WHERE r.source_question_uid = ? AND r.relation_type = ?",
+        "WHERE r.source_question_uid = ? AND r.relation_type = ? "
+        "AND q.target_grade_and_subject = ?",
     ):
-        for row in conn.execute(sql, (parent_uid, relation_type)).fetchall():
+        for row in conn.execute(sql, (parent_uid, relation_type, grade)).fetchall():
             if str(row["question_uid"]) not in excluded:
                 return row
 
@@ -874,8 +899,9 @@ def _search_local_variant(
     if relation_type == "ISOMORPHIC":
         parent_nodes = _node_id_set(conn, parent_uid)
         candidates = conn.execute(
-            "SELECT * FROM questions WHERE question_uid <> ? AND ABS(base_elo - ?) <= ?",
-            (parent_uid, parent_elo, _ISOMORPHIC_MAX_ELO_GAP),
+            "SELECT q.* FROM questions q WHERE q.question_uid <> ? "
+            "AND q.target_grade_and_subject = ? AND ABS(q.base_elo - ?) <= ?",
+            (parent_uid, grade, parent_elo, _ISOMORPHIC_MAX_ELO_GAP),
         ).fetchall()
         for cand in candidates:
             if str(cand["question_uid"]) in excluded:
@@ -891,7 +917,9 @@ def _search_local_variant(
     if not parent_tags:
         return None
     candidates = conn.execute(
-        "SELECT * FROM questions WHERE question_uid <> ?", (parent_uid,)
+        "SELECT q.* FROM questions q WHERE q.question_uid <> ? "
+        "AND q.target_grade_and_subject = ?",
+        (parent_uid, grade),
     ).fetchall()
     for cand in candidates:
         if str(cand["question_uid"]) in excluded:

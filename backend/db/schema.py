@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS diagnostic_sessions (
     prewarm_status TEXT NOT NULL DEFAULT 'IDLE' CHECK (
         prewarm_status IN ('IDLE', 'RUNNING', 'READY_SYMPY', 'READY_FALLBACK', 'FAILED')
     ),
+    prewarm_excluded_uids_json TEXT NOT NULL DEFAULT '[]',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -455,6 +456,11 @@ def init_db(db_path: Path | None = None) -> None:
     with get_db_connection(path) as conn:
         for ddl in TABLE_DDLS.values():
             conn.execute(ddl)
+        if not _has_column(conn, "diagnostic_sessions", "prewarm_excluded_uids_json"):
+            conn.execute(
+                "ALTER TABLE diagnostic_sessions ADD COLUMN prewarm_excluded_uids_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
         _migrate_grade_scoping(conn)
         for ddl in INDEX_DDLS:
             conn.execute(ddl)

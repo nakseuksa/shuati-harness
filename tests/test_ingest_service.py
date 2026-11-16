@@ -1412,3 +1412,177 @@ async def test_empty_grade_rejected_before_any_write(
     assert diagnose_calls == []
     for table in ("questions", "knowledge_nodes", "diagnostic_sessions", "grade_subjects"):
         assert _count(tmp_db, table) == 0
+
+
+# ---------------------------------------------------------------------------
+# P11-C：带新草稿重入库多解分支持久化与分支名防冲突递增
+# ---------------------------------------------------------------------------
+
+
+def _four_step_alt_payload(
+    *,
+    last_valid: int = 3,
+    stalled: int = 4,
+    branch_id: str = "user_alt_1",
+) -> DiagnosisPayload:
+    """构造 4 步替代解法（多于 canonical 3 步），用于重入库多解持久化测试。"""
+    payload = _default_payload()
+    alt_steps = [
+        StepSkeletonItem(
+            step_index=i,
+            step_goal_desc=f"替代解法第 {i} 步",
+            step_formula_latex=f"x_{i} = {i}",
+            l1_module="力学",
+            l2_entity="圆周运动",
+            l3_operator=f"替代算子{i}",
+            c_sub=2,
+            s_sub=2,
+            t_sub=1,
+            l_sub=1,
+            masked_conditions=[f"条件{i}"],
+            probe_question_md=f"写出第 {i} 步关系。",
+        )
+        for i in range(1, 5)
+    ]
+    payload.alignment = DraftAlignmentResult(
+        draft_steps_latex=["x_1 = 1", "x_2 = 2", "x_3 = 3"],
+        matched_branch_id=branch_id,
+        alt_branch_steps=alt_steps,
+        last_valid_step_index=last_valid,
+        stalled_step_index=stalled,
+        error_category="CONCEPT_BOTTLENECK",
+        trap_taxonomy_tag=None,
+    )
+    return payload
+
+
+async def test_reimport_new_draft_persists_alt_branch_and_allocates_increment(
+    tmp_db: Path,
+    cas_dir: Path,
+    draft_image: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P11-C：带新草稿重入库识别 user_alt_1（4步）时持久化分支步骤并防冲突递增 user_alt_2。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image])
+    uid = first.question_uid
+
+    # 模拟已有进度/托管池/账本，验证重入库绝不漂移
+    with get_db_connection(tmp_db) as conn:
+        conn.execute(
+            "UPDATE questions SET mastery_state='MASTERED', "
+            "blind_test_unlock_at='2026-11-16 00:00:00', "
+            "blind_test_due_at='2026-11-20 00:00:00' WHERE question_uid=?",
+            (uid,),
+        )
+        conn.execute(
+            "INSERT INTO question_escrow_pool (question_uid, l1_module, "
+            "initial_combat_elo_snapshot, floor_elo_applied, escrow_status) "
+            "VALUES (?, '力学', 1200.0, 90.0, 'FLOOR_ONLY')",
+            (uid,),
+        )
+        conn.execute(
+            "INSERT INTO elo_mutation_ledger (idempotency_key, l1_module, question_uid, "
+            "mutation_trigger, eval_difficulty_elo, coverage_elo_before, coverage_elo_after, "
+            "combat_elo_before, combat_elo_after, explanation_text, grade_subject) "
+            "VALUES (?, '力学', ?, 'PARTIAL_DRAFT_SUBGOAL_FLOOR', 1290, "
+            "1200.0, 1290.0, 1200.0, 1290.0, '测试快照', ?)",
+            (f"{uid}:{first.session_id}:PARTIAL_DRAFT_SUBGOAL_FLOOR", uid, GRADE),
+        )
+    canonical_before = [
+        dict(r)
+        for r in _query(
+            tmp_db,
+            "SELECT * FROM question_steps WHERE question_uid=? AND solution_branch_id='canonical' "
+            "ORDER BY step_index",
+            (uid,),
+        )
+    ]
+    escrow_before = [dict(r) for r in _query(tmp_db, "SELECT * FROM question_escrow_pool")]
+    ledger_before = [dict(r) for r in _query(tmp_db, "SELECT * FROM elo_mutation_ledger")]
+
+    # 第一次携带新草稿重入库：4 步替代分支，卡在 Step 4（多于 canonical 3 步）
+    _install_payload(monkeypatch, _four_step_alt_payload(last_valid=3, stalled=4))
+    draft2 = _make_image(tmp_path / "draft2.png", (0, 255, 0))
+    card2 = await _ingest(tmp_db, stem_md=_with_uid(uid, STEM_MD), draft_images=[draft2])
+
+    assert card2.is_reimport is True
+    assert card2.session_id != first.session_id
+    assert [s.step_index for s in card2.steps] == [1, 2, 3, 4]
+    assert [s.status for s in card2.steps] == ["completed", "completed", "completed", "blocked"]
+    expected_sub_elo = clamp_substep_difficulty(
+        (3, 3, 2, 3), EXPECTED_BASE_ELO, (2, 2, 1, 1)
+    )[1]
+    assert [s.sub_elo for s in card2.steps] == [expected_sub_elo] * 4
+    assert card2.floor_preview_elo == expected_sub_elo
+
+    # canonical 3 步完好无损，user_alt_1 4 步正确落库
+    canonical_after = [
+        dict(r)
+        for r in _query(
+            tmp_db,
+            "SELECT * FROM question_steps WHERE question_uid=? AND solution_branch_id='canonical' "
+            "ORDER BY step_index",
+            (uid,),
+        )
+    ]
+    assert canonical_after == canonical_before
+    alt1_rows = _query(
+        tmp_db,
+        "SELECT * FROM question_steps WHERE question_uid=? AND solution_branch_id='user_alt_1' "
+        "ORDER BY step_index",
+        (uid,),
+    )
+    assert len(alt1_rows) == 4
+    assert [r["is_blocked_step"] for r in alt1_rows] == [0, 0, 0, 1]
+    assert [r["sub_elo"] for r in alt1_rows] == [expected_sub_elo] * 4
+    sess2 = _query(
+        tmp_db, "SELECT * FROM diagnostic_sessions WHERE session_id=?", (card2.session_id,)
+    )[0]
+    assert sess2["matched_branch_id"] == "user_alt_1"
+    # 新节点全部落在既有题目学段
+    assert {
+        str(r["grade_subject"]) for r in _query(tmp_db, "SELECT * FROM knowledge_nodes")
+    } == {GRADE}
+
+    # Elo / 托管池 / 掌握态 / 盲测字段零漂移
+    q = _query(tmp_db, "SELECT * FROM questions WHERE question_uid=?", (uid,))[0]
+    assert q["mastery_state"] == "MASTERED"
+    assert q["blind_test_unlock_at"] == "2026-11-16 00:00:00"
+    assert q["blind_test_due_at"] == "2026-11-20 00:00:00"
+    assert [dict(r) for r in _query(tmp_db, "SELECT * FROM question_escrow_pool")] == escrow_before
+    assert [dict(r) for r in _query(tmp_db, "SELECT * FROM elo_mutation_ledger")] == ledger_before
+
+    # 第二次携带新草稿重入库，VLM 仍返回 matched_branch_id='user_alt_1'：
+    # 自动分配 user_alt_2 无 UNIQUE 冲突
+    _install_payload(
+        monkeypatch, _four_step_alt_payload(last_valid=2, stalled=3, branch_id="user_alt_1")
+    )
+    draft3 = _make_image(tmp_path / "draft3.png", (255, 255, 0))
+    card3 = await _ingest(tmp_db, stem_md=_with_uid(uid, STEM_MD), draft_images=[draft3])
+
+    assert card3.is_reimport is True
+    assert card3.session_id not in {first.session_id, card2.session_id}
+    assert [s.status for s in card3.steps] == ["completed", "completed", "blocked", "untouched"]
+    sess3 = _query(
+        tmp_db, "SELECT * FROM diagnostic_sessions WHERE session_id=?", (card3.session_id,)
+    )[0]
+    assert sess3["matched_branch_id"] == "user_alt_2"
+    alt2_rows = _query(
+        tmp_db,
+        "SELECT * FROM question_steps WHERE question_uid=? AND solution_branch_id='user_alt_2' "
+        "ORDER BY step_index",
+        (uid,),
+    )
+    assert len(alt2_rows) == 4
+    assert [r["is_blocked_step"] for r in alt2_rows] == [0, 0, 1, 1]
+    # 历史 user_alt_1 分支保持原样（4 行，卡在 Step 4）
+    assert [
+        r["is_blocked_step"]
+        for r in _query(
+            tmp_db,
+            "SELECT is_blocked_step FROM question_steps "
+            "WHERE question_uid=? AND solution_branch_id='user_alt_1' ORDER BY step_index",
+            (uid,),
+        )
+    ] == [0, 0, 0, 1]

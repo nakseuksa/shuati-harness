@@ -260,7 +260,7 @@ async def ingest_question(
                 "SELECT * FROM questions WHERE question_uid = ?", (uid,)
             ).fetchone()
             assert fresh_existing is not None
-            return _persist_reimport_draft_session(
+            return await _persist_reimport_draft_session(
                 conn,
                 fresh_existing,
                 payload=payload,
@@ -466,7 +466,27 @@ async def _ingest_new_question(
 # ---------------------------------------------------------------------------
 
 
-def _persist_reimport_draft_session(
+def _allocate_alt_branch_id(
+    conn: sqlite3.Connection, question_uid: str, preferred_branch_id: str
+) -> str:
+    """为重入库替代分支分配不冲突的 solution_branch_id（保留既有历史分支）。"""
+    existing_branches = {
+        str(row["solution_branch_id"])
+        for row in conn.execute(
+            "SELECT DISTINCT solution_branch_id FROM question_steps WHERE question_uid = ?",
+            (question_uid,),
+        ).fetchall()
+    }
+    branch_id = preferred_branch_id or "user_alt_1"
+    if branch_id in existing_branches:
+        idx = 1
+        while f"user_alt_{idx}" in existing_branches:
+            idx += 1
+        branch_id = f"user_alt_{idx}"
+    return branch_id
+
+
+async def _persist_reimport_draft_session(
     conn: sqlite3.Connection,
     existing: sqlite3.Row,
     *,
@@ -476,7 +496,7 @@ def _persist_reimport_draft_session(
     draft_uris: list[str],
     initial_state: InitialState,
 ) -> GateCardDTO:
-    """携带新草稿重入库写库事务：题干更新（若变更）+ 新建会话（绝不跨 VLM 持锁）。"""
+    """携带新草稿重入库写库事务：题干更新（若变更）+ 替代分支落库 + 新建会话（绝不跨 VLM 持锁）。"""
     uid = str(existing["question_uid"])
     stem_changed = existing["stem_hash"] != stem_hash
     if stem_changed:
@@ -485,17 +505,48 @@ def _persist_reimport_draft_session(
             "updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
             (normalized_md, stem_hash, uid),
         )
+    alignment = payload.alignment
     log_event(
         logger,
         "ingest.diagnosis",
         question_uid=uid,
         base_elo=int(existing["base_elo"]),
         tier=str(existing["tier"]),
-        error_category=payload.alignment.error_category,
-        stalled_step=payload.alignment.stalled_step_index,
+        error_category=alignment.error_category,
+        stalled_step=alignment.stalled_step_index,
         step_count=len(payload.trace.steps),
     )
-    _insert_session(conn, uid, draft_uris, payload.alignment, initial_state)
+    alt_steps = alignment.alt_branch_steps
+    if alt_steps:
+        branch_id = _allocate_alt_branch_id(conn, uid, alignment.matched_branch_id)
+        alignment = alignment.model_copy(update={"matched_branch_id": branch_id})
+        parent_cstl = (
+            int(existing["c_score"]),
+            int(existing["s_score"]),
+            int(existing["t_score"]),
+            int(existing["l_score"]),
+        )
+        base_elo = int(existing["base_elo"])
+        tree_grade = str(existing["target_grade_and_subject"])
+        for step in alt_steps:
+            sub_cstl, sub_elo = clamp_substep_difficulty(
+                parent_cstl, base_elo, (step.c_sub, step.s_sub, step.t_sub, step.l_sub)
+            )
+            node_id, reused = await match_or_create_l3_node(
+                conn, tree_grade, step.l1_module, step.l2_entity, step.l3_operator, []
+            )
+            _insert_step_row(
+                conn,
+                uid,
+                branch_id,
+                step,
+                node_id,
+                reused,
+                sub_cstl,
+                sub_elo,
+                alignment.stalled_step_index,
+            )
+    _insert_session(conn, uid, draft_uris, alignment, initial_state)
     new_session = _latest_session(conn, uid)
     log_event(
         logger,

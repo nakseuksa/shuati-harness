@@ -25,6 +25,7 @@ from backend.services import elo_engine, knowledge_graph
 from backend.services.blind_drill_scheduler import (
     BlindDrillItemDTO,
     BlindDrillOutcomeDTO,
+    _extract_symbols,
     evaluate_blind_drill_submission,
     get_daily_blind_drill_queue,
 )
@@ -921,3 +922,141 @@ def test_decay_stays_global_across_grades(conn: sqlite3.Connection) -> None:
         "SELECT COUNT(*) FROM elo_mutation_ledger WHERE mutation_trigger='ESCROW_TIMEOUT_DECAY'"
     ).fetchone()[0]
     assert events == 2  # 两学段各一题，各仅一条衰减事件
+
+
+# ---------------------------------------------------------------------------
+# P11-A：L>=2 变式 equation_skeleton 核验对齐 + 下标符号提取与噪声剥离
+# ---------------------------------------------------------------------------
+
+
+def test_variant_equation_skeleton_passes_and_wrong_skeleton_fails(
+    conn: sqlite3.Connection,
+) -> None:
+    """AI_SYNTHETIC_VARIANT (L>=2) 在 canonical 首步存有列式骨架时，提交等价列式可销账。"""
+    skeleton_std = r"m*v_{max}^2/2 = q*U"
+    final_std = r"v_{max} = 10\ \text{m/s}"
+
+    _prepare_original(conn, "q-vskel-pass", l_score=2)
+    _insert_variant(conn, "v-skel-pass", "q-vskel-pass", answer=final_std)
+    _insert_step(
+        conn,
+        "v-skel-pass",
+        "vs-pass-1",
+        index=1,
+        formula=skeleton_std,
+        probe="列式骨架",
+        node_id="n-q-vskel-pass-1",
+        blocked=0,
+    )
+    _insert_step(
+        conn,
+        "v-skel-pass",
+        "vs-pass-2",
+        index=2,
+        formula=final_std,
+        probe="化简求值",
+        node_id="n-q-vskel-pass-2",
+        blocked=0,
+    )
+    _insert_relation(conn, "q-vskel-pass", "v-skel-pass", "CLONE")
+
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
+    assert item.drill_question_uid == "v-skel-pass"
+    assert item.verification_mode == "equation_skeleton"
+    assert item.requires_intermediate is False
+
+    pass_out = evaluate_blind_drill_submission(
+        conn, "q-vskel-pass", r"\frac{1}{2}m v_{max}^2 = q U", None, DAY
+    )
+    assert pass_out.passed is True
+    assert pass_out.mastery_state == "MASTERED"
+    assert _pool(conn, "q-vskel-pass")["escrow_status"] == "REALIZED_MASTERED"
+
+    # 错误列式骨架仍判失败，触发 STAGE_1 重训
+    _prepare_original(conn, "q-vskel-fail", l_score=2)
+    _insert_variant(conn, "v-skel-fail", "q-vskel-fail", answer=final_std)
+    _insert_step(
+        conn,
+        "v-skel-fail",
+        "vs-fail-1",
+        index=1,
+        formula=skeleton_std,
+        probe="列式骨架",
+        node_id="n-q-vskel-fail-1",
+        blocked=0,
+    )
+    _insert_relation(conn, "q-vskel-fail", "v-skel-fail", "ISOMORPHIC")
+
+    fail_out = evaluate_blind_drill_submission(
+        conn, "q-vskel-fail", "m*vmax^2 = q*U", None, DAY
+    )
+    assert fail_out.passed is False
+    assert fail_out.mastery_state == "ACTIVE"
+    assert fail_out.retrain_stage == "STAGE_1_BLIND_PROBE"
+    assert _attempt(conn, "q-vskel-fail")["final_correct"] == 0
+
+
+def test_original_fallback_rejects_step_skeleton_as_final_answer(
+    conn: sqlite3.Connection,
+) -> None:
+    """原题回退时 final_answer 必须匹配 standard_answer_latex，不会被步骤骨架误放行。"""
+    _prepare_original(conn, "q-orig-strict", l_score=2, answer=FINAL_RIGHT)
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
+    assert item.requires_intermediate is True
+    assert item.verification_mode == "equation_skeleton"
+
+    # 提交 step 1 的公式作为 final_answer（即使中间步正确）仍须判定最终答案错
+    outcome = evaluate_blind_drill_submission(
+        conn, "q-orig-strict", "q*v*B = m*v^2/R", INTERMEDIATE_RIGHT, DAY
+    )
+    assert outcome.passed is False
+    assert outcome.retrain_stage == "STAGE_4_DECRUTCH_VARIANT"
+    log = _attempt(conn, "q-orig-strict")
+    assert log["intermediate_correct"] == 1
+    assert log["final_correct"] == 0
+
+
+def test_extract_symbols_subscripts_and_noise_stripping() -> None:
+    """_extract_symbols 保留显式下标并剥离单位与 Markdown URL 十六进制字母。"""
+    syms = _extract_symbols(
+        [
+            "![示意图](cas://0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d)"
+            " [参考](https://example.com/1a2b/c/x?y=3)"
+            r" 初速度 v_0，最大速度 v_{max} = 20\ \text{m/s}，"
+            r" 质量 \mathrm{kg}，函数 \operatorname{sin}，常量 \mbox{const}，"
+            r" 倾角 \theta_0，参考量 z_0。"
+        ]
+    )
+    assert syms == ["theta0", "v0", "vmax", "z0"]
+
+    # 同时出现带下标与不带下标的同前缀符号时，二者各自独立保留
+    both = _extract_symbols([r"v_0 + v + \theta_0 + \theta"])
+    assert both == ["theta", "theta0", "v", "v0"]
+
+
+def test_build_item_allowed_symbols_with_subscripts_and_cas_image(
+    conn: sqlite3.Connection,
+) -> None:
+    """_build_item 返回的 allowed_symbols 正确保留下标且不泄漏 cas:// 与单位字母。"""
+    stem = (
+        "![题图](cas://0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d)\n"
+        r"粒子初速度 v_0，以倾角 \theta_0 射入磁场，求最大速度 v_{max}（单位 \text{m/s}）。"
+    )
+    _insert_question(conn, "q-sub-sym", l_score=2, stem=stem, answer=r"v_{max} = 20\ \text{m/s}")
+    _insert_node(conn, "n-sub-1")
+    _insert_step(
+        conn,
+        "q-sub-sym",
+        "s-sub-1",
+        index=1,
+        formula=r"v_{max} = \frac{q B R}{m}",
+        probe="列式骨架",
+        node_id="n-sub-1",
+        blocked=1,
+    )
+    _insert_session(conn, "q-sub-sym", "sess-sub-1", stalled=1)
+    _insert_pool(conn, "q-sub-sym")
+
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
+    assert item.verification_mode == "equation_skeleton"
+    assert item.allowed_symbols == ["B", "R", "m", "q", "theta0", "v0", "vmax"]

@@ -634,6 +634,14 @@ async function renameGradeSubject(btn, old) {
       const affected = (resp && resp.affected) || {};
       const total = Object.values(affected).reduce((acc, v) => acc + (Number(v) || 0), 0);
       toast(`✏️ 已重命名为「${renamed}」（级联改标 ${total} 行）`, 'ok');
+      if (state.gateGrade === old) state.gateGrade = renamed;
+      if (state.sessionGrade === old) state.sessionGrade = renamed;
+      const persisted = loadPersistedSession();
+      if (persisted && persisted.grade === old) {
+        try {
+          localStorage.setItem(LS_SESSION, JSON.stringify({ ...persisted, grade: renamed }));
+        } catch { /* 存储不可用时仅内存态 */ }
+      }
       await fetchGradeOptions();
       if (old === state.gradeSubject) changeGrade(renamed);
       else syncGradeSelect();
@@ -1047,7 +1055,7 @@ function persistSession() {
     if (state.session) {
       localStorage.setItem(LS_SESSION, JSON.stringify({
         resp: state.session, gateParams: state.gateParams, savedAt: Date.now(),
-        grade: state.gradeSubject, // P10-F：续传横幅按学段匹配
+        grade: state.sessionGrade || state.gradeSubject, // P10-F/P11-D：续传横幅按会话所属学段匹配
       }));
     } else {
       localStorage.removeItem(LS_SESSION);
@@ -1526,6 +1534,12 @@ function drillCardHtml(item, idx) {
   const uid = item.question_uid;
   const outcome = state.drill.outcomes[uid];
   const isEq = item.verification_mode === 'equation_skeleton';
+  const isVariantEq = isEq && !item.requires_intermediate;
+  const uidEsc = esc(uid);
+  const symbolRow = (targetId) => (isEq && item.allowed_symbols.length ? `
+    <div class="symbol-row" role="group" aria-label="allowed_symbols 符号芯片">
+      ${item.allowed_symbols.map((s) => `<button type="button" class="symbol-chip" data-action="insert-symbol" data-symbol="${esc(s)}" data-target="${targetId}">${esc(s)}</button>`).join('')}
+    </div>` : '');
   if (outcome) {
     const passed = outcome.passed;
     const retrain = outcome.retrain_stage;
@@ -1567,7 +1581,7 @@ function drillCardHtml(item, idx) {
   <div class="card drill-card">
     <div class="card-title">
       <span class="drill-no">盲测题 #${idx + 1}</span>
-      <span class="badge badge-gray">${isEq ? '🧮 核心列式核验' : '✍️ 最终答案核验'}</span>
+      <span class="badge badge-gray">${item.requires_intermediate ? '✍️ 双重核验（中间式 + 最终答案）' : (isEq ? '🧮 核心列式核验' : '✍️ 最终答案核验')}</span>
       ${item.requires_intermediate ? '<span class="badge badge-amber">🔒 原题回退 · 中间量+最终答案双重核验</span>' : ''}
       <span class="hint">来源与知识点标签已剥离</span>
     </div>
@@ -1579,24 +1593,22 @@ function drillCardHtml(item, idx) {
             <div class="probe-label">曾卡壳的中间子目标（必答）</div>
             <div class="rich">${renderRich(item.probe_question_md || '（中间子目标描述缺失）')}</div>
           </div>
-          <label class="field-label" for="drill-mid-${esc(uid)}">中间子目标表达式</label>
-          <textarea id="drill-mid-${esc(uid)}" class="mono-input" rows="2" data-eq="1"
+          <label class="field-label" for="drill-mid-${uidEsc}">中间子目标表达式</label>
+          ${symbolRow(`drill-mid-${uidEsc}`)}
+          <textarea id="drill-mid-${uidEsc}" class="mono-input" rows="2" data-eq="1"
                     placeholder="输入曾卡壳步骤的中间关系式（SymPy / LaTeX）"></textarea>
         </div>` : ''}
       <div>
-        <label class="field-label" for="drill-fin-${esc(uid)}">${isEq ? '核心方程组（无需化简）' : '最终答案'}</label>
-        ${isEq && item.allowed_symbols.length ? `
-          <div class="symbol-row" role="group" aria-label="allowed_symbols 符号芯片">
-            ${item.allowed_symbols.map((s) => `<button type="button" class="symbol-chip" data-action="insert-symbol" data-symbol="${esc(s)}" data-target="drill-fin-${esc(uid)}">${esc(s)}</button>`).join('')}
-          </div>` : ''}
-        ${isEq
-          ? `<textarea id="drill-fin-${esc(uid)}" class="mono-input" rows="3" data-eq="1"
+        <label class="field-label" for="drill-fin-${uidEsc}">${isVariantEq ? '核心方程组（无需化简）' : '最终答案'}</label>
+        ${isVariantEq ? symbolRow(`drill-fin-${uidEsc}`) : ''}
+        ${isVariantEq
+          ? `<textarea id="drill-fin-${uidEsc}" class="mono-input" rows="3" data-eq="1"
                placeholder="多个方程用 ; 或换行分隔"></textarea>`
-          : `<input type="text" id="drill-fin-${esc(uid)}" placeholder="输入最终答案（数值 / 表达式）" />`}
+          : `<input type="text" id="drill-fin-${uidEsc}" placeholder="输入最终答案（数值 / 表达式）" />`}
       </div>
     </div>
     <div class="btn-row" style="margin-top:14px">
-      <button class="btn btn-primary" type="button" data-action="drill-submit" data-uid="${esc(uid)}">📤 提交盲测答案</button>
+      <button class="btn btn-primary" type="button" data-action="drill-submit" data-uid="${uidEsc}">📤 提交盲测答案</button>
       ${item.requires_intermediate ? '<span class="field-help">两项均正确方可销账为 🟢MASTERED</span>' : ''}
     </div>
   </div>`;
@@ -1666,9 +1678,7 @@ async function openRetrainSession(btn, sessionId) {
     state.sessionGrade = state.gradeSubject;
     persistSession();
     switchTab('training');
-    if (next && (next.prewarm_status === 'RUNNING' || next.prewarm_status === 'IDLE')) {
-      startPrewarmPoll();
-    }
+    syncPrewarmPoll();
     renderResumeBanner();
   });
 }

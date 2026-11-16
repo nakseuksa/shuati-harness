@@ -314,6 +314,65 @@ def test_rename_invalid_args_raise(seeded_db: Path, old: str, new: str) -> None:
             rename_grade_subject(conn, old, new)
 
 
+def test_rename_syncs_frontmatter_without_touching_body_or_hash(tmp_db: Path) -> None:
+    """P11-C：改名同步改写 stem_md 顶部 frontmatter 学段，不误改正文、不改 stem_hash/counts。"""
+    old_grade = _GRADE_A
+    new_grade = "小学奥数-竞赛"
+    body_text = (
+        f"已知题目属性文本 target_grade_and_subject: {old_grade} 应原样保留。\n"
+        f"---\ntarget_grade_and_subject: {old_grade}\n---\n"
+    )
+    stem_a = (
+        f"---\nquestion_uid: uid-a1\ntarget_grade_and_subject: {old_grade}\n---\n\n{body_text}"
+    )
+    stem_a_dots = (
+        f"---\nquestion_uid: uid-a2\ntarget_grade_and_subject: {old_grade}\n...\n\n纯正文"
+    )
+    stem_b = (
+        f"---\nquestion_uid: uid-b1\ntarget_grade_and_subject: {_GRADE_B}\n---\n\n其他学段正文"
+    )
+    with get_db_connection(tmp_db) as conn:
+        conn.execute(
+            "INSERT INTO grade_subjects (grade_subject) VALUES (?), (?)",
+            (old_grade, _GRADE_B),
+        )
+        for uid, grade, stem, shash in (
+            ("uid-a1", old_grade, stem_a, "hash-a1"),
+            ("uid-a2", old_grade, stem_a_dots, "hash-a2"),
+            ("uid-b1", _GRADE_B, stem_b, "hash-b1"),
+        ):
+            conn.execute(
+                "INSERT INTO questions ("
+                "question_uid, origin_type, target_grade_and_subject, stem_md, stem_hash, "
+                "standard_answer_latex, c_score, s_score, t_score, l_score, base_elo, tier, "
+                "primary_l1_module) VALUES (?, 'USER_CANONICAL', ?, ?, ?, 'x=1', "
+                "1, 1, 1, 1, 1000, 'L1_基础直达', '代数')",
+                (uid, grade, stem, shash),
+            )
+        counts = rename_grade_subject(conn, old_grade, new_grade)
+
+    assert counts["questions"] == 2
+    with get_db_connection(tmp_db) as conn:
+        rows = {
+            r["question_uid"]: r
+            for r in conn.execute(
+                "SELECT question_uid, target_grade_and_subject, stem_md, stem_hash FROM questions"
+            ).fetchall()
+        }
+    assert rows["uid-a1"]["target_grade_and_subject"] == new_grade
+    assert rows["uid-a1"]["stem_hash"] == "hash-a1"
+    assert rows["uid-a1"]["stem_md"] == (
+        f"---\nquestion_uid: uid-a1\ntarget_grade_and_subject: {new_grade}\n---\n\n{body_text}"
+    )
+    assert rows["uid-a2"]["target_grade_and_subject"] == new_grade
+    assert rows["uid-a2"]["stem_hash"] == "hash-a2"
+    assert rows["uid-a2"]["stem_md"] == (
+        f"---\nquestion_uid: uid-a2\ntarget_grade_and_subject: {new_grade}\n...\n\n纯正文"
+    )
+    assert rows["uid-b1"]["target_grade_and_subject"] == _GRADE_B
+    assert rows["uid-b1"]["stem_md"] == stem_b
+
+
 # ---------------------------------------------------------------------------
 # delete
 # ---------------------------------------------------------------------------

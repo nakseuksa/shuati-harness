@@ -210,18 +210,48 @@ _GREEK_SYMBOL_COMMANDS = frozenset(
         "Phi", "Psi", "Omega",
     }
 )
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_MD_LINK_RE = re.compile(
+    r"\[([^\]]*)\]\((?:[A-Za-z][A-Za-z0-9+.-]*://|data:|/|./|../)[^)]*\)"
+)
+_TEXT_CMD_RE = re.compile(
+    r"\\(?:text|mathrm|mbox|operatorname)\s*\{(?:[^{}]|\{[^{}]*\})*\}"
+)
+_GREEK_SUB_BRACE_RE = re.compile(r"\\([A-Za-z]+)_\{([A-Za-z0-9]+)\}")
+_GREEK_SUB_CHAR_RE = re.compile(r"\\([A-Za-z]+)_([A-Za-z0-9])")
+_LATIN_SUB_BRACE_RE = re.compile(r"(?<![A-Za-z])([A-Za-z])_\{([A-Za-z0-9]+)\}")
+_LATIN_SUB_CHAR_RE = re.compile(r"(?<![A-Za-z])([A-Za-z])_([A-Za-z0-9])")
 _LATEX_CMD_RE = re.compile(r"\\([a-zA-Z]+)")
 _SINGLE_LETTER_RE = re.compile(r"(?<![A-Za-z])([A-Za-z])(?![A-Za-z])")
 
 
 def _extract_symbols(texts: Iterable[str]) -> list[str]:
-    """从题干/步骤公式提取符号集：希腊字母命令名 + 独立拉丁字母（确定性排序）。"""
+    """从题干/步骤公式提取符号集：保留显式下标并剥离 URL 与单位文本（确定性排序）。"""
     symbols: set[str] = set()
-    for text in texts:
-        for cmd in _LATEX_CMD_RE.findall(text):
+
+    def _collect_greek_sub(match: re.Match[str]) -> str:
+        cmd, sub = match.group(1), match.group(2)
+        if cmd in _GREEK_SYMBOL_COMMANDS:
+            symbols.add(f"{cmd}{sub}")
+            return " "
+        return match.group(0)
+
+    def _collect_latin_sub(match: re.Match[str]) -> str:
+        symbols.add(f"{match.group(1)}{match.group(2)}")
+        return " "
+
+    for raw in texts:
+        cleaned = _MD_IMAGE_RE.sub(r" \1 ", raw)
+        cleaned = _MD_LINK_RE.sub(r" \1 ", cleaned)
+        cleaned = _TEXT_CMD_RE.sub(" ", cleaned)
+        cleaned = _GREEK_SUB_BRACE_RE.sub(_collect_greek_sub, cleaned)
+        cleaned = _GREEK_SUB_CHAR_RE.sub(_collect_greek_sub, cleaned)
+        cleaned = _LATIN_SUB_BRACE_RE.sub(_collect_latin_sub, cleaned)
+        cleaned = _LATIN_SUB_CHAR_RE.sub(_collect_latin_sub, cleaned)
+        for cmd in _LATEX_CMD_RE.findall(cleaned):
             if cmd in _GREEK_SYMBOL_COMMANDS:
                 symbols.add(cmd)
-        cleaned = _LATEX_CMD_RE.sub(" ", text)
+        cleaned = _LATEX_CMD_RE.sub(" ", cleaned)
         symbols.update(_SINGLE_LETTER_RE.findall(cleaned))
     return sorted(symbols)
 
@@ -516,7 +546,26 @@ def evaluate_blind_drill_submission(
 
         item = _build_item(conn, question)  # 确定性重放呈现题
         drill = _load_question(conn, item.drill_question_uid)
-        final_ok = answers_equivalent(final_answer, str(drill["standard_answer_latex"]))
+        standard_answer = str(drill["standard_answer_latex"])
+        final_ok = answers_equivalent(final_answer, standard_answer)
+        if (
+            not final_ok
+            and not item.requires_intermediate
+            and item.verification_mode == "equation_skeleton"
+            and str(drill["origin_type"]) == "AI_SYNTHETIC_VARIANT"
+        ):
+            # L>=2 变式若按 equation_skeleton 持久化，允许直接提交 canonical 首步核心列式骨架
+            skeleton_row = _query_one(
+                conn,
+                "SELECT step_formula_latex FROM question_steps"
+                " WHERE question_uid = ? AND solution_branch_id = 'canonical'"
+                " ORDER BY step_index ASC LIMIT 1",
+                (item.drill_question_uid,),
+            )
+            if skeleton_row is not None:
+                skeleton = str(skeleton_row["step_formula_latex"]).strip()
+                if skeleton and skeleton != standard_answer.strip():
+                    final_ok = answers_equivalent(final_answer, skeleton)
 
         session = _latest_session(conn, question_uid)
         step = _stalled_step(conn, question_uid, session)
