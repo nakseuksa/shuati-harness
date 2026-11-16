@@ -57,6 +57,17 @@ FINAL_WRONG = "x = 9"
 NAME_A = "动量定理求电荷量"
 NAME_B = "动量定理求电荷量大小与位移"
 
+# P10-E：看板/账本/盲测读取端点均要求 grade_subject 必填 Query（缺失 → 422）。
+GRAPH_PARAMS: dict[str, str] = {"grade_subject": GRADE}
+
+
+def _drill_params(active_date: date | None = None) -> dict[str, str]:
+    """盲测题单查询参数：学段必填 + 可选 active_date（时间旅行注入）。"""
+    params = dict(GRAPH_PARAMS)
+    if active_date is not None:
+        params["active_date"] = active_date.isoformat()
+    return params
+
 
 # ---------------------------------------------------------------------------
 # 夹具：环境隔离 / ASGI 客户端 / 预热 Task 清理
@@ -228,6 +239,7 @@ async def _run_full_chain(client: AsyncClient) -> dict[str, Any]:
 def _insert_drill_question(
     uid: str,
     *,
+    grade: str = GRADE,
     module: str = MODULE,
     answer: str = FINAL_RIGHT,
     origin: str = "USER_CANONICAL",
@@ -246,7 +258,7 @@ def _insert_drill_question(
         (
             uid,
             origin,
-            GRADE,
+            grade,
             stem if stem is not None else f"题干 {uid}：求 x。",
             f"hash-{uid}",
             answer,
@@ -259,12 +271,14 @@ def _insert_drill_question(
     )
 
 
-def _insert_drill_scaffold(uid: str, *, stalled_formula: str = INTERMEDIATE_STD) -> None:
+def _insert_drill_scaffold(
+    uid: str, *, stalled_formula: str = INTERMEDIATE_STD, grade: str = GRADE
+) -> None:
     """节点 + 卡壳步 + 已完成会话（回退原题时中间量核验依赖）。"""
     _execute(
-        "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator)"
-        " VALUES (?, ?, ?, ?)",
-        (f"node-{uid}", MODULE, f"实体-{uid}", f"算子-{uid}"),
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+        " l3_operator) VALUES (?, ?, ?, ?, ?)",
+        (f"node-{uid}", grade, MODULE, f"实体-{uid}", f"算子-{uid}"),
     )
     _execute(
         "INSERT INTO question_steps (step_id, question_uid, step_index, step_goal_desc,"
@@ -541,11 +555,11 @@ async def test_drills_daily_time_travel_and_idempotent(client: AsyncClient) -> N
     _insert_drill_scaffold("q-due")
     # 解锁日之前：空题单
     resp = await client.get(
-        "/api/v1/drills/daily", params={"active_date": (DAY - timedelta(days=2)).isoformat()}
+        "/api/v1/drills/daily", params=_drill_params(DAY - timedelta(days=2))
     )
     assert resp.status_code == 200 and resp.json() == []
     # 解锁日：排入 1 道（回退原题，携带卡壳步 probe）
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": DAY.isoformat()})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(DAY))
     assert resp.status_code == 200
     items = resp.json()
     assert len(items) == 1
@@ -556,7 +570,7 @@ async def test_drills_daily_time_travel_and_idempotent(client: AsyncClient) -> N
     assert item["probe_question_md"]
     assert item["verification_mode"] == "equation_skeleton"
     # 同日重复 GET：幂等锁定，不重复递增曝光
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": DAY.isoformat()})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(DAY))
     assert [i["question_uid"] for i in resp.json()] == ["q-due"]
     row = _one("SELECT * FROM questions WHERE question_uid = 'q-due'")
     assert row["slated_exposure_count"] == 1
@@ -569,7 +583,7 @@ async def test_drills_daily_default_active_date_today(client: AsyncClient) -> No
         "q-today", unlock=today - timedelta(days=1), due=today + timedelta(days=3)
     )
     _insert_drill_scaffold("q-today")
-    resp = await client.get("/api/v1/drills/daily")  # 缺省 today
+    resp = await client.get("/api/v1/drills/daily", params=GRAPH_PARAMS)  # 缺省 today
     assert resp.status_code == 200
     assert [i["question_uid"] for i in resp.json()] == ["q-today"]
 
@@ -632,7 +646,7 @@ async def test_drills_submit_variant_final_only(client: AsyncClient) -> None:
     )
     _insert_relation("q-var", "v-1", "ISOMORPHIC")
 
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": DAY.isoformat()})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(DAY))
     items = resp.json()
     assert len(items) == 1
     assert items[0]["drill_question_uid"] == "v-1"  # 变式优先
@@ -657,7 +671,7 @@ async def test_drills_submit_strips_spoiler_frontmatter(client: AsyncClient) -> 
     stem = f"---\nquestion_uid: q-meta\ntarget_grade_and_subject: {GRADE}\n---\n\n求 x。"
     _insert_drill_question("q-meta", stem=stem)
     _insert_drill_scaffold("q-meta")
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": DAY.isoformat()})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(DAY))
     item = resp.json()[0]
     assert "question_uid" not in item["stem_md"]
     assert "求 x" in item["stem_md"]
@@ -681,18 +695,20 @@ async def test_knowledge_graph_structure(client: AsyncClient) -> None:
     # 直接 SQL 构造：两个 L1 模块、挂载题目、标红边
     _insert_drill_question("q-kg", mastery="ACTIVE", unlock=None, due=None)
     _execute(
-        "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator,"
-        " aliases_json) VALUES ('n1', ?, '圆周运动', '临界边界条件', '[\"N=0 临界\"]')",
-        (MODULE,),
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+        " l3_operator, aliases_json)"
+        " VALUES ('n1', ?, ?, '圆周运动', '临界边界条件', '[\"N=0 临界\"]')",
+        (GRADE, MODULE),
     )
     _execute(
-        "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator)"
-        " VALUES ('n2', ?, '圆周运动', '向心力来源')",
-        (MODULE,),
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+        " l3_operator) VALUES ('n2', ?, ?, '圆周运动', '向心力来源')",
+        (GRADE, MODULE),
     )
     _execute(
-        "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator)"
-        " VALUES ('n3', '力学', '抛体运动', '分解与合成')",
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+        " l3_operator) VALUES ('n3', ?, '力学', '抛体运动', '分解与合成')",
+        (GRADE,),
     )
     _execute(
         "INSERT INTO question_steps (step_id, question_uid, step_index, step_goal_desc,"
@@ -701,13 +717,13 @@ async def test_knowledge_graph_structure(client: AsyncClient) -> None:
         " VALUES ('s-kg', 'q-kg', 1, '子目标', 'x=1', 'n1', '[]', 'probe', 1, 1, 1, 1, 1, 900)",
     )
     _execute(
-        "INSERT INTO concept_co_errors (node_u_id, node_v_id, l1_module_u, l1_module_v,"
-        " active_error_count, total_historical_count, source_question_uids_json)"
-        " VALUES ('n1', 'n2', ?, ?, 2, 5, '[\"q-kg\"]')",
-        (MODULE, MODULE),
+        "INSERT INTO concept_co_errors (node_u_id, node_v_id, grade_subject,"
+        " l1_module_u, l1_module_v, active_error_count, total_historical_count,"
+        " source_question_uids_json) VALUES ('n1', 'n2', ?, ?, ?, 2, 5, '[\"q-kg\"]')",
+        (GRADE, MODULE, MODULE),
     )
 
-    resp = await client.get("/api/v1/knowledge-graph")
+    resp = await client.get("/api/v1/knowledge-graph", params=GRAPH_PARAMS)
     assert resp.status_code == 200
     body = resp.json()
     modules = {m["l1_module"]: m for m in body["modules"]}
@@ -766,26 +782,26 @@ async def test_knowledge_graph_compaction_revert_roundtrip(
             ("B", NAME_B, "2026-01-01 00:00:02"),
         ):
             conn.execute(
-                "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator,"
-                " created_at) VALUES (?, ?, '电磁感应单双杆模型', ?, ?)",
-                (nid, MODULE, name, ts),
+                "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+                " l3_operator, created_at) VALUES (?, ?, ?, '电磁感应单双杆模型', ?, ?)",
+                (nid, GRADE, MODULE, name, ts),
             )
         conn.execute(
-            "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator)"
-            " VALUES ('X', ?, '磁场边界', '放缩圆')",
-            (MODULE,),
+            "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+            " l3_operator) VALUES ('X', ?, ?, '磁场边界', '放缩圆')",
+            (GRADE, MODULE),
         )
         conn.execute(
-            "INSERT INTO concept_co_errors (node_u_id, node_v_id, l1_module_u, l1_module_v,"
-            " active_error_count, total_historical_count, source_question_uids_json)"
-            " VALUES ('B', 'X', ?, ?, 1, 1, '[\"q1\"]')",
-            (MODULE, MODULE),
+            "INSERT INTO concept_co_errors (node_u_id, node_v_id, grade_subject,"
+            " l1_module_u, l1_module_v, active_error_count, total_historical_count,"
+            " source_question_uids_json) VALUES ('B', 'X', ?, ?, ?, 1, 1, '[\"q1\"]')",
+            (GRADE, MODULE, MODULE),
         )
-        batch_id = run_scoped_compaction(conn, MODULE, "电磁感应单双杆模型")
+        batch_id = run_scoped_compaction(conn, GRADE, MODULE, "电磁感应单双杆模型")
     assert batch_id is not None
 
     # 合并后看板：B 被 resolve 出活跃树，标红边端点改写为 A
-    resp = await client.get("/api/v1/knowledge-graph")
+    resp = await client.get("/api/v1/knowledge-graph", params=GRAPH_PARAMS)
     body = resp.json()
     em = next(m for m in body["modules"] if m["l1_module"] == MODULE)
     group = next(g for g in em["l2_groups"] if g["l2_entity"] == "电磁感应单双杆模型")
@@ -805,7 +821,7 @@ async def test_knowledge_graph_compaction_revert_roundtrip(
     resp = await client.post(f"/api/v1/knowledge-graph/compaction/{batch_id}/revert")
     assert resp.status_code == 200
     assert resp.json() == {"batch_id": batch_id, "reverted_merges": 1}
-    body = (await client.get("/api/v1/knowledge-graph")).json()
+    body = (await client.get("/api/v1/knowledge-graph", params=GRAPH_PARAMS)).json()
     em = next(m for m in body["modules"] if m["l1_module"] == MODULE)
     group = next(g for g in em["l2_groups"] if g["l2_entity"] == "电磁感应单双杆模型")
     assert {n["node_id"] for n in group["nodes"]} == {"A", "B"}
@@ -830,7 +846,7 @@ async def test_knowledge_graph_compaction_revert_roundtrip(
 
 async def test_elo_ledger_full_flow(client: AsyncClient) -> None:
     card = await _run_full_chain(client)  # 力学模块：保底 + 覆盖分结算 + 托管冻结
-    resp = await client.get("/api/v1/elo/ledger")
+    resp = await client.get("/api/v1/elo/ledger", params=GRAPH_PARAMS)
     assert resp.status_code == 200
     modules = resp.json()["modules"]
     assert [m["l1_module"] for m in modules] == ["力学"]
@@ -861,16 +877,18 @@ async def test_elo_ledger_full_flow(client: AsyncClient) -> None:
 
 async def test_elo_ledger_module_filter(client: AsyncClient) -> None:
     await _run_full_chain(client)
-    resp = await client.get("/api/v1/elo/ledger", params={"l1_module": "力学"})
+    resp = await client.get("/api/v1/elo/ledger", params={**GRAPH_PARAMS, "l1_module": "力学"})
     assert [m["l1_module"] for m in resp.json()["modules"]] == ["力学"]
-    resp = await client.get("/api/v1/elo/ledger", params={"l1_module": "不存在的模块"})
+    resp = await client.get(
+        "/api/v1/elo/ledger", params={**GRAPH_PARAMS, "l1_module": "不存在的模块"}
+    )
     assert resp.status_code == 200
     assert resp.json()["modules"] == []
 
 
 async def test_elo_ledger_cold_start_module(client: AsyncClient) -> None:
     _insert_drill_question("q-cold", mastery="ACTIVE", unlock=None, due=None)
-    resp = await client.get("/api/v1/elo/ledger")
+    resp = await client.get("/api/v1/elo/ledger", params=GRAPH_PARAMS)
     modules = resp.json()["modules"]
     assert [m["l1_module"] for m in modules] == [MODULE]
     ledger = modules[0]
@@ -924,7 +942,7 @@ async def _with_client(app: Any) -> AsyncIterator[AsyncClient]:
 async def test_frontend_missing_app_still_starts(tmp_path: Path) -> None:
     app = create_app(frontend_dir=tmp_path / "nonexistent-frontend")
     async for client in _with_client(app):
-        resp = await client.get("/api/v1/drills/daily")
+        resp = await client.get("/api/v1/drills/daily", params=GRAPH_PARAMS)
         assert resp.status_code == 200 and resp.json() == []
         assert (await client.get("/")).status_code == 404  # 无挂载，根路径无服务
 
@@ -934,7 +952,7 @@ async def test_frontend_empty_dir_app_still_starts(tmp_path: Path) -> None:
     empty.mkdir()
     app = create_app(frontend_dir=empty)
     async for client in _with_client(app):
-        assert (await client.get("/api/v1/elo/ledger")).status_code == 200
+        assert (await client.get("/api/v1/elo/ledger", params=GRAPH_PARAMS)).status_code == 200
         assert (await client.get("/")).status_code == 404  # 无 index.html
 
 
@@ -948,7 +966,7 @@ async def test_frontend_index_served(tmp_path: Path) -> None:
         assert resp.status_code == 200
         assert "刷题 Harness 工作台" in resp.text
         # API 路由不被 "/" 挂载遮蔽
-        assert (await client.get("/api/v1/drills/daily")).status_code == 200
+        assert (await client.get("/api/v1/drills/daily", params=GRAPH_PARAMS)).status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -987,7 +1005,7 @@ async def test_root_injects_content_hash_versions(frontend_copy: Path) -> None:
         # 确定性：内容不变 → 两次请求 HTML 完全一致（缓存友好）
         assert (await client.get("/")).text == resp.text
         # 根路由不遮蔽 API 与静态资源路径（mount 仍服务其余文件）
-        assert (await client.get("/api/v1/drills/daily")).status_code == 200
+        assert (await client.get("/api/v1/drills/daily", params=GRAPH_PARAMS)).status_code == 200
         assert (await client.get("/app.js")).status_code == 200
         assert (await client.get("/styles.css")).status_code == 200
 
@@ -1059,6 +1077,8 @@ def test_default_app_registers_all_contract_routes() -> None:
         "/api/v1/knowledge-graph",
         "/api/v1/knowledge-graph/compaction/{batch_id}/revert",
         "/api/v1/elo/ledger",
+        "/api/v1/settings/grade-subjects",  # P10-E 新增
+        "/api/v1/settings/grade-subjects/{name}",  # P10-E 新增
         "/assets/{cas_hash}",
     } <= paths
 
@@ -1235,3 +1255,237 @@ async def test_drill_failure_returns_retrain_session_id_and_prewarms(
     assert sess_resp.json()["micro_stage"] == "STAGE_1_BLIND_PROBE"
     for task in list(scaffold_engine.in_flight_prewarm_tasks.values()):
         await task
+
+
+# ---------------------------------------------------------------------------
+# P10-E：学段必填 Query / Settings 条目 CRUD / 跨学段响应隔离 / 录入自动注册
+# ---------------------------------------------------------------------------
+
+ALT_GRADE = "初中数学"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/knowledge-graph", "/api/v1/elo/ledger", "/api/v1/drills/daily"],
+)
+async def test_grade_read_endpoints_require_grade_subject(
+    client: AsyncClient, path: str
+) -> None:
+    """P10-E：看板/账本/盲测读取端点缺 grade_subject → FastAPI 422（必填 Query）。"""
+    resp = await client.get(path)
+    assert resp.status_code == 422
+    assert "grade_subject" in resp.text
+
+
+async def test_ingest_auto_registers_grade_subject_entry(client: AsyncClient) -> None:
+    """P10-D/E：录入即 get_or_create 学段条目 → settings list 立即可见且计数实时。"""
+    assert (await client.get("/api/v1/settings/grade-subjects")).json() == []
+
+    card = await _ingest(client)
+    items = (await client.get("/api/v1/settings/grade-subjects")).json()
+    assert [i["grade_subject"] for i in items] == [GRADE]
+    assert items[0]["question_count"] == 1
+    assert card["question_uid"]
+
+    # 同学段再录一道（改题干避免幂等重入库）→ 条目仍唯一、计数递增
+    await _ingest(client, f"{STEM_MD}\n（同学段第二题）")
+    items = (await client.get("/api/v1/settings/grade-subjects")).json()
+    assert [i["grade_subject"] for i in items] == [GRADE]
+    assert items[0]["question_count"] == 2
+
+
+async def test_settings_grade_subjects_crud_full_chain(client: AsyncClient) -> None:
+    """Settings CRUD 全链：新建（幂等/空名 400）→ list → rename 级联 → delete 409/204。"""
+    # 新建：strip 规范化 + created=True
+    resp = await client.post(
+        "/api/v1/settings/grade-subjects", json={"grade_subject": f"  {ALT_GRADE}  "}
+    )
+    assert resp.status_code == 200
+    created = resp.json()
+    assert created["created"] is True
+    assert created["item"]["grade_subject"] == ALT_GRADE
+    assert created["item"]["question_count"] == 0
+    assert created["item"]["created_at"]
+    # 幂等：同学段再建 → created=False，条目不变
+    resp = await client.post(
+        "/api/v1/settings/grade-subjects", json={"grade_subject": ALT_GRADE}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["created"] is False
+    assert resp.json()["item"] == created["item"]
+    # 空/纯空白名称 → 400
+    resp = await client.post("/api/v1/settings/grade-subjects", json={"grade_subject": "   "})
+    assert resp.status_code == 400
+    assert "detail" in resp.json()
+
+    # 真实数据：概念分支全链路（3 节点 / 3 标红边 / 2 账本事件，均为 GRADE 学段）
+    card = await _run_full_chain(client)
+    items = (await client.get("/api/v1/settings/grade-subjects")).json()
+    assert [i["grade_subject"] for i in items] == [ALT_GRADE, GRADE]  # 按 created_at 升序
+
+    scoped = {
+        "questions": (
+            "SELECT COUNT(*) AS n FROM questions WHERE target_grade_and_subject = ?",
+            (GRADE,),
+        ),
+        "knowledge_nodes": (
+            "SELECT COUNT(*) AS n FROM knowledge_nodes WHERE grade_subject = ?",
+            (GRADE,),
+        ),
+        "elo_mutation_ledger": (
+            "SELECT COUNT(*) AS n FROM elo_mutation_ledger WHERE grade_subject = ?",
+            (GRADE,),
+        ),
+        "concept_co_errors": (
+            "SELECT COUNT(*) AS n FROM concept_co_errors WHERE grade_subject = ?",
+            (GRADE,),
+        ),
+        "compaction_audit_ledger": (
+            "SELECT COUNT(*) AS n FROM compaction_audit_ledger WHERE grade_subject = ?",
+            (GRADE,),
+        ),
+    }
+    before = {key: int(_one(sql, params)["n"]) for key, (sql, params) in scoped.items()}
+    assert items[1]["question_count"] == before["questions"]  # 条目计数实时统计
+    assert before["questions"] >= 1
+    assert before["knowledge_nodes"] == 3
+    assert before["elo_mutation_ledger"] == 2
+    assert before["concept_co_errors"] == 3
+
+    # rename：五处级联改标，返回各表受影响行数
+    new_grade = "高中物理-高三"
+    resp = await client.patch(
+        f"/api/v1/settings/grade-subjects/{GRADE}", json={"new_name": new_grade}
+    )
+    assert resp.status_code == 200, resp.text
+    renamed = resp.json()
+    assert renamed["renamed"] == new_grade
+    assert renamed["affected"] == {
+        "grade_subjects": 1,
+        "questions": before["questions"],
+        "knowledge_nodes": before["knowledge_nodes"],
+        "elo_mutation_ledger": before["elo_mutation_ledger"],
+        "concept_co_errors": before["concept_co_errors"],
+        "compaction_audit_ledger": before["compaction_audit_ledger"],
+    }
+    # 旧学段零残留、新学段行数与改标前一致
+    for key, (sql, _params) in scoped.items():
+        assert int(_one(sql, (new_grade,))["n"]) == before[key]
+        assert int(_one(sql, (GRADE,))["n"]) == 0
+    assert _one(
+        "SELECT target_grade_and_subject FROM questions WHERE question_uid = ?",
+        (card["question_uid"],),
+    )["target_grade_and_subject"] == new_grade
+    # 条目主键亦已改标（list 中旧名消失、新名出现）
+    listed = [
+        i["grade_subject"] for i in (await client.get("/api/v1/settings/grade-subjects")).json()
+    ]
+    assert listed == [ALT_GRADE, new_grade]
+
+    # rename 目标已存在 → 400（写前拦截，零残留）
+    resp = await client.patch(
+        f"/api/v1/settings/grade-subjects/{new_grade}", json={"new_name": ALT_GRADE}
+    )
+    assert resp.status_code == 400
+    assert "已存在" in resp.json()["detail"]
+    # rename 新名为空 → 400
+    resp = await client.patch(
+        f"/api/v1/settings/grade-subjects/{new_grade}", json={"new_name": "  "}
+    )
+    assert resp.status_code == 400
+    # rename 原条目不存在 → 400
+    resp = await client.patch(
+        "/api/v1/settings/grade-subjects/不存在的学段", json={"new_name": "新学段"}
+    )
+    assert resp.status_code == 400
+    assert "不存在" in resp.json()["detail"]
+
+    # delete：有题条目 → 409（detail 含题目计数）；空条目 → 204 且 list 消失
+    resp = await client.delete(f"/api/v1/settings/grade-subjects/{new_grade}")
+    assert resp.status_code == 409
+    assert str(before["questions"]) in resp.json()["detail"]
+    assert new_grade in resp.json()["detail"]
+    resp = await client.delete(f"/api/v1/settings/grade-subjects/{ALT_GRADE}")
+    assert resp.status_code == 204
+    assert resp.content == b""
+    assert [
+        i["grade_subject"] for i in (await client.get("/api/v1/settings/grade-subjects")).json()
+    ] == [new_grade]
+
+
+async def test_grade_partition_isolation_graph_elo_drill(client: AsyncClient) -> None:
+    """P10-E：两学段同名 L1 各有题/节点/事件 → graph/elo/drill 响应逐学段隔离。"""
+    card = await _run_full_chain(client)  # 学段 A（GRADE）：力学 3 节点/3 边/2 事件/1 托管
+    # 学段 B（ALT_GRADE）：同 L1 名 MODULE 的题目 + 节点对 + 标红边 + 到期盲测题
+    _insert_drill_question("q-alt", grade=ALT_GRADE, mastery="ACTIVE", unlock=None, due=None)
+    _insert_drill_question("q-par-a")
+    _insert_drill_question("q-par-b", grade=ALT_GRADE)
+    _execute(
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+        " l3_operator) VALUES ('nb1', ?, ?, '函数极限', '等价无穷小'),"
+        " ('nb2', ?, ?, '函数极限', '洛必达')",
+        (ALT_GRADE, MODULE, ALT_GRADE, MODULE),
+    )
+    _execute(
+        "INSERT INTO question_steps (step_id, question_uid, step_index, step_goal_desc,"
+        " step_formula_latex, knowledge_node_id, masked_conditions_json,"
+        " probe_question_md, is_blocked_step, c_sub, s_sub, t_sub, l_sub, sub_elo)"
+        " VALUES ('step-alt', 'q-alt', 1, '子目标', 'x=1', 'nb1', '[]', 'probe',"
+        " 1, 1, 1, 1, 1, 900)",
+    )
+    _execute(
+        "INSERT INTO concept_co_errors (node_u_id, node_v_id, grade_subject, l1_module_u,"
+        " l1_module_v, active_error_count, total_historical_count, source_question_uids_json)"
+        " VALUES ('nb1', 'nb2', ?, ?, ?, 3, 4, '[\"q-alt\"]')",
+        (ALT_GRADE, MODULE, MODULE),
+    )
+    alt_params = {"grade_subject": ALT_GRADE}
+
+    # graph：节点/标红边/指标逐学段隔离
+    graph_a = (await client.get("/api/v1/knowledge-graph", params=GRAPH_PARAMS)).json()
+    graph_b = (await client.get("/api/v1/knowledge-graph", params=alt_params)).json()
+    nodes_a = {
+        n["node_id"] for m in graph_a["modules"] for g in m["l2_groups"] for n in g["nodes"]
+    }
+    nodes_b = {
+        n["node_id"] for m in graph_b["modules"] for g in m["l2_groups"] for n in g["nodes"]
+    }
+    assert len(nodes_a) == 3
+    assert nodes_b == {"nb1", "nb2"}
+    assert nodes_a.isdisjoint(nodes_b)
+    assert [m["l1_module"] for m in graph_b["modules"]] == [MODULE]
+    assert {(e["node_u_id"], e["node_v_id"]) for e in graph_b["red_edges"]} == {("nb1", "nb2")}
+    assert all(
+        e["node_u_id"] not in nodes_b and e["node_v_id"] not in nodes_b
+        for e in graph_a["red_edges"]
+    )
+    assert len(graph_a["red_edges"]) == 3  # 全链路 3 节点两两成边，不含 B 学段边
+    metrics_a = next(m for m in graph_a["modules"] if m["l1_module"] == "力学")["metrics"]
+    metrics_b = next(m for m in graph_b["modules"] if m["l1_module"] == MODULE)["metrics"]
+    assert metrics_a["active_nodes"] == 3
+    assert metrics_b["active_nodes"] == 2
+    assert metrics_b["mastery_rate"] == 0.0  # 仅 B 的 ACTIVE 卡壳挂载
+    assert graph_b["compaction_batches"] == []
+
+    # elo：事件/托管池/当前水位逐学段隔离（B 无事件 → 1200 冷启动）
+    ledger_a = (await client.get("/api/v1/elo/ledger", params=GRAPH_PARAMS)).json()
+    ledger_b = (await client.get("/api/v1/elo/ledger", params=alt_params)).json()
+    la = next(m for m in ledger_a["modules"] if m["l1_module"] == "力学")
+    lb = next(m for m in ledger_b["modules"] if m["l1_module"] == MODULE)
+    assert [e["question_uid"] for e in la["events"]] == [card["question_uid"]] * 2
+    assert lb["events"] == [] and lb["curve"] == []
+    initial = settings.MODULE_ELO_INITIAL
+    assert lb["current"] == {"coverage_elo": initial, "combat_elo": initial}
+    assert lb["pending_escrows"] == []
+    assert [e["question_uid"] for e in la["pending_escrows"]] == [card["question_uid"]]
+
+    # drill：题单只含当前学段题（同名 L1、同一 active_date 互不串）
+    drill_a = (await client.get("/api/v1/drills/daily", params=_drill_params(DAY))).json()
+    drill_b = (
+        await client.get(
+            "/api/v1/drills/daily", params={**alt_params, "active_date": DAY.isoformat()}
+        )
+    ).json()
+    assert "q-par-a" in [i["question_uid"] for i in drill_a]
+    assert "q-par-b" not in [i["question_uid"] for i in drill_a]
+    assert [i["question_uid"] for i in drill_b] == ["q-par-b"]

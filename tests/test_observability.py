@@ -202,6 +202,7 @@ def _mk_question(
     mastery: str = "ACTIVE",
     node_id: str | None = None,
     unlock_at: str | None = None,
+    grade: str = "高中物理",
 ) -> str:
     """直插单步题 + 节点 + 会话（观测测试夹具，绕过 VLM，行为与落库契约一致）。"""
     with get_db_connection(db_path) as conn:
@@ -209,19 +210,20 @@ def _mk_question(
             node_id = f"node-{uid}"
         conn.execute(
             "INSERT OR IGNORE INTO knowledge_nodes"
-            " (node_id, l1_module, l2_entity, l3_operator, aliases_json)"
-            " VALUES (?, ?, '实体', '算子', '[]')",
-            (node_id, module),
+            " (node_id, grade_subject, l1_module, l2_entity, l3_operator, aliases_json)"
+            " VALUES (?, ?, ?, '实体', '算子', '[]')",
+            (node_id, grade, module),
         )
         conn.execute(
             "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
             " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
             " base_elo, tier, trap_tags_json, primary_l1_module, mastery_state,"
             " blind_test_unlock_at, blind_test_due_at, verification_status)"
-            " VALUES (?, 'USER_CANONICAL', '高中物理', ?, ?, ?, 2, 2, 2, 1, ?, 'L3_综合中档',"
+            " VALUES (?, 'USER_CANONICAL', ?, ?, ?, ?, 2, 2, 2, 1, ?, 'L3_综合中档',"
             " '[]', ?, ?, ?, ?, 'HUMAN_OR_CANONICAL')",
             (
                 uid,
+                grade,
                 f"题干 {uid}",
                 hashlib.sha256(uid.encode()).hexdigest(),
                 answer,
@@ -1062,7 +1064,7 @@ def test_drill_queue_locked_and_idempotent(
 ) -> None:
     _mk_question(tmp_db, "q-drill", mastery="PENDING_RETEST", unlock_at=PAST_UNLOCK)
     with get_db_connection(tmp_db) as conn:
-        items = get_daily_blind_drill_queue(conn, DAY)
+        items = get_daily_blind_drill_queue(conn, DAY, grade_subject="高中物理")
     assert [i.question_uid for i in items] == ["q-drill"]
     locked = _f(_one(caplog, "drill.queue_locked"))
     assert locked["active_date"] == DAY.isoformat()
@@ -1072,7 +1074,7 @@ def test_drill_queue_locked_and_idempotent(
 
     caplog.clear()
     with get_db_connection(tmp_db) as conn:
-        get_daily_blind_drill_queue(conn, DAY)
+        get_daily_blind_drill_queue(conn, DAY, grade_subject="高中物理")
     assert _f(_one(caplog, "drill.queue_locked"))["idempotent"] is True
 
 
@@ -1082,7 +1084,7 @@ def test_drill_submission_and_retrain_events(
     _mk_question(tmp_db, "q-wrong", mastery="PENDING_RETEST", unlock_at=PAST_UNLOCK)
     with get_db_connection(tmp_db) as conn:
         elo_engine.freeze_decrutch_escrow(conn, "q-wrong", "sess-q-wrong")
-        get_daily_blind_drill_queue(conn, DAY)
+        get_daily_blind_drill_queue(conn, DAY, grade_subject="高中物理")
     caplog.clear()
     with get_db_connection(tmp_db) as conn:
         outcome = evaluate_blind_drill_submission(conn, "q-wrong", "x = 9", active_date=DAY)
@@ -1106,7 +1108,7 @@ def test_drill_cascade_event(tmp_db: Path, caplog: pytest.LogCaptureFixture) -> 
     with get_db_connection(tmp_db) as conn:
         elo_engine.freeze_decrutch_escrow(conn, "q-parent", "sess-q-parent")
         elo_engine.freeze_decrutch_escrow(conn, "q-child", "sess-q-child")
-        get_daily_blind_drill_queue(conn, DAY)
+        get_daily_blind_drill_queue(conn, DAY, grade_subject="高中物理")
     caplog.clear()
     with get_db_connection(tmp_db) as conn:
         outcome = evaluate_blind_drill_submission(conn, "q-parent", "x = 5", active_date=DAY)
@@ -1131,7 +1133,7 @@ async def test_graph_node_created_and_reused_events(
 ) -> None:
     with get_db_connection(tmp_db) as conn:
         nid, reused = await knowledge_graph.match_or_create_l3_node(
-            conn, "力学", "实体", "算子A", []
+            conn, "高中物理", "力学", "实体", "算子A", []
         )
     assert reused is False
     created = _f(_one(caplog, "graph.node_created"))
@@ -1145,7 +1147,7 @@ async def test_graph_node_created_and_reused_events(
     caplog.clear()
     with get_db_connection(tmp_db) as conn:
         nid2, reused2 = await knowledge_graph.match_or_create_l3_node(
-            conn, "力学", "实体", "算子A别名", []
+            conn, "高中物理", "力学", "实体", "算子A别名", []
         )
     assert reused2 is True and nid2 == nid
     reused_ev = _f(_one(caplog, "graph.node_reused"))
@@ -1157,10 +1159,10 @@ async def test_graph_compaction_merged_and_reverted_events(
 ) -> None:
     with get_db_connection(tmp_db) as conn:
         n1, _ = await knowledge_graph.match_or_create_l3_node(
-            conn, "力学", "实体", "动量定理求电荷量", []
+            conn, "高中物理", "力学", "实体", "动量定理求电荷量", []
         )
         n2, _ = await knowledge_graph.match_or_create_l3_node(
-            conn, "力学", "实体", "动量定理求电荷量大小", []
+            conn, "高中物理", "力学", "实体", "动量定理求电荷量大小", []
         )
 
     async def confirm_judge(payload: dict[str, Any]) -> NodeJudgeResult:
@@ -1171,7 +1173,7 @@ async def test_graph_compaction_merged_and_reverted_events(
     monkeypatch.setattr(knowledge_graph, "_judge_nodes", confirm_judge)
     caplog.clear()
     with get_db_connection(tmp_db) as conn:
-        batch_id = knowledge_graph.run_scoped_compaction(conn, "力学", "实体")
+        batch_id = knowledge_graph.run_scoped_compaction(conn, "高中物理", "力学", "实体")
     assert batch_id is not None
     merged = _f(_one(caplog, "graph.compaction_merged"))
     assert merged["batch_id"] == batch_id
@@ -1194,8 +1196,9 @@ def test_graph_co_error_events(tmp_db: Path, caplog: pytest.LogCaptureFixture) -
     _mk_question(tmp_db, "q-co", node_id="node-a")
     with get_db_connection(tmp_db) as conn:
         conn.execute(
-            "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator,"
-            " aliases_json) VALUES ('node-b', '力学', '实体', '算子B', '[]')"
+            "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+            " l3_operator, aliases_json)"
+            " VALUES ('node-b', '高中物理', '力学', '实体', '算子B', '[]')"
         )
         conn.execute(
             "INSERT INTO question_steps (step_id, question_uid, solution_branch_id, step_index,"
@@ -1230,7 +1233,7 @@ def test_api_request_event_and_request_id_header(
 ) -> None:
     app = create_app(frontend_dir=tmp_path / "frontend")
     with TestClient(app) as client:
-        resp = client.get("/api/v1/drills/daily")
+        resp = client.get("/api/v1/drills/daily", params={"grade_subject": "高中物理"})
     assert resp.status_code == 200
     rid = resp.headers["X-Request-ID"]
     assert rid

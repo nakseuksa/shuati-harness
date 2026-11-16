@@ -12,6 +12,11 @@ elo_engine / cas_store / schema。本文件仅负责：
 - ``./frontend/`` 静态前端挂载（目录缺失/为空时应用仍可启动，P4-B 并行容错）；
   根路由为本地脚本/样式引用注入内容哈希版本号查询参数（P9-E 缓存击穿，零构建）。
 
+P10-E 学段分区接线：看板/账本/盲测三类读取端点强制 ``grade_subject`` 必填 Query
+（缺失 → 422），组装函数全程按学段过滤；按 uid/batch 操作的写端点（drills POST /
+sessions / ingest / revert / assets）不加学段参数——学段由题目归属自派生。
+``/api/v1/settings/grade-subjects`` 提供条目 CRUD（rename 级联改标，删除有题条目 → 409）。
+
 同源本地单机（NG2）：不加 CORS、不加鉴权。
 """
 
@@ -49,6 +54,14 @@ from backend.services.blind_drill_scheduler import (
     get_daily_blind_drill_queue,
 )
 from backend.services.cas_store import resolve_cas_uri
+from backend.services.grade_settings import (
+    GradeSubjectInUseError,
+    GradeSubjectItem,
+    create_grade_subject,
+    delete_grade_subject,
+    list_grade_subjects,
+    rename_grade_subject,
+)
 from backend.services.ingest_service import GateCardDTO, InitialState, ingest_question
 from backend.services.knowledge_graph import CanonicalNodeResolver, GraphMetricsDTO
 from backend.services.llm_gateway import LLMGatewayError, aclose_shared_clients
@@ -92,12 +105,41 @@ class StepSubmitRequest(BaseModel):
 
 
 class BlindDrillSubmitRequest(BaseModel):
-    """每日盲测提交入参；active_date 缺省 today（时间旅行注入点）。"""
+    """每日盲测提交入参；active_date 缺省 today（时间旅行注入点）。
+
+    P10-E：学段不在此入参内——按 question_uid 归属自派生（提交无需重复声明学段）。
+    """
 
     question_uid: str
     final_answer: str
     intermediate_sub_answer: str | None = None
     active_date: date | None = None
+
+
+class GradeSubjectCreateRequest(BaseModel):
+    """学段条目新建入参（strip 规范化在服务层）。"""
+
+    grade_subject: str
+
+
+class GradeSubjectCreateResponse(BaseModel):
+    """新建结果：created=False 表示条目已存在（幂等）。"""
+
+    item: GradeSubjectItem
+    created: bool
+
+
+class GradeSubjectRenameRequest(BaseModel):
+    """学段条目重命名入参。"""
+
+    new_name: str
+
+
+class GradeSubjectRenameResponse(BaseModel):
+    """重命名结果：新名称 + 五处级联改标各表受影响行数。"""
+
+    renamed: str
+    affected: dict[str, int]
 
 
 # ---------------------------------------------------------------------------
@@ -297,10 +339,17 @@ async def _save_uploads(uploads: list[UploadFile] | None, tmp_dir: Path, prefix:
 # ---------------------------------------------------------------------------
 
 
-def _build_graph_response(conn: sqlite3.Connection) -> KnowledgeGraphResponse:
-    resolver = CanonicalNodeResolver(conn)
+def _build_graph_response(conn: sqlite3.Connection, grade_subject: str) -> KnowledgeGraphResponse:
+    """组装指定学段的三层知识网看板（P10-E：全链学段过滤）。
+
+    resolver / 节点树 / L1 模块并集（节点 + 题目）/ 展示状态 / 双指标 /
+    标红边 / compaction 批次均限 ``grade_subject``，响应 DTO 结构不变。
+    """
+    resolver = CanonicalNodeResolver(conn, grade_subject)
     node_rows = conn.execute(
-        "SELECT * FROM knowledge_nodes ORDER BY l1_module, l2_entity, node_id"
+        "SELECT * FROM knowledge_nodes WHERE grade_subject = ?"
+        " ORDER BY l1_module, l2_entity, node_id",
+        (grade_subject,),
     ).fetchall()
     active_rows = [row for row in node_rows if row["redirect_to_id"] is None]
 
@@ -312,9 +361,14 @@ def _build_graph_response(conn: sqlite3.Connection) -> KnowledgeGraphResponse:
 
     l1_modules = {str(row["l1_module"]) for row in node_rows}
     l1_modules.update(
-        str(row[0]) for row in conn.execute("SELECT DISTINCT primary_l1_module FROM questions")
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT primary_l1_module FROM questions"
+            " WHERE target_grade_and_subject = ?",
+            (grade_subject,),
+        )
     )
-    node_states = knowledge_graph.all_node_states(conn)
+    node_states = knowledge_graph.all_node_states(conn, grade_subject)
     modules: list[L1ModuleView] = []
     for l1 in sorted(l1_modules):
         l2_groups: list[L2GroupView] = []
@@ -336,7 +390,7 @@ def _build_graph_response(conn: sqlite3.Connection) -> KnowledgeGraphResponse:
             L1ModuleView(
                 l1_module=l1,
                 l2_groups=l2_groups,
-                metrics=knowledge_graph.compute_graph_metrics(conn, l1),
+                metrics=knowledge_graph.compute_graph_metrics(conn, grade_subject, l1),
             )
         )
 
@@ -351,11 +405,17 @@ def _build_graph_response(conn: sqlite3.Connection) -> KnowledgeGraphResponse:
             source_question_uids=json.loads(row["source_question_uids_json"]),
             last_error_at=str(row["last_error_at"]),
         )
-        for row in conn.execute("SELECT * FROM concept_co_errors ORDER BY node_u_id, node_v_id")
+        for row in conn.execute(
+            "SELECT * FROM concept_co_errors WHERE grade_subject = ?"
+            " ORDER BY node_u_id, node_v_id",
+            (grade_subject,),
+        )
     ]
 
     ledger_rows = conn.execute(
-        "SELECT * FROM compaction_audit_ledger ORDER BY batch_id, merge_id"
+        "SELECT * FROM compaction_audit_ledger WHERE grade_subject = ?"
+        " ORDER BY batch_id, merge_id",
+        (grade_subject,),
     ).fetchall()
     by_batch: dict[str, list[sqlite3.Row]] = {}
     for row in ledger_rows:
@@ -388,16 +448,36 @@ def _build_graph_response(conn: sqlite3.Connection) -> KnowledgeGraphResponse:
 
 
 def _build_elo_ledger_response(
-    conn: sqlite3.Connection, l1_module: str | None
+    conn: sqlite3.Connection, grade_subject: str, l1_module: str | None
 ) -> EloLedgerResponse:
+    """组装指定学段的双轨 Elo 台账看板（P10-E：全链学段过滤）。
+
+    模块并集（账本 / 托管池 / 题目）与事件流水均限 ``grade_subject``；
+    托管池无 grade 列，经 ``JOIN questions`` 按 target_grade_and_subject 过滤；
+    当前双轨分经 ``get_module_elo(conn, grade_subject, module)`` 分区核算。
+    """
     l1_modules = {
-        str(row[0]) for row in conn.execute("SELECT DISTINCT l1_module FROM elo_mutation_ledger")
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT l1_module FROM elo_mutation_ledger WHERE grade_subject = ?",
+            (grade_subject,),
+        )
     }
     l1_modules.update(
-        str(row[0]) for row in conn.execute("SELECT DISTINCT l1_module FROM question_escrow_pool")
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT p.l1_module FROM question_escrow_pool p"
+            " JOIN questions q ON q.question_uid = p.question_uid"
+            " WHERE q.target_grade_and_subject = ?",
+            (grade_subject,),
+        )
     )
     l1_modules.update(
-        str(row[0]) for row in conn.execute("SELECT DISTINCT primary_l1_module FROM questions")
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT primary_l1_module FROM questions WHERE target_grade_and_subject = ?",
+            (grade_subject,),
+        )
     )
     if l1_module is not None:
         l1_modules &= {l1_module}
@@ -405,8 +485,9 @@ def _build_elo_ledger_response(
     modules: list[ModuleLedgerView] = []
     for module in sorted(l1_modules):
         event_rows = conn.execute(
-            "SELECT * FROM elo_mutation_ledger WHERE l1_module = ? ORDER BY event_id",
-            (module,),
+            "SELECT * FROM elo_mutation_ledger WHERE grade_subject = ? AND l1_module = ?"
+            " ORDER BY event_id",
+            (grade_subject, module),
         ).fetchall()
         events = [
             EloEventView(
@@ -425,14 +506,16 @@ def _build_elo_ledger_response(
             for row in event_rows
         ]
         escrow_rows = conn.execute(
-            "SELECT * FROM question_escrow_pool WHERE l1_module = ?"
-            " AND escrow_status = 'FROZEN_PENDING_BLIND' ORDER BY question_uid",
-            (module,),
+            "SELECT p.* FROM question_escrow_pool p"
+            " JOIN questions q ON q.question_uid = p.question_uid"
+            " WHERE q.target_grade_and_subject = ? AND p.l1_module = ?"
+            " AND p.escrow_status = 'FROZEN_PENDING_BLIND' ORDER BY p.question_uid",
+            (grade_subject, module),
         ).fetchall()
         modules.append(
             ModuleLedgerView(
                 l1_module=module,
-                current=elo_engine.get_module_elo(conn, module),
+                current=elo_engine.get_module_elo(conn, grade_subject, module),
                 events=events,
                 curve=[
                     EloCurvePoint(
@@ -582,11 +665,13 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
     # ---- CUJ 3：每日盲测题单 / 销账（active_date 注入贯穿，支持时间旅行） ----
     @app.get("/api/v1/drills/daily", response_model=list[BlindDrillItemDTO])
     def daily_drills(
+        grade_subject: Annotated[str, Query()],
         active_date: Annotated[date | None, Query()] = None,
     ) -> list[BlindDrillItemDTO]:
+        """指定学段当日盲测题单（P10-E：grade_subject 必填，每学段独立配额）。"""
         day = active_date if active_date is not None else date.today()
         with get_db_connection() as conn:
-            return get_daily_blind_drill_queue(conn, day)
+            return get_daily_blind_drill_queue(conn, day, grade_subject=grade_subject)
 
     @app.post("/api/v1/drills/daily", response_model=BlindDrillOutcomeDTO)
     async def submit_drill(body: BlindDrillSubmitRequest) -> BlindDrillOutcomeDTO:
@@ -612,9 +697,12 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
 
     # ---- CUJ 4：三层知识网看板 + 并查集批次一键回滚 ----
     @app.get("/api/v1/knowledge-graph", response_model=KnowledgeGraphResponse)
-    def get_knowledge_graph() -> KnowledgeGraphResponse:
+    def get_knowledge_graph(
+        grade_subject: Annotated[str, Query()],
+    ) -> KnowledgeGraphResponse:
+        """指定学段知识网看板（P10-E：grade_subject 必填，跨学段节点零串扰）。"""
         with get_db_connection() as conn:
-            return _build_graph_response(conn)
+            return _build_graph_response(conn, grade_subject)
 
     @app.post(
         "/api/v1/knowledge-graph/compaction/{batch_id}/revert",
@@ -637,10 +725,49 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
     # ---- 双轨 Elo 账本看板 ----
     @app.get("/api/v1/elo/ledger", response_model=EloLedgerResponse)
     def get_elo_ledger(
+        grade_subject: Annotated[str, Query()],
         l1_module: Annotated[str | None, Query()] = None,
     ) -> EloLedgerResponse:
+        """指定学段双轨 Elo 台账（P10-E：grade_subject 必填，(学段,L1) 独立核算）。"""
         with get_db_connection() as conn:
-            return _build_elo_ledger_response(conn, l1_module)
+            return _build_elo_ledger_response(conn, grade_subject, l1_module)
+
+    # ---- 学段学科条目 CRUD（P10-A 服务；写操作单连接事务提交） ----
+    @app.get("/api/v1/settings/grade-subjects", response_model=list[GradeSubjectItem])
+    def list_grade_subject_items() -> list[GradeSubjectItem]:
+        """全部学段条目（含 0 题条目，按创建时间升序）。"""
+        with get_db_connection() as conn:
+            return list_grade_subjects(conn)
+
+    @app.post("/api/v1/settings/grade-subjects", response_model=GradeSubjectCreateResponse)
+    def create_grade_subject_item(
+        body: GradeSubjectCreateRequest,
+    ) -> GradeSubjectCreateResponse:
+        """新建条目（幂等）；空/纯空白名称 → ValueError → 400。"""
+        with get_db_connection() as conn:
+            item, created = create_grade_subject(conn, body.grade_subject)
+        return GradeSubjectCreateResponse(item=item, created=created)
+
+    @app.patch(
+        "/api/v1/settings/grade-subjects/{name}", response_model=GradeSubjectRenameResponse
+    )
+    def rename_grade_subject_item(
+        name: str, body: GradeSubjectRenameRequest
+    ) -> GradeSubjectRenameResponse:
+        """重命名条目并单事务级联改标（题目/节点/账本/标红边/审计）；冲突 → 400。"""
+        with get_db_connection() as conn:
+            affected = rename_grade_subject(conn, name, body.new_name)
+        return GradeSubjectRenameResponse(renamed=body.new_name.strip(), affected=affected)
+
+    @app.delete("/api/v1/settings/grade-subjects/{name}", status_code=204)
+    def delete_grade_subject_item(name: str) -> None:
+        """删除条目；该学段下仍有题目 → GradeSubjectInUseError → 409（含计数）。"""
+        with get_db_connection() as conn:
+            try:
+                delete_grade_subject(conn, name)
+            except GradeSubjectInUseError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return None
 
     # ---- CAS 受管资产静态图像服务 ----
     @app.get("/assets/{cas_hash}")

@@ -94,6 +94,13 @@ PAIR_A = "能量守恒求焦耳热"
 PAIR_B = "能量守恒求焦耳热大小"
 
 DAY = date(2026, 11, 12)  # 配额测试固定时间旅行日
+ALT_GRADE = "初中数学"  # P10-E 跨学段隔离：第二学段（与 GRADE 同 L1 名「力学」）
+
+
+def _drill_params(active_date: date | str) -> dict[str, str]:
+    """P10-E：盲测题单学段必填 Query + active_date（时间旅行注入）。"""
+    day = active_date.isoformat() if isinstance(active_date, date) else active_date
+    return {"grade_subject": GRADE, "active_date": day}
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +212,10 @@ async def _ingest(
     *,
     with_images: bool = False,
     draft_color: tuple[int, int, int] = (200, 30, 30),
+    grade: str = GRADE,
 ) -> dict[str, Any]:
-    data = {"stem_md": stem_md, "target_grade": GRADE, "initial_state": "错题"}
+    """multipart 录入；grade 缺省本文件 GRADE（P10-E 跨学段 E2E 需第二学段）。"""
+    data = {"stem_md": stem_md, "target_grade": grade, "initial_state": "错题"}
     files = []
     if with_images:
         files = [
@@ -307,15 +316,17 @@ def _module_ledger(client_body: dict[str, Any], module: str) -> dict[str, Any]:
     return next(m for m in client_body["modules"] if m["l1_module"] == module)
 
 
-async def _get_ledger(client: AsyncClient) -> dict[str, Any]:
-    resp = await client.get("/api/v1/elo/ledger")
+async def _get_ledger(client: AsyncClient, grade: str = GRADE) -> dict[str, Any]:
+    """P10-E：账本端点学段必填（默认本文件 GRADE，可显式指定以断言跨学段隔离）。"""
+    resp = await client.get("/api/v1/elo/ledger", params={"grade_subject": grade})
     assert resp.status_code == 200
     body: dict[str, Any] = resp.json()
     return body
 
 
-async def _get_graph(client: AsyncClient) -> dict[str, Any]:
-    resp = await client.get("/api/v1/knowledge-graph")
+async def _get_graph(client: AsyncClient, grade: str = GRADE) -> dict[str, Any]:
+    """P10-E：看板端点学段必填（默认本文件 GRADE，可显式指定以断言跨学段隔离）。"""
+    resp = await client.get("/api/v1/knowledge-graph", params={"grade_subject": grade})
     assert resp.status_code == 200
     body: dict[str, Any] = resp.json()
     return body
@@ -525,7 +536,7 @@ async def test_cuj3_settlement_window_blind_mastered_conservation(client: AsyncC
     assert len(ledger["pending_escrows"]) == 1
 
     # 时间旅行 +4 天：题单剥标签，优先未曝光 ISOMORPHIC 变式（只核最终答案）
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": _drill_day(4)})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(_drill_day(4)))
     assert resp.status_code == 200
     items = resp.json()
     assert len(items) == 1
@@ -589,7 +600,7 @@ async def test_cuj3_original_fallback_double_verification_pass(
     assert question["blind_test_unlock_at"][:10] == _drill_day(2)
     assert question["blind_test_due_at"][:10] == _drill_day(4)
     # TRAP 变式为 SHARED_TRAP（非 CLONE/ISOMORPHIC）→ 题单回退原题
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": _drill_day(3)})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(_drill_day(3)))
     items = resp.json()
     assert len(items) == 1
     item = items[0]
@@ -719,9 +730,9 @@ async def test_cuj3_daily_quota_defer_and_idempotent_lock(client: AsyncClient) -
             ),
         )
         _execute(
-            "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator)"
-            " VALUES (?, ?, ?, ?)",
-            (f"node-{uid}", MODULE_EM, f"实体-{uid}", f"算子-{uid}"),
+            "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+            " l3_operator) VALUES (?, ?, ?, ?, ?)",
+            (f"node-{uid}", GRADE, MODULE_EM, f"实体-{uid}", f"算子-{uid}"),
         )
         _execute(
             "INSERT INTO question_steps (step_id, question_uid, step_index, step_goal_desc,"
@@ -742,7 +753,7 @@ async def test_cuj3_daily_quota_defer_and_idempotent_lock(client: AsyncClient) -
         )
 
     # 首次 GET：按 unlock ASC（同日按 uid）锁定前 3，第 4 道顺延 +1 天
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": DAY.isoformat()})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(DAY))
     assert resp.status_code == 200
     items = resp.json()
     assert [i["question_uid"] for i in items] == ["q-quota-1", "q-quota-2", "q-quota-3"]
@@ -757,7 +768,7 @@ async def test_cuj3_daily_quota_defer_and_idempotent_lock(client: AsyncClient) -
         assert row["slated_exposure_count"] == 1
 
     # 同日重复刷新：幂等返回锁定题单，不重复递增曝光、不重复顺延
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": DAY.isoformat()})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(DAY))
     assert [i["question_uid"] for i in resp.json()] == [
         "q-quota-1",
         "q-quota-2",
@@ -782,12 +793,12 @@ async def test_cuj3_daily_quota_defer_and_idempotent_lock(client: AsyncClient) -
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["mastery_state"] == "MASTERED"
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": DAY.isoformat()})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(DAY))
     assert resp.json() == []
 
     # 次日：顺延题解锁入单（曝光从 1 开始）
     next_day = (DAY + timedelta(days=1)).isoformat()
-    resp = await client.get("/api/v1/drills/daily", params={"active_date": next_day})
+    resp = await client.get("/api/v1/drills/daily", params=_drill_params(next_day))
     assert [i["question_uid"] for i in resp.json()] == ["q-quota-4"]
     deferred = _one("SELECT * FROM questions WHERE question_uid = 'q-quota-4'")
     assert deferred["slated_drill_date"] == next_day
@@ -1130,10 +1141,131 @@ async def test_elo_idempotency_keys_no_double_credit(client: AsyncClient) -> Non
     assert await _get_ledger(client) == ledger_before
     # 知识网服务层与账本正交：resolve 不产生 Elo 副作用
     with get_db_connection() as conn:
-        resolver = knowledge_graph.CanonicalNodeResolver(conn)
+        resolver = knowledge_graph.CanonicalNodeResolver(conn, GRADE)
         node = _one(
             "SELECT knowledge_node_id FROM question_steps WHERE question_uid = ? LIMIT 1",
             (uid,),
         )
         assert resolver.resolve(str(node["knowledge_node_id"])) == str(node["knowledge_node_id"])
     assert await _get_ledger(client) == ledger_before
+
+# ---------------------------------------------------------------------------
+# P10-E：跨学段 E2E — 两学段同 L1 全链隔离 + 盲测销账互不波及
+# ---------------------------------------------------------------------------
+
+
+async def test_cross_grade_isolation_full_chain(client: AsyncClient) -> None:
+    """A/B 两学段各录一道错题走完门禁+四阶 → graph/elo/drill 逐学段隔离。
+
+    断言要点（P10-E）：
+    - 两学段同名 L1「力学」的节点/标红边/事件/托管/题单互不串；
+    - 两学段各自 1200 冷启动独立核算（此时 A 的保底事件不抬高 B）；
+    - A 学段盲测销账只改 A 学段账本，B 学段账本逐字段零变化。
+    """
+    card_a = await _concept_chain(client)
+    # B 学段：同结构错题（改题干避免同内容幂等重入库）→ 门禁 + 四阶全链
+    card_b = await _ingest(client, f"{STEM_MD}\n（学段隔离题：{ALT_GRADE}）", grade=ALT_GRADE)
+    sid_b = card_b["session_id"]
+    assert (await _confirm(client, sid_b, "CONCEPT_BOTTLENECK"))["micro_stage"] == (
+        "STAGE_1_BLIND_PROBE"
+    )
+    for answer, stage in (
+        (STAGE1_WRONG, "STAGE_2_MICRO_SCAFFOLD"),
+        (STAGE2_ANSWER, "STAGE_3_REDO_ORIGINAL"),
+        (STAGE3_ANSWER, "STAGE_4_DECRUTCH_VARIANT"),
+        (STAGE4_EQUATION, "SESSION_COMPLETED"),
+    ):
+        assert (await _submit(client, sid_b, answer))["micro_stage"] == stage
+    uid_b = card_b["question_uid"]
+    assert _one("SELECT mastery_state FROM questions WHERE question_uid = ?", (uid_b,))[
+        "mastery_state"
+    ] == "PENDING_RETEST"
+    # 学段归属自派生：两题各自挂在自己学段下
+    assert {
+        row["target_grade_and_subject"]
+        for row in _query(
+            "SELECT target_grade_and_subject FROM questions WHERE question_uid IN (?, ?)",
+            (card_a["question_uid"], uid_b),
+        )
+    } == {GRADE, ALT_GRADE}
+
+    # ① graph：节点/标红边逐学段隔离（同 L1 名、同 L2/L3 名，仍零共享）
+    graph_a = await _get_graph(client)
+    graph_b = await _get_graph(client, ALT_GRADE)
+    ids_a = {
+        n["node_id"] for m in graph_a["modules"] for g in m["l2_groups"] for n in g["nodes"]
+    }
+    ids_b = {
+        n["node_id"] for m in graph_b["modules"] for g in m["l2_groups"] for n in g["nodes"]
+    }
+    assert len(ids_a) == 3 and len(ids_b) == 3
+    assert ids_a.isdisjoint(ids_b)
+    assert [m["l1_module"] for m in graph_a["modules"]] == ["力学"]
+    assert [m["l1_module"] for m in graph_b["modules"]] == ["力学"]
+    edges_a = {(e["node_u_id"], e["node_v_id"]) for e in graph_a["red_edges"]}
+    edges_b = {(e["node_u_id"], e["node_v_id"]) for e in graph_b["red_edges"]}
+    assert len(edges_a) == 3 and len(edges_b) == 3
+    assert edges_a.isdisjoint(edges_b)
+    assert {
+        row["grade_subject"]
+        for row in _query("SELECT grade_subject FROM knowledge_nodes")
+    } == {GRADE, ALT_GRADE}
+    assert {
+        row["grade_subject"]
+        for row in _query(
+            "SELECT grade_subject FROM knowledge_nodes WHERE node_id IN (?, ?, ?)", tuple(ids_b)
+        )
+    } == {ALT_GRADE}
+
+    # ② elo：事件/托管池逐学段隔离；同一 mock 结构下双轨水位完全对称（各自 1200 起算）
+    ledger_a = await _get_ledger(client)
+    ledger_b = await _get_ledger(client, ALT_GRADE)
+    la = _module_ledger(ledger_a, "力学")
+    lb = _module_ledger(ledger_b, "力学")
+    assert [e["question_uid"] for e in la["events"]] == [card_a["question_uid"]] * 2
+    assert [e["question_uid"] for e in lb["events"]] == [uid_b] * 2
+    # 解释条前缀为【学段 · 模块】（P10-B）：剥离学段前缀后逐字相同 → 算分零串扰
+    assert all(e["explanation_text"].startswith(f"【{GRADE} · 力学】") for e in la["events"])
+    assert all(e["explanation_text"].startswith(f"【{ALT_GRADE} · 力学】") for e in lb["events"])
+    assert [
+        e["explanation_text"].removeprefix(f"【{GRADE} · 力学】") for e in la["events"]
+    ] == [
+        e["explanation_text"].removeprefix(f"【{ALT_GRADE} · 力学】") for e in lb["events"]
+    ]
+    assert la["current"] == lb["current"]  # 各自 (学段, L1) 独立核算，零串扰
+    assert [e["question_uid"] for e in la["pending_escrows"]] == [card_a["question_uid"]]
+    assert [e["question_uid"] for e in lb["pending_escrows"]] == [uid_b]
+
+    # ③ drill：同一 active_date 两学段题单各自只含本学段题
+    day4 = _drill_day(4)
+    drill_a = (
+        await client.get("/api/v1/drills/daily", params=_drill_params(day4))
+    ).json()
+    drill_b = (
+        await client.get(
+            "/api/v1/drills/daily",
+            params={"grade_subject": ALT_GRADE, "active_date": day4},
+        )
+    ).json()
+    assert [i["question_uid"] for i in drill_a] == [card_a["question_uid"]]
+    assert [i["question_uid"] for i in drill_b] == [uid_b]
+
+    # ④ A 学段盲测销账 → 仅 A 账本新增兑现事件；B 账本逐字段零变化（含托管仍在）
+    ledger_b_before = await _get_ledger(client, ALT_GRADE)
+    resp = await client.post(
+        "/api/v1/drills/daily",
+        json={
+            "question_uid": card_a["question_uid"],
+            "final_answer": STAGE2_ANSWER,
+            "active_date": day4,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["mastery_state"] == "MASTERED"
+    la_after = _module_ledger(await _get_ledger(client), "力学")
+    assert [e["mutation_trigger"] for e in la_after["events"]][-1] == "BLIND_TEST_REALIZE"
+    assert la_after["pending_escrows"] == []
+    ledger_b_after = await _get_ledger(client, ALT_GRADE)
+    assert ledger_b_after == ledger_b_before
+    pending_b = _module_ledger(ledger_b_after, "力学")["pending_escrows"]
+    assert [e["question_uid"] for e in pending_b] == [uid_b]
