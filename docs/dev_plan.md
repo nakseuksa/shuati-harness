@@ -228,3 +228,5 @@ flowchart LR
 | 2026-11-16 | 用户 UI 需求两项：①标红边列表折叠（P9-C）②Elo 看板拆独立同级页签（P9-D） | P9-C 交付并验收（076613e）：默认折叠+统计徽章+原地切换，.edge-list[hidden] 陷阱已处理，worker 离线 vm 29 断言+PM diff 审查；P9-D 待 P9-C 提交后串行派发（app.js 所有权互斥） |
 | 2026-11-16 | P9-D 派发：双轨 Elo 看板拆为独立页签「📈 双轨 Elo」 | loadGraphAndElo 拆 loadGraph/loadElo 独立懒加载；模块过滤只刷 Elo；renderElo 内容不动 |
 | 2026-11-16 | P9-D 验收交付：diff 审查与契约一致 + 本地服务冒烟（五页签↔五视图 aria 配对、elo-root 唯一、双 API 200、零残留） | unmergeBatch 本就只刷图（Elo 正交）无需改；styles.css 零改动；前端五页签各自独立懒加载；本轮全部需求（backlog 三项 + UI 两项）交付完毕 |
+| 2026-11-16 | 用户报告看不到折叠开关，PM 排查证实服务端正常（真实数据 vm 渲染验证 7/7），根因浏览器缓存旧 app.js；用户裁决：静态挂载加脚本版本号查询参数（P9-E） | 静态响应仅 ETag/Last-Modified 无 Cache-Control → 启发式缓存；排查链：交付内容 grep + API 数据 + 字段映射 + 真实数据渲染证明 |
+| 2026-11-16 | P9-E 验收交付（7c878cd）：根路由注入 ?v=内容sha256[:12]，全量门禁 917 测试/96.99%，重启服务真实冒烟（注入哈希一致/版本化 URL 200/API 不受影响） | index.html 不改（零构建，file:// 直开仍可用）；资源缺失容错不注入；内容不变 URL 稳定缓存友好；此后前端迭代普通刷新即生效 |
