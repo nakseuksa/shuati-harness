@@ -101,12 +101,13 @@ async def _ingest(
     base_dir: Path | None = None,
     user_answer: str = "",
     mastered_claim: bool = False,
+    grade: str = GRADE,
 ) -> GateCardDTO:
     return await ingest_question(
         stem_md,
         stem_images or [],
         draft_images or [],
-        GRADE,
+        grade,
         initial_state=initial_state,  # type: ignore[arg-type]
         base_dir=base_dir,
         db_path=db_path,
@@ -634,16 +635,17 @@ async def test_auto_compaction_triggered_at_threshold_during_ingest(
     threshold = settings.COMPACTION_BATCH_THRESHOLD
     _install_payload(monkeypatch, _many_step_payload(threshold))
     real_compaction = knowledge_graph.run_scoped_compaction
-    compaction_calls: list[tuple[str, str]] = []
+    compaction_calls: list[tuple[str, str, str]] = []
 
-    def spy(conn: sqlite3.Connection, l1: str, l2: str) -> str | None:
-        compaction_calls.append((l1, l2))
-        return real_compaction(conn, l1, l2)
+    # P10-D：Compaction 作用域已升为 (学段, L1, L2) 三元组（P10-C），spy 同步扩参
+    def spy(conn: sqlite3.Connection, grade: str, l1: str, l2: str) -> str | None:
+        compaction_calls.append((grade, l1, l2))
+        return real_compaction(conn, grade, l1, l2)
 
     monkeypatch.setattr(knowledge_graph, "run_scoped_compaction", spy)
     card = await _ingest(tmp_db)
     # 第 threshold 个新建节点在录入中途自动触发同域 compaction
-    assert compaction_calls == [("力学", "圆周运动")]
+    assert compaction_calls == [(GRADE, "力学", "圆周运动")]
     # 默认裁判保守判未命中：无合并，节点全部保持活跃，录入事务完整
     assert _count(tmp_db, "knowledge_nodes") == threshold
     assert all(
@@ -759,8 +761,9 @@ async def test_single_node_question_creates_no_edges(
     assert len(edges_before) == 3
 
     async def fake_match(
-        conn: Any, l1: str, l2: str, cand: str, aliases: list[str]
+        conn: Any, grade: str, l1: str, l2: str, cand: str, aliases: list[str]
     ) -> tuple[str, bool]:
+        assert grade == GRADE  # P10-D：节点解析限同学段
         return target_id, True  # 全部步复用同一节点
 
     monkeypatch.setattr(ingest_service, "match_or_create_l3_node", fake_match)
@@ -829,8 +832,9 @@ async def test_second_multi_node_question_increments_shared_edges(
     }
 
     async def fake_match(
-        conn: Any, l1: str, l2: str, cand: str, aliases: list[str]
+        conn: Any, grade: str, l1: str, l2: str, cand: str, aliases: list[str]
     ) -> tuple[str, bool]:
+        assert grade == GRADE  # P10-D：节点解析限同学段
         return nodes_by_op[cand], True  # 按算子名复用第一题的对应节点
 
     monkeypatch.setattr(ingest_service, "match_or_create_l3_node", fake_match)
@@ -1276,3 +1280,135 @@ async def test_ingest_releases_db_lock_during_vlm_call(
 
     card = await task
     assert card.question_uid
+
+
+# ---------------------------------------------------------------------------
+# P10-D：学段学科分区接线（条目幂等建 / 树注入 scoped / 重入库归属零漂移）
+# ---------------------------------------------------------------------------
+
+OTHER_GRADE = "高中物理-高一"
+
+
+def _grade_entries(db_path: Path) -> list[str]:
+    return [
+        str(r["grade_subject"])
+        for r in _query(db_path, "SELECT * FROM grade_subjects ORDER BY grade_subject")
+    ]
+
+
+def _insert_node_direct(
+    db_path: Path, node_id: str, grade: str, l1: str, l2: str, l3: str
+) -> None:
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+            " l3_operator) VALUES (?, ?, ?, ?, ?)",
+            (node_id, grade, l1, l2, l3),
+        )
+
+
+async def test_new_question_creates_grade_entry_and_scoped_nodes(
+    tmp_db: Path, cas_dir: Path, draft_image: Path
+) -> None:
+    """P10-D 新题：幂等建学段条目 + 题目归属规范化 + 节点/账本行同学段（P10-B 联动）。"""
+    card = await _ingest(tmp_db, draft_images=[draft_image], mastered_claim=True)
+    assert _grade_entries(tmp_db) == [GRADE]
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["target_grade_and_subject"] == GRADE
+    node_grades = {
+        str(r["grade_subject"]) for r in _query(tmp_db, "SELECT * FROM knowledge_nodes")
+    }
+    assert node_grades == {GRADE}  # 节点全部落题目学段
+    assert _count(tmp_db, "knowledge_nodes") == 3
+    step_nodes = _query(
+        tmp_db, "SELECT DISTINCT knowledge_node_id FROM question_steps WHERE question_uid=?",
+        (card.question_uid,),
+    )
+    assert len(step_nodes) == 3
+    # 录入即掌握（P7-A）的账本行学段/模块与题目一致
+    events = _query(tmp_db, "SELECT * FROM elo_mutation_ledger")
+    assert len(events) == 1
+    assert events[0]["grade_subject"] == GRADE
+    assert events[0]["l1_module"] == "力学"
+
+
+async def test_new_question_grade_name_stripped(
+    tmp_db: Path, cas_dir: Path, draft_image: Path
+) -> None:
+    """入参学段首尾空白 strip 后落库（条目 / 题目归属同一规范化名）。"""
+    card = await _ingest(tmp_db, draft_images=[draft_image], grade=f"  {GRADE}  ")
+    assert card.is_reimport is False
+    assert _grade_entries(tmp_db) == [GRADE]
+    assert _query(tmp_db, "SELECT * FROM questions")[0]["target_grade_and_subject"] == GRADE
+    assert {
+        str(r["grade_subject"]) for r in _query(tmp_db, "SELECT * FROM knowledge_nodes")
+    } == {GRADE}
+
+
+async def test_vlm_tree_injection_scoped_to_grade(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, diagnose_calls: list[dict[str, Any]]
+) -> None:
+    """树注入 scoped：两学段同名 L1 各有节点 → 录 A 学段题时只注入 A 学段 L1/L2。"""
+    _insert_node_direct(tmp_db, "n-other-1", OTHER_GRADE, "力学", "圆周运动", "异构算子")
+    _insert_node_direct(tmp_db, "n-same-1", GRADE, "力学", "平抛运动", "本学段算子")
+    await _ingest(tmp_db, draft_images=[draft_image])
+    assert len(diagnose_calls) == 1
+    call = diagnose_calls[0]
+    assert call["target_grade"] == GRADE
+    assert call["existing_l1_l2_tree"] == {"力学": ["平抛运动"]}  # 不含异学段 L2
+    assert "圆周运动" not in call["existing_l1_l2_tree"].get("力学", [])
+
+
+async def test_reimport_cross_grade_keeps_original_ownership(
+    tmp_db: Path, cas_dir: Path, draft_image: Path, tmp_path: Path,
+    diagnose_calls: list[dict[str, Any]],
+) -> None:
+    """重入库零漂移：短路/改题干/带新草稿三路径学段归属不变，不建异学段条目。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image])
+    uid = first.question_uid
+    nodes_before = [dict(r) for r in _query(tmp_db, "SELECT * FROM knowledge_nodes")]
+
+    # 路径 1：同内容短路（入参学段不同）
+    short = await _ingest(tmp_db, draft_images=[draft_image], grade=OTHER_GRADE)
+    assert short.is_reimport is True and short.session_id == first.session_id
+    # 路径 2：仅题干更新（入参学段不同）
+    stem_edit = await _ingest(
+        tmp_db,
+        stem_md=_with_uid(uid, STEM_MD + "\n（措辞微调。）"),
+        draft_images=[draft_image],
+        grade=OTHER_GRADE,
+    )
+    assert stem_edit.is_reimport is True
+    # 路径 3：补充新草稿（新建会话，入参学段不同）
+    new_draft = _make_image(tmp_path / "draft2.png", (0, 255, 0))
+    draft_card = await _ingest(
+        tmp_db, stem_md=_with_uid(uid, STEM_MD), draft_images=[new_draft], grade=OTHER_GRADE
+    )
+    assert draft_card.is_reimport is True
+    assert draft_card.session_id != first.session_id
+    # 归属零漂移：题目学段 / 唯一条目 / 节点集全部不变
+    q = _query(tmp_db, "SELECT * FROM questions")[0]
+    assert q["target_grade_and_subject"] == GRADE
+    # 题干 frontmatter 的学段行亦为既有归属（不与入参漂移）
+    assert f"target_grade_and_subject: {GRADE}\n" in q["stem_md"]
+    assert f"target_grade_and_subject: {OTHER_GRADE}" not in q["stem_md"]
+    assert _grade_entries(tmp_db) == [GRADE]  # 未误建异学段空条目
+    assert [dict(r) for r in _query(tmp_db, "SELECT * FROM knowledge_nodes")] == nodes_before
+    # 带新草稿路径的诊断也用既有归属学段（防提示与骨架树自相矛盾）
+    # 仅首次新题与带新草稿重入库各调用一次 VLM；两次学段均为既有归属（不含异学段入参）
+    assert len(diagnose_calls) == 2
+    assert [c["target_grade"] for c in diagnose_calls] == [GRADE, GRADE]
+    assert diagnose_calls[0]["existing_l1_l2_tree"] == {}  # 冷启动空树
+    assert diagnose_calls[1]["existing_l1_l2_tree"] == {"力学": ["圆周运动"]}
+
+
+@pytest.mark.parametrize("grade", ["", "   ", "\n\t "])
+async def test_empty_grade_rejected_before_any_write(
+    tmp_db: Path, cas_dir: Path, grade: str, diagnose_calls: list[dict[str, Any]]
+) -> None:
+    """入口守卫：空/纯空白学段 → ValueError，未落任何行、未调用 VLM。"""
+    with pytest.raises(ValueError, match="学段"):
+        await _ingest(tmp_db, grade=grade)
+    assert diagnose_calls == []
+    for table in ("questions", "knowledge_nodes", "diagnostic_sessions", "grade_subjects"):
+        assert _count(tmp_db, table) == 0

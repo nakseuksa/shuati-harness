@@ -10,11 +10,17 @@ Target File #12；任务契约 docs/tasks/P3-C_blind_drill.md。
   函数体内部以 SAVEPOINT 保证「全程单事务」的原子性（异常整体回滚）。
 
 核心不变量：
-- 同日题单幂等：``slated_drill_date == active_date`` 已存在任何锁定记录（含当日已
+- 学段独立配额（P10-D）：候选/锁定/幂等判据均带 ``target_grade_and_subject`` 学段过滤；
+  每个学段各自 ≤limit 配额、独立 ``slated_drill_date`` 当日幂等锁、独立溢出顺延与
+  ``system_deferred_days``，互不串用（用户裁决④）；
+- 同日题单幂等：本学段 ``slated_drill_date == active_date`` 已有任何锁定记录（含当日已
   作答而离开 PENDING_RETEST 的题）即幂等返回仍在待测的锁定题单，不重复递增曝光、
   不重复顺延；跨日才重新锁定并 ``slated_exposure_count += 1``。
-- 溢出顺延：超出当日配额的到期题 unlock_at / due_at 各 +1 天、system_deferred_days
-  +1，当日不排入 → ``apply_overdue_escrow_decay`` 的 slated 判据天然冻结其衰减。
+- 溢出顺延：超出本学段当日配额的到期题 unlock_at / due_at 各 +1 天、
+  system_deferred_days +1，当日不排入 → ``apply_overdue_escrow_decay`` 的 slated 判据
+  天然冻结其衰减。
+- 衰减全局（P10-D 裁决）：``apply_overdue_escrow_decay`` 跨学段一次扫描，不按学段过滤；
+  同日幂等键 ``{uid}:{active_date}:ESCROW_TIMEOUT_DECAY`` 保证多学段队列调用不重复衰减。
 - 防剧透：DTO 结构上不含 primary_l1_module / 知识点路径 / parent 字段；题干文本
   剥离 frontmatter、[L1]/[L2]/[L3] 路径标签行与来源行。
 - 防背答案：优先呈现 blind_drill_attempts 中从未曝光过的 CLONE/ISOMORPHIC 变式；
@@ -306,20 +312,25 @@ def _build_item(conn: sqlite3.Connection, question: sqlite3.Row) -> BlindDrillIt
 
 
 def get_daily_blind_drill_queue(
-    conn: sqlite3.Connection, active_date: date, limit: int | None = None
+    conn: sqlite3.Connection,
+    active_date: date,
+    limit: int | None = None,
+    *,
+    grade_subject: str,
 ) -> list[BlindDrillItemDTO]:
-    """获取当日综合盲测题单（<= cap 道，已剥离剧透标签），全程单事务。
+    """获取指定学段当日综合盲测题单（<= cap 道，已剥离剧透标签），全程单事务。
 
-    - 当日已锁定（任何题 slated_drill_date == active_date，含已作答离队者）→
+    - 候选与锁定均限 ``grade_subject`` 学段（P10-D 用户裁决④：每学段独立配额）；
+    - 本学段当日已锁定（任何题 slated_drill_date == active_date，含已作答离队者）→
       幂等返回仍在 PENDING_RETEST 的锁定题单，不重复递增曝光、不重复顺延；
-    - 否则选 PENDING_RETEST 且 blind_test_unlock_at <= active_date 的题，按
+    - 否则选本学段 PENDING_RETEST 且 blind_test_unlock_at <= active_date 的题，按
       unlock_at ASC 取前 cap 道：slated_drill_date=active_date、曝光 +1；
-    - 溢出到期题 unlock_at/due_at 各 +1 天、system_deferred_days +1，当日不排入
-      （未 slated → 衰减判据天然冻结）；
-    - 锁定后接线 elo_engine.apply_overdue_escrow_decay（当日已排入且曝光 > 阈值
-      的题按日衰减；函数自身按 (uid, date) 幂等，重复刷新不重复衰减）。
+    - 本学段溢出到期题 unlock_at/due_at 各 +1 天、system_deferred_days +1，当日不
+      排入（未 slated → 衰减判据天然冻结）；
+    - 锁定后接线 elo_engine.apply_overdue_escrow_decay（全局跨学段扫描；当日已排入且
+      曝光 > 阈值的题按日衰减；函数自身按 (uid, date) 幂等，重复刷新/多学段调用不重衰）。
 
-    limit 缺省 settings.DAILY_BLIND_DRILL_CAP；负数抛 ValueError。limit=0 时
+    limit 缺省 settings.DAILY_BLIND_DRILL_CAP；负数抛 ValueError。limit=0 时本学段
     不产生锁定记录，所有到期题顺延（退化用法，同日重复调用会再次顺延）。
     """
     cap = settings.DAILY_BLIND_DRILL_CAP if limit is None else limit
@@ -329,16 +340,20 @@ def get_daily_blind_drill_queue(
 
     with _savepoint(conn):
         locked_any = _query_one(
-            conn, "SELECT question_uid FROM questions WHERE slated_drill_date = ? LIMIT 1", (day,)
+            conn,
+            "SELECT question_uid FROM questions"
+            " WHERE slated_drill_date = ? AND target_grade_and_subject = ? LIMIT 1",
+            (day, grade_subject),
         )
         if locked_any is not None:
-            # 当日已锁定 → 幂等返回仍在待测的锁定题单（已作答者自然离队）
+            # 本学段当日已锁定 → 幂等返回仍在待测的锁定题单（已作答者自然离队）
             rows = _query_all(
                 conn,
                 "SELECT * FROM questions WHERE slated_drill_date = ?"
+                " AND target_grade_and_subject = ?"
                 " AND mastery_state = 'PENDING_RETEST'"
                 " ORDER BY blind_test_unlock_at ASC, question_uid ASC",
-                (day,),
+                (day, grade_subject),
             )
             deferred_uids: list[str] = []
             idempotent = True
@@ -346,9 +361,10 @@ def get_daily_blind_drill_queue(
             due = _query_all(
                 conn,
                 "SELECT * FROM questions WHERE mastery_state = 'PENDING_RETEST'"
+                " AND target_grade_and_subject = ?"
                 " AND blind_test_unlock_at IS NOT NULL AND date(blind_test_unlock_at) <= date(?)"
                 " ORDER BY blind_test_unlock_at ASC, question_uid ASC",
-                (day,),
+                (grade_subject, day),
             )
             rows = due[:cap]
             for row in rows:
@@ -373,12 +389,14 @@ def get_daily_blind_drill_queue(
             logger,
             "drill.queue_locked",
             active_date=day,
+            grade_subject=grade_subject,
             uids=[str(row["question_uid"]) for row in rows],
             deferred_uids=deferred_uids,
             idempotent=idempotent,
         )
         items = [_build_item(conn, row) for row in rows]
-        # 衰减接线：仅当日已排入且曝光 > 阈值的题衰减；顺延题未 slated → 冻结
+        # 衰减接线（全局，不按学段过滤）：仅当日已排入且曝光 > 阈值的题衰减；
+        # 顺延题未 slated → 冻结；同日幂等键保证多学段调用不重复衰减。
         elo_engine.apply_overdue_escrow_decay(conn, active_date)
     return items
 
@@ -483,6 +501,9 @@ def evaluate_blind_drill_submission(
 
     题目不存在或不在 PENDING_RETEST 状态抛 ValueError（回滚，不落任何写入）。
     active_date 缺省 date.today()。
+
+    P10-D：签名与逻辑不变——本函数以 uid 操作，学段由 elo_engine/knowledge_graph
+    自题目行自派生（P10-B/C）；SCAFFOLD_PRE 子题与母题同学段由构造保证。
     """
     day = active_date if active_date is not None else date.today()
     with _savepoint(conn):

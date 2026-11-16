@@ -30,6 +30,15 @@ Target File #5/#8；API 签名与落库流程按 PM 契约 docs/tasks/P2-D_inges
   ≥2 不同 resolve 节点才建边由该服务内部判定）；重入库路径绝不重复调用；
 - 确认卡 steps 取会话 matched_branch_id 对应分支（一题多解时对齐索引针对该分支），
   该分支无步骤行时回退 canonical。
+
+P10-D 学段分区接线（docs/tasks/P10-D_ingest_drill_wiring.md）：
+- 入口处 ``target_grade`` 一律 strip；空/纯空白 → ValueError（API 层映射 400）；
+- 注入 VLM 的既有 L1/L2 骨架树只含**本学段**活跃节点（防跨学段 L1 碎片化，
+  设计 Alternative 2A）；新题用入参学段，重入库路径用既有归属学段（零漂移）；
+- 新题落库事务内 ``grade_settings.get_or_create_grade_subject`` 幂等建条目并把
+  规范化名写入 ``questions.target_grade_and_subject``，节点解析补 grade 实参；
+- **重入库绝不用入参学段建条目或改归属**（防误建空条目 / 防归属漂移）；同内容
+  跨学段重录命中既有 uid 时保持原归属（uid 内容确定性设计不变）。
 """
 
 from __future__ import annotations
@@ -56,6 +65,7 @@ from backend.services.difficulty_rubric import (
     calculate_base_elo,
     clamp_substep_difficulty,
 )
+from backend.services.grade_settings import get_or_create_grade_subject
 from backend.services.knowledge_graph import match_or_create_l3_node, record_co_error_edges
 from backend.services.vlm_diagnosis import (
     DiagnosisPayload,
@@ -138,10 +148,15 @@ async def ingest_question(
 
     Raises:
         LLMGatewayError: VLM 诊断失败（事务回滚，无残留）。
-        ValueError: 诊断结果非法（空骨架等，事务回滚，无残留）。
+        ValueError: 目标学段为空/纯空白（入口即拒，未落任何行）；
+            诊断结果非法（空骨架等，事务回滚，无残留）。
     """
+    # P10-D：学段作用域入口守卫（strip 规范化；空 → ValueError，API 层映射 400）
+    grade = target_grade.strip()
+    if not grade:
+        raise ValueError("目标学段学科（target_grade）不能为空或纯空白")
     normalized_md, uid, stem_hash = normalize_markdown_with_frontmatter(
-        stem_md, None, target_grade, base_dir
+        stem_md, None, grade, base_dir
     )
     # 题干配图同样归档 CAS（幂等写盘；Markdown 内引用改写由 normalize 负责）
     for image_path in stem_images:
@@ -154,7 +169,7 @@ async def ingest_question(
         question_uid=uid,
         stem_hash=stem_hash,
         initial_state=initial_state,
-        target_grade=target_grade,
+        target_grade=grade,
         stem_excerpt=normalized_md,  # 内容字段经观测层统一截断 <= 120 字符
         stem_image_count=len(stem_images),
         draft_image_count=len(draft_images),
@@ -162,11 +177,20 @@ async def ingest_question(
         user_answer=user_answer,
     )
 
+    # P10-D：新题用入参学段注入骨架树；重入库用既有归属学段（题目归属零漂移）
+    tree_grade = grade
     with get_db_connection(db_path) as conn:
         existing = conn.execute(
             "SELECT * FROM questions WHERE question_uid = ?", (uid,)
         ).fetchone()
         if existing is not None:
+            tree_grade = str(existing["target_grade_and_subject"])
+            if tree_grade != grade:
+                # 归属零漂移：题干 frontmatter 的学段行也回填既有归属（不随入参漂移；
+                # 内容/stem_hash/uid 均不受影响，仍由正文确定性生成）
+                normalized_md, _, _ = normalize_markdown_with_frontmatter(
+                    stem_md, uid, tree_grade, base_dir
+                )
             latest = _latest_session(conn, uid)
             stem_changed = existing["stem_hash"] != stem_hash
             has_new_drafts = _has_new_drafts(draft_uris, latest)
@@ -222,11 +246,12 @@ async def ingest_question(
                     auto_mastered=echoed,
                     mastery_explanation=explanation,
                 )
-        tree = _build_l1_l2_tree(conn)
+        tree = _build_l1_l2_tree(conn, tree_grade)
 
     # 释放数据库连接与 SQLite 锁后，再跨网络执行耗时 VLM 诊断与沙盒判定
+    # （诊断学段 = 骨架树学段：重入库时二者同取既有归属，避免提示内自相矛盾）
     payload = await analyze_question_and_draft(
-        normalized_md, stem_images, draft_images, target_grade, tree
+        normalized_md, stem_images, draft_images, tree_grade, tree
     )
 
     if existing is not None:
@@ -252,7 +277,7 @@ async def ingest_question(
         normalized_md=normalized_md,
         stem_hash=stem_hash,
         draft_uris=draft_uris,
-        target_grade=target_grade,
+        target_grade=grade,
         initial_state=initial_state,
         user_answer=user_answer,
         mastered_claim=mastered_claim,
@@ -318,6 +343,8 @@ async def _ingest_new_question(
     )
 
     with get_db_connection(db_path) as conn:
+        # P10-D：单事务内幂等建学段条目（strip 规范化），题目归属与节点/账本同学段
+        grade = get_or_create_grade_subject(conn, target_grade)
         branches: list[tuple[str, list[StepSkeletonItem]]] = [("canonical", trace.steps)]
         if alignment.alt_branch_steps:
             branches.append(("user_alt_1", alignment.alt_branch_steps))
@@ -330,8 +357,9 @@ async def _ingest_new_question(
                     parent_cstl, base_elo, (step.c_sub, step.s_sub, step.t_sub, step.l_sub)
                 )
                 # 诊断 Schema 暂无别名字段，candidate_aliases 传 []
+                # P10-C：节点解析限同学段（召回/复用/新建均落该学段）
                 node_id, reused = await match_or_create_l3_node(
-                    conn, step.l1_module, step.l2_entity, step.l3_operator, []
+                    conn, grade, step.l1_module, step.l2_entity, step.l3_operator, []
                 )
                 resolved_steps.append((branch_id, step, node_id, reused, sub_cstl, sub_elo))
 
@@ -344,7 +372,7 @@ async def _ingest_new_question(
                       'ACTIVE', 'HUMAN_OR_CANONICAL')""",
             (
                 uid,
-                target_grade,
+                grade,
                 normalized_md,
                 stem_hash,
                 trace.standard_answer_latex,
@@ -525,12 +553,20 @@ def _has_new_drafts(draft_uris: list[str], latest_session: sqlite3.Row) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _build_l1_l2_tree(conn: sqlite3.Connection) -> dict[str, list[str]]:
-    """由活跃节点（redirect_to_id IS NULL）构造既有 L1/L2 骨架树注入 Prompt。"""
+def _build_l1_l2_tree(
+    conn: sqlite3.Connection, grade_subject: str
+) -> dict[str, list[str]]:
+    """由**本学段**活跃节点（redirect_to_id IS NULL）构造既有 L1/L2 骨架树注入 Prompt。
+
+    P10-D：只注入当前学段骨架，防同名 L1 跨学段碎片化（设计 Alternative 2A
+    rationale：学段是知识网顶层作用域，跨学段召回/复用同样是红线）。
+    """
     tree: dict[str, list[str]] = {}
     rows = conn.execute(
         "SELECT DISTINCT l1_module, l2_entity FROM knowledge_nodes "
-        "WHERE redirect_to_id IS NULL ORDER BY l1_module, l2_entity"
+        "WHERE grade_subject = ? AND redirect_to_id IS NULL "
+        "ORDER BY l1_module, l2_entity",
+        (grade_subject,),
     ).fetchall()
     for row in rows:
         tree.setdefault(row["l1_module"], []).append(row["l2_entity"])

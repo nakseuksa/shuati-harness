@@ -30,7 +30,10 @@ from backend.services.blind_drill_scheduler import (
 )
 
 MODULE = "电磁学"
+# P10-D 学段分区：测试默认学段（夹具统一声明，题目/节点/账本/队列同域）
+GRADE = "高中物理-高二"
 DAY = date(2026, 11, 12)
+OTHER_GRADE = "高中物理-高一"
 UNLOCK_DEFAULT = DAY - timedelta(days=1)
 DUE_DEFAULT = DAY + timedelta(days=3)
 
@@ -63,6 +66,7 @@ def _insert_question(
     uid: str,
     *,
     module: str = MODULE,
+    grade: str = GRADE,
     l_score: int = 2,
     base_elo: int = 2085,
     stem: str | None = None,
@@ -79,9 +83,9 @@ def _insert_question(
         " target_grade_and_subject, stem_md, stem_hash, standard_answer_latex,"
         " c_score, s_score, t_score, l_score, base_elo, tier, primary_l1_module,"
         " mastery_state, blind_test_unlock_at, blind_test_due_at, slated_exposure_count)"
-        " VALUES (?, ?, ?, '高中物理-高二', ?, ?, ?, 2, 2, 2, ?, ?, 'L3_综合中档', ?, ?, ?, ?, ?)",
+        " VALUES (?, ?, ?, ?, ?, ?, ?, 2, 2, 2, ?, ?, 'L3_综合中档', ?, ?, ?, ?, ?)",
         (
-            uid, origin, parent,
+            uid, origin, parent, grade,
             stem if stem is not None else f"题干 {uid}：求 x。",
             f"hash-{uid}", answer, l_score, base_elo, module, mastery,
             unlock.isoformat() if unlock is not None else None,
@@ -91,11 +95,13 @@ def _insert_question(
     )
 
 
-def _insert_node(conn: sqlite3.Connection, nid: str) -> None:
+def _insert_node(
+    conn: sqlite3.Connection, nid: str, *, grade: str = GRADE, module: str = MODULE
+) -> None:
     conn.execute(
-        "INSERT INTO knowledge_nodes (node_id, l1_module, l2_entity, l3_operator)"
-        " VALUES (?, ?, ?, ?)",
-        (nid, MODULE, f"实体-{nid}", f"算子-{nid}"),
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity, l3_operator)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (nid, grade, module, f"实体-{nid}", f"算子-{nid}"),
     )
 
 
@@ -170,6 +176,7 @@ def _prepare_original(
     conn: sqlite3.Connection,
     uid: str,
     *,
+    grade: str = GRADE,
     l_score: int = 2,
     answer: str = FINAL_RIGHT,
     category: str = "CONCEPT_BOTTLENECK",
@@ -181,10 +188,11 @@ def _prepare_original(
 ) -> None:
     """完整可盲测原题：题目 + 双节点双步骤（Step2 卡壳）+ 原会话 + 冻结托管池。"""
     _insert_question(
-        conn, uid, l_score=l_score, answer=answer, stem=stem, exposure=exposure, unlock=unlock
+        conn, uid, grade=grade, l_score=l_score, answer=answer, stem=stem,
+        exposure=exposure, unlock=unlock,
     )
-    _insert_node(conn, f"n-{uid}-1")
-    _insert_node(conn, f"n-{uid}-2")
+    _insert_node(conn, f"n-{uid}-1", grade=grade)
+    _insert_node(conn, f"n-{uid}-2", grade=grade)
     _insert_step(
         conn, uid, f"s-{uid}-1", index=1, formula="q*v*B = m*v^2/R",
         probe="步骤1反问句", node_id=f"n-{uid}-1", blocked=0,
@@ -231,8 +239,8 @@ def _attempt(conn: sqlite3.Connection, uid: str) -> sqlite3.Row:
     )
 
 
-def _combat(conn: sqlite3.Connection, module: str = MODULE) -> float:
-    return elo_engine.get_module_elo(conn, module).combat_elo
+def _combat(conn: sqlite3.Connection, module: str = MODULE, grade: str = GRADE) -> float:
+    return elo_engine.get_module_elo(conn, grade, module).combat_elo
 
 
 def _submit(
@@ -289,13 +297,13 @@ def test_blind_drill_attempts_table_and_index_exist(tmp_db: Path) -> None:
 def test_same_day_idempotent_queue_and_exposure(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q1", unlock=DAY - timedelta(days=2))
     _prepare_original(conn, "q2", unlock=DAY - timedelta(days=1))
-    first = get_daily_blind_drill_queue(conn, DAY)
+    first = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
     assert [i.question_uid for i in first] == ["q1", "q2"]
     for uid in ("q1", "q2"):
         row = _question(conn, uid)
         assert row["slated_drill_date"] == DAY.isoformat()
         assert row["slated_exposure_count"] == 1
-    second = get_daily_blind_drill_queue(conn, DAY)
+    second = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
     assert second == first  # 幂等返回锁定题单
     for uid in ("q1", "q2"):
         assert _question(conn, uid)["slated_exposure_count"] == 1  # 曝光不重复递增
@@ -303,9 +311,9 @@ def test_same_day_idempotent_queue_and_exposure(conn: sqlite3.Connection) -> Non
 
 def test_cross_day_relock_increments_exposure(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q1")
-    get_daily_blind_drill_queue(conn, DAY)
+    get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
     next_day = DAY + timedelta(days=1)
-    queue = get_daily_blind_drill_queue(conn, next_day)
+    queue = get_daily_blind_drill_queue(conn, next_day, grade_subject=GRADE)
     assert [i.question_uid for i in queue] == ["q1"]
     row = _question(conn, "q1")
     assert row["slated_drill_date"] == next_day.isoformat()
@@ -316,19 +324,19 @@ def test_answered_items_leave_queue_without_relock(conn: sqlite3.Connection) -> 
     _prepare_original(conn, "q1", unlock=DAY - timedelta(days=3))
     _prepare_original(conn, "q2", unlock=DAY - timedelta(days=2))
     _prepare_original(conn, "q3", unlock=DAY - timedelta(days=1))
-    assert len(get_daily_blind_drill_queue(conn, DAY)) == 3
+    assert len(get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)) == 3
     outcome = evaluate_blind_drill_submission(conn, "q1", FINAL_RIGHT, INTERMEDIATE_RIGHT, DAY)
     assert outcome.passed
-    queue = get_daily_blind_drill_queue(conn, DAY)
+    queue = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
     assert [i.question_uid for i in queue] == ["q2", "q3"]  # 已销账离队，不拉新题补位
     assert _question(conn, "q2")["slated_exposure_count"] == 1
     assert _question(conn, "q3")["slated_drill_date"] == DAY.isoformat()
 
 
 def test_empty_queue_when_nothing_due(conn: sqlite3.Connection) -> None:
-    assert get_daily_blind_drill_queue(conn, DAY) == []
+    assert get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE) == []
     _prepare_original(conn, "q-future", unlock=DAY + timedelta(days=1))
-    assert get_daily_blind_drill_queue(conn, DAY) == []
+    assert get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE) == []
     assert _question(conn, "q-future")["slated_drill_date"] is None
 
 
@@ -340,7 +348,7 @@ def test_empty_queue_when_nothing_due(conn: sqlite3.Connection) -> None:
 def test_quota_overflow_defers_single_day(conn: sqlite3.Connection) -> None:
     for i in range(4):
         _prepare_original(conn, f"q{i + 1}", unlock=DAY - timedelta(days=4 - i))
-    queue = get_daily_blind_drill_queue(conn, DAY)  # 缺省 cap=3
+    queue = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)  # 缺省 cap=3
     assert [i.question_uid for i in queue] == ["q1", "q2", "q3"]  # unlock ASC
     deferred = _question(conn, "q4")
     assert deferred["slated_drill_date"] is None
@@ -353,7 +361,7 @@ def test_quota_overflow_defers_single_day(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE questions SET mastery_state='MASTERED' WHERE question_uid=?", (uid,)
         )
-    next_queue = get_daily_blind_drill_queue(conn, DAY + timedelta(days=1))
+    next_queue = get_daily_blind_drill_queue(conn, DAY + timedelta(days=1), grade_subject=GRADE)
     assert [i.question_uid for i in next_queue] == ["q4"]
     assert _question(conn, "q4")["system_deferred_days"] == 1  # 未重复顺延
 
@@ -361,11 +369,11 @@ def test_quota_overflow_defers_single_day(conn: sqlite3.Connection) -> None:
 def test_limit_override(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q1", unlock=DAY - timedelta(days=2))
     _prepare_original(conn, "q2", unlock=DAY - timedelta(days=1))
-    queue = get_daily_blind_drill_queue(conn, DAY, limit=1)
+    queue = get_daily_blind_drill_queue(conn, DAY, limit=1, grade_subject=GRADE)
     assert [i.question_uid for i in queue] == ["q1"]
     assert _question(conn, "q2")["system_deferred_days"] == 1
     with pytest.raises(ValueError, match="配额"):
-        get_daily_blind_drill_queue(conn, DAY, limit=-1)
+        get_daily_blind_drill_queue(conn, DAY, limit=-1, grade_subject=GRADE)
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +389,7 @@ def test_dto_strips_spoilers_and_has_no_leaky_fields(conn: sqlite3.Connection) -
         "带电粒子以速度 v 垂直射入宽度为 d 的条形磁场，求轨迹半径 R。"
     )
     _prepare_original(conn, "q-spoiler", stem=spoiler_stem)
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert set(BlindDrillItemDTO.model_fields) == {
         "question_uid", "drill_question_uid", "stem_md", "verification_mode",
         "allowed_symbols", "probe_question_md", "requires_intermediate",
@@ -403,7 +411,7 @@ def test_equation_skeleton_mode_and_symbols(conn: sqlite3.Connection) -> None:
         "宽度 d，入射角 \\theta，求半径 R。"
     )
     _prepare_original(conn, "q-skel", l_score=2, stem=stem)
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.verification_mode == "equation_skeleton"
     assert item.allowed_symbols  # 非空
     for sym in ("R", "d", "q", "m", "v", "B", "theta"):
@@ -413,7 +421,7 @@ def test_equation_skeleton_mode_and_symbols(conn: sqlite3.Connection) -> None:
 
 def test_final_answer_mode_for_l1(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q-l1", l_score=1)
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.verification_mode == "final_answer"
     assert item.allowed_symbols == []
 
@@ -429,22 +437,22 @@ def test_variant_preferred_and_unexposed_criterion(conn: sqlite3.Connection) -> 
     _insert_variant(conn, "v-b", "q-orig")
     _insert_relation(conn, "q-orig", "v-a", "CLONE")
     _insert_relation(conn, "v-b", "q-orig", "ISOMORPHIC")  # 反向边亦可检索
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.drill_question_uid == "v-a"  # CLONE 优先且未曝光
     assert not item.requires_intermediate and item.probe_question_md is None
     assert "换数同构变式 v-a" in item.stem_md
     _expose_variant(conn, "q-orig", "v-a")
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.drill_question_uid == "v-b"  # 已曝光变式被跳过
     _expose_variant(conn, "q-orig", "v-b")
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.drill_question_uid == "q-orig"  # 全部曝光 → 回退原题
     assert item.requires_intermediate and item.probe_question_md == PROBE_MD
 
 
 def test_fallback_original_carries_probe(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q-solo")
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.drill_question_uid == "q-solo"
     assert item.requires_intermediate is True
     assert item.probe_question_md == PROBE_MD
@@ -457,7 +465,7 @@ def test_fallback_original_carries_probe(conn: sqlite3.Connection) -> None:
 
 def test_original_both_correct_passes(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q-pass")
-    get_daily_blind_drill_queue(conn, DAY)
+    get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
     outcome = evaluate_blind_drill_submission(conn, "q-pass", FINAL_RIGHT, INTERMEDIATE_RIGHT, DAY)
     assert isinstance(outcome, BlindDrillOutcomeDTO)
     assert outcome.passed and outcome.mastery_state == "MASTERED"
@@ -512,7 +520,7 @@ def test_variant_pass_final_only_and_replay_matches_queue(conn: sqlite3.Connecti
     _prepare_original(conn, "q-var")
     _insert_variant(conn, "v-1", "q-var", answer="x = 5")
     _insert_relation(conn, "q-var", "v-1", "CLONE")
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.drill_question_uid == "v-1"
     outcome = evaluate_blind_drill_submission(conn, "q-var", "x = 5", None, DAY)
     assert outcome.passed and outcome.mastery_state == "MASTERED"
@@ -527,7 +535,7 @@ def test_variant_wrong_final_fails_stage1(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q-var-fail")
     _insert_variant(conn, "v-1", "q-var-fail", answer="x = 5")
     _insert_relation(conn, "q-var-fail", "v-1", "ISOMORPHIC")
-    get_daily_blind_drill_queue(conn, DAY)
+    get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
     # 背原题答案无效：呈现题是变式，核验对象为变式标准答案
     outcome = evaluate_blind_drill_submission(conn, "q-var-fail", FINAL_RIGHT, None, DAY)
     assert not outcome.passed and outcome.retrain_stage == "STAGE_1_BLIND_PROBE"
@@ -550,7 +558,7 @@ def test_pass_realizes_escrow_with_decay_and_decrements_edges(conn: sqlite3.Conn
     )
     assert outcome.passed
     assert _combat(conn) == pytest.approx(settings.MODULE_ELO_INITIAL + 20.0 * 0.85)
-    state = elo_engine.get_module_elo(conn, MODULE)
+    state = elo_engine.get_module_elo(conn, GRADE, MODULE)
     assert state.combat_elo <= state.coverage_elo
     pool = _pool(conn, "q-decay-pass")
     assert pool["escrow_status"] == "REALIZED_MASTERED" and pool["escrow_combat_delta"] == 0.0
@@ -579,12 +587,13 @@ def test_full_flow_conservation_floor_plus_escrow(conn: sqlite3.Connection) -> N
         " blind_test_due_at=? WHERE question_uid=?",
         (UNLOCK_DEFAULT.isoformat(), DUE_DEFAULT.isoformat(), uid),
     )
-    assert [i.question_uid for i in get_daily_blind_drill_queue(conn, DAY)] == [uid]
+    queue = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
+    assert [i.question_uid for i in queue] == [uid]
     outcome = evaluate_blind_drill_submission(conn, uid, FINAL_RIGHT, INTERMEDIATE_RIGHT, DAY)
     assert outcome.passed
     target = settings.K_COMBAT * (1.0 - elo_engine.expected_pass(settings.MODULE_ELO_INITIAL, 2085))
     assert _combat(conn) - settings.MODULE_ELO_INITIAL == pytest.approx(target)
-    elo_engine.replay_module_elo_from_ledger(conn, MODULE)  # 账本链完整可重放
+    elo_engine.replay_module_elo_from_ledger(conn, GRADE, MODULE)  # 账本链完整可重放
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +656,7 @@ def test_decay_applies_to_overexposed_slated_only(conn: sqlite3.Connection) -> N
     _prepare_original(conn, "q-cold", exposure=0, unlock=DAY - timedelta(days=4))
     _prepare_original(conn, "q-warm", exposure=3, unlock=DAY - timedelta(days=3))
     _prepare_original(conn, "q-deferred", exposure=3, unlock=DAY - timedelta(days=2))
-    queue = get_daily_blind_drill_queue(conn, DAY)
+    queue = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
     assert [i.question_uid for i in queue] == ["q-hot", "q-cold", "q-warm"]
     assert _pool(conn, "q-hot")["decay_factor"] == pytest.approx(0.85)  # 曝光 4 > 3
     assert _pool(conn, "q-warm")["decay_factor"] == pytest.approx(0.85)
@@ -655,7 +664,7 @@ def test_decay_applies_to_overexposed_slated_only(conn: sqlite3.Connection) -> N
     assert _pool(conn, "q-deferred")["decay_factor"] == pytest.approx(1.0)  # 顺延冻结
     assert _question(conn, "q-deferred")["system_deferred_days"] == 1
     assert _combat(conn) == pytest.approx(settings.MODULE_ELO_INITIAL)  # 衰减不动基线
-    get_daily_blind_drill_queue(conn, DAY)  # 同日二次刷新
+    get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)  # 同日二次刷新
     assert _pool(conn, "q-hot")["decay_factor"] == pytest.approx(0.85)  # 不重复衰减
     events = conn.execute(
         "SELECT COUNT(*) FROM elo_mutation_ledger WHERE mutation_trigger='ESCROW_TIMEOUT_DECAY'"
@@ -718,7 +727,7 @@ def test_stalled_step_branch_fallback(conn: sqlite3.Connection) -> None:
         "UPDATE diagnostic_sessions SET matched_branch_id='alt-branch'"
         " WHERE question_uid='q-branch'"
     )
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.probe_question_md == PROBE_MD  # 回退 canonical 分支取卡壳步
     assert _submit(conn, "q-branch").passed
 
@@ -726,7 +735,7 @@ def test_stalled_step_branch_fallback(conn: sqlite3.Connection) -> None:
 def test_missing_session_defaults(conn: sqlite3.Connection) -> None:
     _insert_question(conn, "q-nosess")  # 无会话/无步骤的 SQL 构造题
     _insert_pool(conn, "q-nosess")
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.drill_question_uid == "q-nosess"
     assert item.requires_intermediate is True and item.probe_question_md is None
     outcome = evaluate_blind_drill_submission(conn, "q-nosess", FINAL_WRONG, None, DAY)
@@ -801,7 +810,7 @@ def test_variant_latex_final_answer_passes(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q-latex-var")
     _insert_variant(conn, "v-latex", "q-latex-var", answer=LATEX_FINAL_STD)
     _insert_relation(conn, "q-latex-var", "v-latex", "CLONE")
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.drill_question_uid == "v-latex"
     outcome = evaluate_blind_drill_submission(conn, "q-latex-var", "mv^2/2 = qU", None, DAY)
     assert outcome.passed and outcome.mastery_state == "MASTERED"
@@ -832,7 +841,7 @@ def test_variant_allowed_symbols_extracted_from_drill_not_original(
     )
     _insert_relation(conn, "q-sym-var", "v-sym", "ISOMORPHIC")
 
-    item = get_daily_blind_drill_queue(conn, DAY)[0]
+    item = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)[0]
     assert item.drill_question_uid == "v-sym"
     assert "k" in item.allowed_symbols
     assert "z0" not in item.allowed_symbols
@@ -840,3 +849,75 @@ def test_variant_allowed_symbols_extracted_from_drill_not_original(
     fail_out = evaluate_blind_drill_submission(conn, "q-sym-var", "k = 999", None, DAY)
     assert fail_out.passed is False
     assert fail_out.retrain_session_id is not None
+
+
+# ---------------------------------------------------------------------------
+# P10-D：学段独立配额（用户裁决④）+ 衰减保持全局
+# ---------------------------------------------------------------------------
+
+
+def test_grade_quota_isolation(conn: sqlite3.Connection) -> None:
+    """两学段各 4 道到期题 → 各自 ≤cap、各自锁定幂等、各自顺延计数互不影响。"""
+    for i in range(4):
+        _prepare_original(conn, f"qa{i + 1}", unlock=DAY - timedelta(days=4 - i))
+        _prepare_original(
+            conn, f"qb{i + 1}", grade=OTHER_GRADE, unlock=DAY - timedelta(days=4 - i)
+        )
+
+    queue_a = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
+    assert [i.question_uid for i in queue_a] == ["qa1", "qa2", "qa3"]  # 本学段上限 3
+    queue_b = get_daily_blind_drill_queue(conn, DAY, grade_subject=OTHER_GRADE)
+    assert [i.question_uid for i in queue_b] == ["qb1", "qb2", "qb3"]
+    # 各自锁定与曝光（互不串用本学段配额）
+    for uid in ("qa1", "qa2", "qa3"):
+        assert _question(conn, uid)["slated_drill_date"] == DAY.isoformat()
+        assert _question(conn, uid)["slated_exposure_count"] == 1
+    for uid in ("qb1", "qb2", "qb3"):
+        assert _question(conn, uid)["slated_drill_date"] == DAY.isoformat()
+        assert _question(conn, uid)["slated_exposure_count"] == 1
+    # 各自溢出顺延单日 + 独立 system_deferred_days；重叠学段刷新不重复顺延
+    for uid in ("qa4", "qb4"):
+        assert _question(conn, uid)["slated_drill_date"] is None
+        assert _question(conn, uid)["system_deferred_days"] == 1
+        assert _question(conn, uid)["blind_test_unlock_at"] == DAY.isoformat()
+
+    # 同日重复刷新：本学段幂等（不重复递增曝光/顺延），且不拉入异学段题
+    assert get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE) == queue_a
+    assert get_daily_blind_drill_queue(conn, DAY, grade_subject=OTHER_GRADE) == queue_b
+    assert _question(conn, "qa1")["slated_exposure_count"] == 1
+    assert _question(conn, "qa4")["system_deferred_days"] == 1
+    assert _question(conn, "qb4")["system_deferred_days"] == 1
+    # 异学段互不可见：A 阵营题不出现在 B 题单，反之亦然
+    assert {i.question_uid for i in queue_a}.isdisjoint({i.question_uid for i in queue_b})
+
+
+def test_decay_stays_global_across_grades(conn: sqlite3.Connection) -> None:
+    """衰减全局：任一学段队列调用即对两学段逾期曝光题生效，同日不重复衰减。"""
+    _prepare_original(conn, "q-dec-a", exposure=3, unlock=DAY - timedelta(days=1))
+    _prepare_original(
+        conn, "q-dec-b", grade=OTHER_GRADE, exposure=3, unlock=DAY - timedelta(days=1)
+    )
+    # 构造 B 学段当日已排入题单（等价于其队列早前已锁定），其曝光已达 4 > 阈值 3
+    conn.execute(
+        "UPDATE questions SET slated_drill_date = ?, slated_exposure_count = 4"
+        " WHERE question_uid = 'q-dec-b'",
+        (DAY.isoformat(),),
+    )
+
+    # 仅调用 A 学段队列：衰减跨学段一次扫描 → A/B 两学段均衰减
+    queue = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
+    assert [i.question_uid for i in queue] == ["q-dec-a"]
+    assert _pool(conn, "q-dec-a")["decay_factor"] == pytest.approx(0.85)
+    assert _pool(conn, "q-dec-b")["decay_factor"] == pytest.approx(0.85)
+    # B 学段队列（当日已锁定 → 幂等）+ A 同日二次刷新：不重复衰减
+    assert [
+        i.question_uid
+        for i in get_daily_blind_drill_queue(conn, DAY, grade_subject=OTHER_GRADE)
+    ] == ["q-dec-b"]
+    get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
+    assert _pool(conn, "q-dec-a")["decay_factor"] == pytest.approx(0.85)
+    assert _pool(conn, "q-dec-b")["decay_factor"] == pytest.approx(0.85)
+    events = conn.execute(
+        "SELECT COUNT(*) FROM elo_mutation_ledger WHERE mutation_trigger='ESCROW_TIMEOUT_DECAY'"
+    ).fetchone()[0]
+    assert events == 2  # 两学段各一题，各仅一条衰减事件
