@@ -39,30 +39,40 @@ import math
 import sqlite3
 import uuid
 from collections import Counter
-from collections.abc import Coroutine, Iterable, Iterator
+from collections.abc import Coroutine, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import combinations
-from typing import Any, TypeVar, cast
+from pathlib import Path
+from typing import Any, Literal, TypeVar, cast
 
 from pydantic import BaseModel
 
 from backend.config import settings
+from backend.db.schema import get_db_connection
 from backend.observability import log_event
 from backend.services import llm_gateway
 
 __all__ = [
+    "ActiveNodeRecord",
     "CanonicalNodeResolver",
     "GraphMetricsDTO",
+    "L3ResolutionRequest",
     "NodeJudgeResult",
+    "PlannedL3Resolution",
     "all_node_states",
+    "apply_planned_l3_node_resolutions",
     "compute_graph_metrics",
     "decrement_co_error_edges_on_mastery",
+    "load_active_nodes_snapshot",
     "match_or_create_l3_node",
     "node_state",
+    "plan_l3_node_resolutions",
     "record_co_error_edges",
     "revert_compaction_batch",
     "run_scoped_compaction",
+    "run_scoped_compaction_unlocked",
 ]
 
 logger = logging.getLogger(__name__)
@@ -243,8 +253,75 @@ def _active_nodes(
     ).fetchall()
 
 
-def _judge_payload(
-    task: str, l1: str, l2: str, candidate_names: list[str], existing: list[sqlite3.Row]
+@dataclass
+class ActiveNodeRecord:
+    """无锁规划阶段的轻量活跃节点内存快照。"""
+
+    node_id: str
+    grade_subject: str
+    l1_module: str
+    l2_entity: str
+    l3_operator: str
+    aliases: list[str]
+
+
+@dataclass(frozen=True)
+class L3ResolutionRequest:
+    """无锁 L3 节点对齐请求项。"""
+
+    grade_subject: str
+    l1_module: str
+    l2_entity: str
+    candidate_l3: str
+    candidate_aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlannedL3Resolution:
+    """无锁 L3 节点对齐规划结果（写库事务内应用）。"""
+
+    grade_subject: str
+    l1_module: str
+    l2_entity: str
+    candidate_l3: str
+    candidate_aliases: tuple[str, ...]
+    action: Literal["reuse", "create"]
+    target_node_id: str
+
+
+def _row_to_active_record(row: sqlite3.Row) -> ActiveNodeRecord:
+    return ActiveNodeRecord(
+        node_id=str(row["node_id"]),
+        grade_subject=str(row["grade_subject"]),
+        l1_module=str(row["l1_module"]),
+        l2_entity=str(row["l2_entity"]),
+        l3_operator=str(row["l3_operator"]),
+        aliases=list(json.loads(row["aliases_json"])),
+    )
+
+
+def _select_judge_candidates(
+    nodes: Sequence[ActiveNodeRecord], candidate_names: Sequence[str]
+) -> list[ActiveNodeRecord]:
+    if len(nodes) > settings.L3_LOCAL_RECALL_TRIGGER_COUNT:
+        cand_grams = _char_ngrams(candidate_names)
+        ranked = sorted(
+            nodes,
+            key=lambda rec: (
+                -_jaccard(cand_grams, _char_ngrams([rec.l3_operator, *rec.aliases])),
+                rec.node_id,
+            ),
+        )
+        return ranked[: settings.L3_TOP_K_CANDIDATES]
+    return list(nodes)
+
+
+def _judge_payload_from_records(
+    task: str,
+    l1: str,
+    l2: str,
+    candidate_names: list[str],
+    existing: Sequence[ActiveNodeRecord],
 ) -> dict[str, Any]:
     return {
         "task": task,
@@ -252,9 +329,18 @@ def _judge_payload(
         "l2_entity": l2,
         "candidate": {"names": candidate_names},
         "existing_nodes": [
-            {"node_id": row["node_id"], "names": _surface_names(row)} for row in existing
+            {"node_id": rec.node_id, "names": [rec.l3_operator, *rec.aliases]}
+            for rec in existing
         ],
     }
+
+
+def _judge_payload(
+    task: str, l1: str, l2: str, candidate_names: list[str], existing: list[sqlite3.Row]
+) -> dict[str, Any]:
+    return _judge_payload_from_records(
+        task, l1, l2, candidate_names, [_row_to_active_record(row) for row in existing]
+    )
 
 
 async def _judge_nodes(payload: dict[str, Any]) -> NodeJudgeResult:
@@ -292,8 +378,275 @@ def _pessimistic(current: str, incoming: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 同父 L2 邻域召回与节点复用 / 新建
+# 同父 L2 邻域召回与节点复用 / 新建（含无锁规划/落库拆分）
 # ---------------------------------------------------------------------------
+
+
+def _reuse_existing_l3_node(
+    conn: sqlite3.Connection,
+    grade_subject: str,
+    l1: str,
+    l2: str,
+    match_id: str,
+    candidate_l3: str,
+    candidate_aliases: Sequence[str],
+) -> bool:
+    """同作用域活跃主节点复核与别名扩充；非活跃或跨域则返回 False。"""
+    row = conn.execute(
+        "SELECT * FROM knowledge_nodes WHERE node_id = ?", (match_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    if not (
+        row["redirect_to_id"] is None
+        and row["grade_subject"] == grade_subject
+        and row["l1_module"] == l1
+        and row["l2_entity"] == l2
+    ):
+        return False
+    aliases = _merge_aliases(
+        json.loads(row["aliases_json"]),
+        str(row["l3_operator"]),
+        [candidate_l3, *candidate_aliases],
+    )
+    conn.execute(
+        "UPDATE knowledge_nodes SET aliases_json = ? WHERE node_id = ?",
+        (json.dumps(aliases, ensure_ascii=False), match_id),
+    )
+    log_event(
+        logger,
+        "graph.node_reused",
+        grade=grade_subject,
+        l1=l1,
+        l2=l2,
+        l3=candidate_l3,
+        node_id=match_id,
+    )
+    return True
+
+
+def _insert_new_l3_node(
+    conn: sqlite3.Connection,
+    grade_subject: str,
+    l1: str,
+    l2: str,
+    candidate_l3: str,
+    candidate_aliases: Sequence[str],
+    *,
+    node_id: str | None = None,
+) -> tuple[str, bool]:
+    """新建 L3 节点并返回 (node_id, 是否达到自动 Compaction 水位线阈值)。"""
+    new_id = node_id or str(uuid.uuid4())
+    aliases = _merge_aliases([], candidate_l3, candidate_aliases)
+    conn.execute(
+        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
+        " l3_operator, aliases_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (new_id, grade_subject, l1, l2, candidate_l3, json.dumps(aliases, ensure_ascii=False)),
+    )
+    log_event(
+        logger,
+        "graph.node_created",
+        grade=grade_subject,
+        l1=l1,
+        l2=l2,
+        l3=candidate_l3,
+        node_id=new_id,
+    )
+    needs_compaction = (
+        _new_nodes_since_last_compaction(conn, grade_subject, l1, l2)
+        >= settings.COMPACTION_BATCH_THRESHOLD
+    )
+    return new_id, needs_compaction
+
+
+def load_active_nodes_snapshot(
+    conn: sqlite3.Connection, scopes: Iterable[tuple[str, str, str]]
+) -> dict[tuple[str, str, str], list[ActiveNodeRecord]]:
+    """只读加载各 (grade_subject, l1, l2) 作用域活跃节点快照（供无锁规划使用）。"""
+    snapshot: dict[tuple[str, str, str], list[ActiveNodeRecord]] = {}
+    for grade_subject, l1, l2 in dict.fromkeys(scopes):
+        snapshot[(grade_subject, l1, l2)] = [
+            _row_to_active_record(row) for row in _active_nodes(conn, grade_subject, l1, l2)
+        ]
+    return snapshot
+
+
+async def plan_l3_node_resolutions(
+    requests: Sequence[L3ResolutionRequest],
+    snapshot: dict[tuple[str, str, str], list[ActiveNodeRecord]],
+) -> list[PlannedL3Resolution]:
+    """纯内存无锁 L3 节点对齐规划：召回 + 别名传播 + AI 裁判，绝不持 DB 连接。"""
+    working: dict[tuple[str, str, str], list[ActiveNodeRecord]] = {
+        scope: [
+            ActiveNodeRecord(
+                node_id=rec.node_id,
+                grade_subject=rec.grade_subject,
+                l1_module=rec.l1_module,
+                l2_entity=rec.l2_entity,
+                l3_operator=rec.l3_operator,
+                aliases=list(rec.aliases),
+            )
+            for rec in recs
+        ]
+        for scope, recs in snapshot.items()
+    }
+    plans: list[PlannedL3Resolution] = []
+    for req in requests:
+        scope = (req.grade_subject, req.l1_module, req.l2_entity)
+        scope_nodes = working.setdefault(scope, [])
+        cand_names = [req.candidate_l3, *req.candidate_aliases]
+        match_id: str | None = None
+        if scope_nodes:
+            sent = _select_judge_candidates(scope_nodes, cand_names)
+            payload = _judge_payload_from_records(
+                "match_or_create", req.l1_module, req.l2_entity, cand_names, sent
+            )
+            verdict = await _judge_nodes(payload)
+            sent_ids = {rec.node_id for rec in sent}
+            if verdict.match_node_id is not None and verdict.match_node_id in sent_ids:
+                match_id = verdict.match_node_id
+
+        if match_id is not None:
+            matched_rec = next(rec for rec in scope_nodes if rec.node_id == match_id)
+            matched_rec.aliases = _merge_aliases(
+                matched_rec.aliases, matched_rec.l3_operator, cand_names
+            )
+            plans.append(
+                PlannedL3Resolution(
+                    grade_subject=req.grade_subject,
+                    l1_module=req.l1_module,
+                    l2_entity=req.l2_entity,
+                    candidate_l3=req.candidate_l3,
+                    candidate_aliases=req.candidate_aliases,
+                    action="reuse",
+                    target_node_id=match_id,
+                )
+            )
+        else:
+            planned_id = str(uuid.uuid4())
+            scope_nodes.append(
+                ActiveNodeRecord(
+                    node_id=planned_id,
+                    grade_subject=req.grade_subject,
+                    l1_module=req.l1_module,
+                    l2_entity=req.l2_entity,
+                    l3_operator=req.candidate_l3,
+                    aliases=_merge_aliases([], req.candidate_l3, req.candidate_aliases),
+                )
+            )
+            plans.append(
+                PlannedL3Resolution(
+                    grade_subject=req.grade_subject,
+                    l1_module=req.l1_module,
+                    l2_entity=req.l2_entity,
+                    candidate_l3=req.candidate_l3,
+                    candidate_aliases=req.candidate_aliases,
+                    action="create",
+                    target_node_id=planned_id,
+                )
+            )
+    return plans
+
+
+def _find_concurrent_surface_match(
+    conn: sqlite3.Connection,
+    grade_subject: str,
+    l1: str,
+    l2: str,
+    candidate_names: Sequence[str],
+    snapshot_surfaces: dict[str, set[str]],
+    created_in_tx: set[str],
+) -> str | None:
+    """写事务内复核并发写入：若无锁阶段后出现新活跃节点或新别名精确命中则复用。"""
+    cand_set = {name for name in candidate_names if name}
+    if not cand_set:
+        return None
+    for row in _active_nodes(conn, grade_subject, l1, l2):
+        nid = str(row["node_id"])
+        if nid in created_in_tx:
+            continue
+        surfaces = set(_surface_names(row))
+        if nid not in snapshot_surfaces:
+            if cand_set & surfaces:
+                return nid
+        elif cand_set & (surfaces - snapshot_surfaces[nid]):
+            return nid
+    return None
+
+
+def apply_planned_l3_node_resolutions(
+    conn: sqlite3.Connection,
+    plans: Sequence[PlannedL3Resolution],
+    snapshot: dict[tuple[str, str, str], list[ActiveNodeRecord]],
+) -> tuple[list[tuple[str, bool]], list[tuple[str, str, str]]]:
+    """在单事务内原子落地规划好的 L3 节点复用/新建与水位线检查（不 commit）。"""
+    snapshot_surfaces_by_scope: dict[tuple[str, str, str], dict[str, set[str]]] = {
+        scope: {rec.node_id: {rec.l3_operator, *rec.aliases} for rec in recs}
+        for scope, recs in snapshot.items()
+    }
+    planned_id_map: dict[str, str] = {}
+    created_in_tx: set[str] = set()
+    results: list[tuple[str, bool]] = []
+    scopes_to_compact: list[tuple[str, str, str]] = []
+    seen_compact_scopes: set[tuple[str, str, str]] = set()
+
+    for plan in plans:
+        scope = (plan.grade_subject, plan.l1_module, plan.l2_entity)
+        if plan.action == "reuse":
+            resolved_target = planned_id_map.get(plan.target_node_id, plan.target_node_id)
+            if _reuse_existing_l3_node(
+                conn,
+                plan.grade_subject,
+                plan.l1_module,
+                plan.l2_entity,
+                resolved_target,
+                plan.candidate_l3,
+                plan.candidate_aliases,
+            ):
+                results.append((resolved_target, True))
+                continue
+
+        concurrent_id = _find_concurrent_surface_match(
+            conn,
+            plan.grade_subject,
+            plan.l1_module,
+            plan.l2_entity,
+            [plan.candidate_l3, *plan.candidate_aliases],
+            snapshot_surfaces_by_scope.get(scope, {}),
+            created_in_tx,
+        )
+        if concurrent_id is not None and _reuse_existing_l3_node(
+            conn,
+            plan.grade_subject,
+            plan.l1_module,
+            plan.l2_entity,
+            concurrent_id,
+            plan.candidate_l3,
+            plan.candidate_aliases,
+        ):
+            if plan.action == "create":
+                planned_id_map[plan.target_node_id] = concurrent_id
+            results.append((concurrent_id, True))
+            continue
+
+        new_id, needs_compaction = _insert_new_l3_node(
+            conn,
+            plan.grade_subject,
+            plan.l1_module,
+            plan.l2_entity,
+            plan.candidate_l3,
+            plan.candidate_aliases,
+            node_id=plan.target_node_id if plan.action == "create" else None,
+        )
+        if plan.action == "create":
+            planned_id_map[plan.target_node_id] = new_id
+        created_in_tx.add(new_id)
+        if needs_compaction and scope not in seen_compact_scopes:
+            seen_compact_scopes.add(scope)
+            scopes_to_compact.append(scope)
+        results.append((new_id, False))
+
+    return results, scopes_to_compact
 
 
 async def match_or_create_l3_node(
@@ -312,75 +665,26 @@ async def match_or_create_l3_node(
     自动触发 run_scoped_compaction。P10-C：召回/复用/新建均限同学段，
     新建节点 INSERT 落 grade_subject。
     """
-    nodes = _active_nodes(conn, grade_subject, l1, l2)
+    records = [_row_to_active_record(row) for row in _active_nodes(conn, grade_subject, l1, l2)]
     match_id: str | None = None
-    if nodes:
-        if len(nodes) > settings.L3_LOCAL_RECALL_TRIGGER_COUNT:
-            cand_grams = _char_ngrams([candidate_l3, *candidate_aliases])
-            ranked = sorted(
-                nodes,
-                key=lambda row: (-_jaccard(cand_grams, _row_grams(row)), str(row["node_id"])),
-            )
-            sent = ranked[: settings.L3_TOP_K_CANDIDATES]
-        else:
-            sent = nodes
-        payload = _judge_payload(
-            "match_or_create", l1, l2, [candidate_l3, *candidate_aliases], sent
-        )
+    if records:
+        cand_names = [candidate_l3, *candidate_aliases]
+        sent = _select_judge_candidates(records, cand_names)
+        payload = _judge_payload_from_records("match_or_create", l1, l2, cand_names, sent)
         verdict = await _judge_nodes(payload)
-        sent_ids = {str(row["node_id"]) for row in sent}
+        sent_ids = {rec.node_id for rec in sent}
         if verdict.match_node_id is not None and verdict.match_node_id in sent_ids:
             match_id = verdict.match_node_id
 
-    if match_id is not None:
-        row = _node_row(conn, match_id)
-        # 硬拒绝：裁判命中必须仍是同作用域（含学段，P10-C）活跃主节点，否则降级为新建。
-        if (
-            row["redirect_to_id"] is None
-            and row["grade_subject"] == grade_subject
-            and row["l1_module"] == l1
-            and row["l2_entity"] == l2
-        ):
-            aliases = _merge_aliases(
-                json.loads(row["aliases_json"]),
-                str(row["l3_operator"]),
-                [candidate_l3, *candidate_aliases],
-            )
-            conn.execute(
-                "UPDATE knowledge_nodes SET aliases_json = ? WHERE node_id = ?",
-                (json.dumps(aliases, ensure_ascii=False), match_id),
-            )
-            log_event(
-                logger,
-                "graph.node_reused",
-                grade=grade_subject,
-                l1=l1,
-                l2=l2,
-                l3=candidate_l3,
-                node_id=match_id,
-            )
-            return match_id, True
-
-    new_id = str(uuid.uuid4())
-    aliases = _merge_aliases([], candidate_l3, candidate_aliases)
-    conn.execute(
-        "INSERT INTO knowledge_nodes (node_id, grade_subject, l1_module, l2_entity,"
-        " l3_operator, aliases_json) VALUES (?, ?, ?, ?, ?, ?)",
-        (new_id, grade_subject, l1, l2, candidate_l3, json.dumps(aliases, ensure_ascii=False)),
-    )
-    log_event(
-        logger,
-        "graph.node_created",
-        grade=grade_subject,
-        l1=l1,
-        l2=l2,
-        l3=candidate_l3,
-        node_id=new_id,
-    )
-    if (
-        _new_nodes_since_last_compaction(conn, grade_subject, l1, l2)
-        >= settings.COMPACTION_BATCH_THRESHOLD
+    if match_id is not None and _reuse_existing_l3_node(
+        conn, grade_subject, l1, l2, match_id, candidate_l3, candidate_aliases
     ):
+        return match_id, True
+
+    new_id, needs_compaction = _insert_new_l3_node(
+        conn, grade_subject, l1, l2, candidate_l3, candidate_aliases
+    )
+    if needs_compaction:
         if run_scoped_compaction is _ORIG_RUN_SCOPED_COMPACTION:
             await _run_scoped_compaction_async(conn, grade_subject, l1, l2)
         else:
@@ -560,6 +864,89 @@ async def _run_scoped_compaction_async(
     return batch_id
 
 
+async def run_scoped_compaction_unlocked(
+    db_path: Path | None, grade_subject: str, l1: str, l2: str
+) -> str | None:
+    """无锁 Compaction：短只读取快照 → 释放连接 await _judge_nodes → 短写事务复核合并。"""
+    with get_db_connection(db_path) as conn:
+        nodes = _active_nodes(conn, grade_subject, l1, l2)
+        raw_count = _raw_nodes_since_last_compaction(conn, grade_subject, l1, l2)
+        db_key = _db_cache_key(conn)
+        node_records = {
+            str(row["node_id"]): _row_to_active_record(row) for row in nodes
+        }
+        last_node_id = str(nodes[-1]["node_id"]) if nodes else None
+        pairs = _build_compaction_pairs(grade_subject, nodes) if len(nodes) >= 2 else []
+
+    wm_key = (db_key, grade_subject, l1, l2)
+    if len(node_records) < 2 or not pairs:
+        if last_node_id is not None:
+            _NO_MERGE_SCAN_WATERMARKS[wm_key] = (last_node_id, raw_count)
+        return None
+
+    redirected_in_mem: set[str] = set()
+    confirmed_merges: list[tuple[str, str, str]] = []
+    for _neg_sim, to_id, from_id in pairs:
+        if to_id in redirected_in_mem or from_id in redirected_in_mem:
+            continue
+        to_rec = node_records[to_id]
+        from_rec = node_records[from_id]
+        payload = _judge_payload_from_records(
+            "scoped_compaction",
+            l1,
+            l2,
+            [from_rec.l3_operator, *from_rec.aliases],
+            [to_rec],
+        )
+        verdict = await _judge_nodes(payload)
+        if verdict.match_node_id != to_id:
+            continue
+        confirmed_merges.append((from_id, to_id, verdict.evidence))
+        redirected_in_mem.add(from_id)
+        to_rec.aliases = _merge_aliases(
+            to_rec.aliases,
+            to_rec.l3_operator,
+            [from_rec.l3_operator, *from_rec.aliases],
+        )
+
+    if not confirmed_merges:
+        if last_node_id is not None:
+            _NO_MERGE_SCAN_WATERMARKS[wm_key] = (last_node_id, raw_count)
+        return None
+
+    batch_id: str | None = None
+    with get_db_connection(db_path) as conn:
+        for from_id, to_id, evidence in confirmed_merges:
+            from_row = conn.execute(
+                "SELECT * FROM knowledge_nodes WHERE node_id = ?", (from_id,)
+            ).fetchone()
+            to_row = conn.execute(
+                "SELECT * FROM knowledge_nodes WHERE node_id = ?", (to_id,)
+            ).fetchone()
+            if (
+                from_row is None
+                or to_row is None
+                or from_row["redirect_to_id"] is not None
+                or to_row["redirect_to_id"] is not None
+                or from_row["grade_subject"] != grade_subject
+                or to_row["grade_subject"] != grade_subject
+                or from_row["l1_module"] != l1
+                or to_row["l1_module"] != l1
+                or from_row["l2_entity"] != l2
+                or to_row["l2_entity"] != l2
+            ):
+                continue
+            if batch_id is None:
+                batch_id = str(uuid.uuid4())
+            _merge_pair(conn, grade_subject, l1, l2, from_id, to_id, batch_id, evidence)
+
+        if batch_id is not None:
+            _NO_MERGE_SCAN_WATERMARKS.pop(wm_key, None)
+        elif last_node_id is not None:
+            _NO_MERGE_SCAN_WATERMARKS[wm_key] = (last_node_id, raw_count)
+    return batch_id
+
+
 def _is_redirected(conn: sqlite3.Connection, node_id: str) -> bool:
     return _node_row(conn, node_id)["redirect_to_id"] is not None
 
@@ -729,17 +1116,85 @@ def _rewrite_edges_after_merge(
 # ---------------------------------------------------------------------------
 
 
+def _canonical_edge_key(u: str, v: str) -> tuple[str, str]:
+    return (u, v) if u <= v else (v, u)
+
+
+def _assert_no_newer_dependent_batches(
+    conn: sqlite3.Connection, batch_id: str, rows: Sequence[sqlite3.Row]
+) -> None:
+    """LIFO 依赖守卫：若存在触及本批次节点或快照边端点的较新未回滚合并，拒绝回滚。"""
+    max_batch_merge_id = max(int(row["merge_id"]) for row in rows)
+    batch_touched_nodes: set[str] = set()
+    for row in rows:
+        batch_touched_nodes.add(str(row["from_node_id"]))
+        batch_touched_nodes.add(str(row["to_node_id"]))
+        for child in json.loads(row["affected_child_node_ids_json"]):
+            batch_touched_nodes.add(str(child))
+        for edge in json.loads(row["previous_co_errors_snapshot_json"]):
+            batch_touched_nodes.add(str(edge["node_u_id"]))
+            batch_touched_nodes.add(str(edge["node_v_id"]))
+
+    newer_rows = conn.execute(
+        "SELECT batch_id, from_node_id, to_node_id, affected_child_node_ids_json"
+        " FROM compaction_audit_ledger"
+        " WHERE is_reverted = 0 AND batch_id != ? AND merge_id > ?"
+        " ORDER BY merge_id ASC",
+        (batch_id, max_batch_merge_id),
+    ).fetchall()
+    for newer in newer_rows:
+        newer_nodes = {
+            str(newer["from_node_id"]),
+            str(newer["to_node_id"]),
+            *(str(c) for c in json.loads(newer["affected_child_node_ids_json"])),
+        }
+        if batch_touched_nodes & newer_nodes:
+            raise ValueError(
+                f"无法回滚批次 {batch_id!r}：存在依赖相关节点的较新未回滚批次"
+                f" {newer['batch_id']!r}，请先回滚较新依赖批次"
+            )
+
+
+def _insert_or_replace_co_error(
+    conn: sqlite3.Connection, grade: str, edge: dict[str, Any]
+) -> None:
+    # P10-C：快照含 grade_subject 列自然逐字段恢复；P10-C 前的旧快照无此键时
+    # 回退批次行学段（P10-A 已回填），绝不丢失分区归属。
+    edge_grade = str(edge.get("grade_subject", grade))
+    conn.execute(
+        "INSERT OR REPLACE INTO concept_co_errors (node_u_id, node_v_id, grade_subject,"
+        " l1_module_u, l1_module_v, active_error_count, total_historical_count,"
+        " source_question_uids_json, last_error_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            edge["node_u_id"],
+            edge["node_v_id"],
+            edge_grade,
+            edge["l1_module_u"],
+            edge["l1_module_v"],
+            edge["active_error_count"],
+            edge["total_historical_count"],
+            edge["source_question_uids_json"],
+            edge["last_error_at"],
+        ),
+    )
+
+
 def revert_compaction_batch(conn: sqlite3.Connection, batch_id: str) -> None:
     """按 merge_id 逆序精确恢复批次内全部合并；已回滚批次幂等无操作。
 
     恢复内容：from.redirect=NULL、affected 子节点指回 from、to.aliases 还原、
-    标红边按快照逐字段还原（删新增 / 恢复计数与 uids）。Elo 账本完全不动。
-    未知 batch_id 亦幂等无操作。语义为标准 undo：假定批次后无冲突性后续变更。
+    标红边增量差值还原（保留合并后新增边与后增量计数/时间戳）。Elo 账本完全不动。
+    未知/已回滚 batch_id 幂等无操作；存在依赖本批次节点/边端点的较新未回滚批次时抛 ValueError。
     """
     rows = conn.execute(
         "SELECT * FROM compaction_audit_ledger WHERE batch_id = ? ORDER BY merge_id DESC",
         (batch_id,),
     ).fetchall()
+    if not rows or all(row["is_reverted"] for row in rows):
+        log_event(logger, "graph.reverted", batch_id=batch_id, merges=0)
+        return
+    _assert_no_newer_dependent_batches(conn, batch_id, rows)
     reverted = 0
     for row in rows:
         if row["is_reverted"]:
@@ -757,36 +1212,94 @@ def _revert_single_merge(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     _assert_same_scope(conn, grade, [from_id, to_id], l1, l2)
     children = [str(c) for c in json.loads(row["affected_child_node_ids_json"])]
 
-    # 标红边：删除当前受影响边（含合并新增），按快照逐字段原样恢复
-    affected_endpoints = {from_id, to_id, *children}
-    ids = sorted(affected_endpoints)
-    placeholders = ", ".join("?" for _ in ids)
+    # 标红边增量恢复：仅扣除 src_rows 对 to_id 外部边的贡献，保留合并后新边与后增量
+    src_endpoints = {from_id, *children}
+    snapshot_edges: list[dict[str, Any]] = json.loads(row["previous_co_errors_snapshot_json"])
+    src_rows: list[dict[str, Any]] = []
+    to_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for edge in snapshot_edges:
+        u, v = str(edge["node_u_id"]), str(edge["node_v_id"])
+        if u in src_endpoints or v in src_endpoints:
+            src_rows.append(edge)
+        else:
+            to_rows[_canonical_edge_key(u, v)] = edge
+
+    def _map_to(node_id: str) -> str:
+        return to_id if node_id in src_endpoints else node_id
+
+    grouped_external: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for edge in src_rows:
+        mu, mv = _canonical_edge_key(
+            _map_to(str(edge["node_u_id"])), _map_to(str(edge["node_v_id"]))
+        )
+        if mu == mv:
+            continue  # 合并时被消除的自环内边，稍后直接原样恢复
+        grouped_external.setdefault((mu, mv), []).append(edge)
+
+    for (mu, mv), src_group in grouped_external.items():
+        current = conn.execute(
+            "SELECT * FROM concept_co_errors WHERE node_u_id = ? AND node_v_id = ?",
+            (mu, mv),
+        ).fetchone()
+        if current is None:
+            continue
+        contrib_active = sum(int(e["active_error_count"]) for e in src_group)
+        contrib_hist = sum(int(e["total_historical_count"]) for e in src_group)
+        contrib_uids: set[str] = set()
+        for e in src_group:
+            contrib_uids.update(str(u) for u in json.loads(e["source_question_uids_json"]))
+
+        pre_to = to_rows.get((mu, mv))
+        pre_to_uids = (
+            {str(u) for u in json.loads(pre_to["source_question_uids_json"])}
+            if pre_to is not None
+            else set()
+        )
+        uids_to_remove = contrib_uids - pre_to_uids
+        current_uids = [str(u) for u in json.loads(current["source_question_uids_json"])]
+        remaining_uids = [u for u in current_uids if u not in uids_to_remove]
+        remaining_active = max(0, int(current["active_error_count"]) - contrib_active)
+        remaining_hist = max(0, int(current["total_historical_count"]) - contrib_hist)
+
+        if remaining_hist <= 0 and not remaining_uids:
+            conn.execute(
+                "DELETE FROM concept_co_errors WHERE node_u_id = ? AND node_v_id = ?",
+                (mu, mv),
+            )
+            continue
+
+        pre_merged_max_ts = max(
+            str(r["last_error_at"]) for r in [*src_group, *([pre_to] if pre_to is not None else [])]
+        )
+        if pre_to is not None and str(current["last_error_at"]) == pre_merged_max_ts:
+            restored_ts = str(pre_to["last_error_at"])
+        else:
+            restored_ts = str(current["last_error_at"])
+
+        conn.execute(
+            "UPDATE concept_co_errors SET active_error_count = ?,"
+            " total_historical_count = ?, source_question_uids_json = ?,"
+            " last_error_at = ? WHERE node_u_id = ? AND node_v_id = ?",
+            (
+                remaining_active,
+                remaining_hist,
+                json.dumps(remaining_uids, ensure_ascii=False),
+                restored_ts,
+                mu,
+                mv,
+            ),
+        )
+
+    src_ids = sorted(src_endpoints)
+    placeholders = ", ".join("?" for _ in src_ids)
     conn.execute(
         f"DELETE FROM concept_co_errors WHERE node_u_id IN ({placeholders})"
         f" OR node_v_id IN ({placeholders})",
-        [*ids, *ids],
+        [*src_ids, *src_ids],
     )
-    for edge in json.loads(row["previous_co_errors_snapshot_json"]):
-        # P10-C：快照含 grade_subject 列自然逐字段恢复；P10-C 前的旧快照无此键时
-        # 回退批次行学段（P10-A 已回填），绝不丢失分区归属。
-        edge_grade = str(edge.get("grade_subject", grade))
-        conn.execute(
-            "INSERT INTO concept_co_errors (node_u_id, node_v_id, grade_subject,"
-            " l1_module_u, l1_module_v, active_error_count, total_historical_count,"
-            " source_question_uids_json, last_error_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                edge["node_u_id"],
-                edge["node_v_id"],
-                edge_grade,
-                edge["l1_module_u"],
-                edge["l1_module_v"],
-                edge["active_error_count"],
-                edge["total_historical_count"],
-                edge["source_question_uids_json"],
-                edge["last_error_at"],
-            ),
-        )
+    for edge in src_rows:
+        _insert_or_replace_co_error(conn, grade, edge)
+
     # 主节点 aliases 精确还原
     conn.execute(
         "UPDATE knowledge_nodes SET aliases_json = ? WHERE node_id = ?",

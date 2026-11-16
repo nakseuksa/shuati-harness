@@ -1586,3 +1586,178 @@ async def test_reimport_new_draft_persists_alt_branch_and_allocates_increment(
             (uid,),
         )
     ] == [0, 0, 0, 1]
+
+
+# ---------------------------------------------------------------------------
+# P12-B：node_judge 与 Compaction 期间零 SQLite 写锁（新题 / 重入库 / Compaction）
+# ---------------------------------------------------------------------------
+
+
+def _assert_external_write_succeeds(db_path: Path, probe_uid: str) -> None:
+    """在外部独立连接上执行 BEGIN IMMEDIATE 写事务，验证数据库写锁未被占用。"""
+    other = sqlite3.connect(db_path, timeout=0.2)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute(
+            "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
+            " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
+            " base_elo, tier, primary_l1_module, mastery_state)"
+            " VALUES (?, 'USER_CANONICAL', '高中物理-高二', '并发探针',"
+            " ?, '1', 1, 1, 1, 1, 1200, 'L1_基础夯实', '力学', 'ACTIVE')",
+            (probe_uid, f"hash-{probe_uid}"),
+        )
+        other.commit()
+    finally:
+        other.close()
+
+
+async def test_ingest_new_question_releases_db_lock_during_node_judge(
+    tmp_db: Path, cas_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P12-B：新题录入调用 node_judge LLM 期间不持有 SQLite 写锁，外部连接可并发写入。"""
+    judge_started = asyncio.Event()
+    release_judge = asyncio.Event()
+    real_judge = knowledge_graph._judge_nodes
+
+    async def slow_judge(payload: dict[str, Any]) -> knowledge_graph.NodeJudgeResult:
+        judge_started.set()
+        await release_judge.wait()
+        return await real_judge(payload)
+
+    monkeypatch.setattr(knowledge_graph, "_judge_nodes", slow_judge)
+    task = asyncio.create_task(_ingest(tmp_db))
+    await judge_started.wait()
+    try:
+        _assert_external_write_succeeds(tmp_db, "probe-during-new-node-judge")
+    finally:
+        release_judge.set()
+
+    card = await task
+    assert card.question_uid
+    assert _count(tmp_db, "questions") == 2
+
+
+async def test_reimport_draft_releases_db_lock_during_node_judge(
+    tmp_db: Path,
+    cas_dir: Path,
+    draft_image: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P12-B：携带新草稿重入库解析替代分支调 node_judge 期间不持有 SQLite 写锁。"""
+    first = await _ingest(tmp_db, draft_images=[draft_image])
+    uid = first.question_uid
+    _install_payload(monkeypatch, _alt_payload())
+
+    judge_started = asyncio.Event()
+    release_judge = asyncio.Event()
+    real_judge = knowledge_graph._judge_nodes
+
+    async def slow_judge(payload: dict[str, Any]) -> knowledge_graph.NodeJudgeResult:
+        judge_started.set()
+        await release_judge.wait()
+        return await real_judge(payload)
+
+    monkeypatch.setattr(knowledge_graph, "_judge_nodes", slow_judge)
+    draft2 = _make_image(tmp_path / "draft_reimport_lock.png", (0, 200, 100))
+    task = asyncio.create_task(
+        _ingest(tmp_db, stem_md=_with_uid(uid, STEM_MD), draft_images=[draft2])
+    )
+    await judge_started.wait()
+    try:
+        _assert_external_write_succeeds(tmp_db, "probe-during-reimport-node-judge")
+    finally:
+        release_judge.set()
+
+    card2 = await task
+    assert card2.is_reimport is True
+    assert card2.session_id != first.session_id
+    assert _count(tmp_db, "questions") == 2
+
+
+async def test_compaction_releases_db_lock_during_node_judge(
+    tmp_db: Path, cas_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P12-B：达到阈值后触发的自动 Compaction 在 LLM 裁判期间不持有 SQLite 写锁。"""
+    threshold = settings.COMPACTION_BATCH_THRESHOLD
+    _install_payload(monkeypatch, _many_step_payload(threshold))
+
+    compaction_judge_started = asyncio.Event()
+    release_compaction_judge = asyncio.Event()
+    real_judge = knowledge_graph._judge_nodes
+
+    async def slow_compaction_judge(
+        payload: dict[str, Any],
+    ) -> knowledge_graph.NodeJudgeResult:
+        if payload["task"] == "scoped_compaction" and not compaction_judge_started.is_set():
+            compaction_judge_started.set()
+            await release_compaction_judge.wait()
+        return await real_judge(payload)
+
+    monkeypatch.setattr(knowledge_graph, "_judge_nodes", slow_compaction_judge)
+    task = asyncio.create_task(_ingest(tmp_db))
+    await compaction_judge_started.wait()
+    try:
+        _assert_external_write_succeeds(tmp_db, "probe-during-compaction-judge")
+    finally:
+        release_compaction_judge.set()
+
+    card = await task
+    assert len(card.steps) == threshold
+    assert _count(tmp_db, "questions") == 2
+
+
+async def test_lock_free_planning_reuses_intra_question_and_concurrent_nodes(
+    tmp_db: Path, cas_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P12-B：无锁规划可命中同题前序新建节点，且写事务复核可复用并发新建的同名节点。"""
+    payload = _default_payload()
+    step1_op = payload.trace.steps[0].l3_operator
+    step2_op = payload.trace.steps[1].l3_operator
+    _install_payload(monkeypatch, payload)
+
+    judge_started = asyncio.Event()
+    release_judge = asyncio.Event()
+    calls = 0
+
+    async def judge_match_step1_for_step3(
+        jpayload: dict[str, Any],
+    ) -> knowledge_graph.NodeJudgeResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            judge_started.set()
+            await release_judge.wait()
+            return knowledge_graph.NodeJudgeResult(match_node_id=None, evidence="不复用")
+        if jpayload["candidate"]["names"][0] == payload.trace.steps[2].l3_operator:
+            # 命中同题第 1 步（并发已落库/同题规划）
+            target = str(jpayload["existing_nodes"][0]["node_id"])
+            return knowledge_graph.NodeJudgeResult(match_node_id=target, evidence="同题复用")
+        return knowledge_graph.NodeJudgeResult(match_node_id=None, evidence="不复用")
+
+    monkeypatch.setattr(knowledge_graph, "_judge_nodes", judge_match_step1_for_step3)
+    task = asyncio.create_task(_ingest(tmp_db))
+    await judge_started.wait()
+    # 模拟并发入库在无锁规划期间先插入了与 step2 同名的活跃节点
+    concurrent_id = "concurrent-node-step2"
+    try:
+        _insert_node_direct(tmp_db, concurrent_id, GRADE, "力学", "圆周运动", step2_op)
+    finally:
+        release_judge.set()
+
+    card = await task
+    steps = _query(
+        tmp_db,
+        "SELECT step_index, knowledge_node_id, reused_existing_node FROM question_steps"
+        " WHERE question_uid = ? ORDER BY step_index",
+        (card.question_uid,),
+    )
+    assert steps[0]["knowledge_node_id"] != concurrent_id
+    assert steps[0]["reused_existing_node"] == 0
+    # Step 2 在写事务复核中命中了并发插入的 concurrent_id
+    assert steps[1]["knowledge_node_id"] == concurrent_id
+    assert steps[1]["reused_existing_node"] == 1
+    # Step 3 在无锁规划中命中了同题 Step 1 的规划节点
+    assert steps[2]["knowledge_node_id"] == steps[0]["knowledge_node_id"]
+    assert steps[2]["reused_existing_node"] == 1
+    assert step1_op != step2_op

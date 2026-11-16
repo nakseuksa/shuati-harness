@@ -123,9 +123,7 @@ function esc(v) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 function todayISO() {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return new Date().toISOString().slice(0, 10);
 }
 function pick(obj, ...keys) {
   if (!obj || typeof obj !== 'object') return undefined;

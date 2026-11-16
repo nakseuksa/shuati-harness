@@ -16,7 +16,7 @@ import re
 import shutil
 import sqlite3
 from collections.abc import AsyncIterator
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -578,7 +578,7 @@ async def test_drills_daily_time_travel_and_idempotent(client: AsyncClient) -> N
 
 
 async def test_drills_daily_default_active_date_today(client: AsyncClient) -> None:
-    today = date.today()
+    today = datetime.now(UTC).date()
     _insert_drill_question(
         "q-today", unlock=today - timedelta(days=1), due=today + timedelta(days=3)
     )
@@ -1255,6 +1255,73 @@ async def test_drill_failure_returns_retrain_session_id_and_prewarms(
     assert sess_resp.json()["micro_stage"] == "STAGE_1_BLIND_PROBE"
     for task in list(scaffold_engine.in_flight_prewarm_tasks.values()):
         await task
+
+
+async def test_drill_failure_returns_before_slow_prewarm_completes(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _insert_drill_question("q-slow-ret")
+    _insert_drill_scaffold("q-slow-ret")
+    _insert_pool("q-slow-ret", escrow=20.0)
+
+    started = asyncio.Event()
+    gate = asyncio.Event()
+    orig_impl = scaffold_engine._prewarm_impl
+    seen_refresh_scaffold: list[bool] = []
+
+    async def _gated_prewarm(
+        session_id: str,
+        db_path: Path | None,
+        *,
+        refresh_scaffold: bool = True,
+        refresh_variant: bool = True,
+        exclude_uids: set[str] | None = None,
+    ) -> None:
+        seen_refresh_scaffold.append(refresh_scaffold)
+        started.set()
+        await gate.wait()
+        await orig_impl(
+            session_id,
+            db_path,
+            refresh_scaffold=refresh_scaffold,
+            refresh_variant=refresh_variant,
+            exclude_uids=exclude_uids,
+        )
+
+    monkeypatch.setattr(scaffold_engine, "_prewarm_impl", _gated_prewarm)
+
+    resp = await client.post(
+        "/api/v1/drills/daily",
+        json={
+            "question_uid": "q-slow-ret",
+            "final_answer": FINAL_WRONG,
+            "intermediate_sub_answer": INTERMEDIATE_RIGHT,
+            "active_date": DAY.isoformat(),
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    sid = data["retrain_session_id"]
+    assert sid
+    assert data["retrain_stage"] == "STAGE_4_DECRUTCH_VARIANT"
+    # HTTP 响应在门控放行前已返回，且后台 Task 已登记在途
+    assert not gate.is_set()
+    assert sid in scaffold_engine.in_flight_prewarm_tasks
+    assert not scaffold_engine.in_flight_prewarm_tasks[sid].done()
+
+    sess_running = await client.get(f"/api/v1/sessions/{sid}")
+    assert sess_running.status_code == 200
+    assert sess_running.json()["prewarm_status"] == "RUNNING"
+
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    assert seen_refresh_scaffold == [False]
+    gate.set()
+    await scaffold_engine.in_flight_prewarm_tasks[sid]
+
+    sess_ready = await client.get(f"/api/v1/sessions/{sid}")
+    assert sess_ready.status_code == 200
+    assert sess_ready.json()["prewarm_status"] in ("READY_SYMPY", "READY_FALLBACK")
+    assert sid not in scaffold_engine.in_flight_prewarm_tasks
 
 
 # ---------------------------------------------------------------------------

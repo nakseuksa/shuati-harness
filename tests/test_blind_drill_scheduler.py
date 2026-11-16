@@ -367,6 +367,36 @@ def test_quota_overflow_defers_single_day(conn: sqlite3.Connection) -> None:
     assert _question(conn, "q4")["system_deferred_days"] == 1  # 未重复顺延
 
 
+def test_quota_overflow_preserves_timestamp_and_date_formats(conn: sqlite3.Connection) -> None:
+    for i in range(3):
+        _prepare_original(conn, f"q-cap-{i + 1}", unlock=DAY - timedelta(days=4 - i))
+    _prepare_original(conn, "q-ts", unlock=DAY - timedelta(days=1))
+    _prepare_original(conn, "q-date", unlock=DAY - timedelta(days=1))
+    conn.execute(
+        "UPDATE questions SET blind_test_unlock_at = ?, blind_test_due_at = ? "
+        "WHERE question_uid = ?",
+        ("2026-11-11 08:30:45", "2026-11-15 23:59:59", "q-ts"),
+    )
+    conn.execute(
+        "UPDATE questions SET blind_test_unlock_at = ?, blind_test_due_at = ? "
+        "WHERE question_uid = ?",
+        ("2026-11-11", "2026-11-15", "q-date"),
+    )
+
+    queue = get_daily_blind_drill_queue(conn, DAY, grade_subject=GRADE)
+    assert [i.question_uid for i in queue] == ["q-cap-1", "q-cap-2", "q-cap-3"]
+
+    ts_row = _question(conn, "q-ts")
+    assert ts_row["blind_test_unlock_at"] == "2026-11-12 08:30:45"
+    assert ts_row["blind_test_due_at"] == "2026-11-16 23:59:59"
+    assert ts_row["system_deferred_days"] == 1
+
+    date_row = _question(conn, "q-date")
+    assert date_row["blind_test_unlock_at"] == "2026-11-12"
+    assert date_row["blind_test_due_at"] == "2026-11-16"
+    assert date_row["system_deferred_days"] == 1
+
+
 def test_limit_override(conn: sqlite3.Connection) -> None:
     _prepare_original(conn, "q1", unlock=DAY - timedelta(days=2))
     _prepare_original(conn, "q2", unlock=DAY - timedelta(days=1))

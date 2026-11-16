@@ -613,3 +613,290 @@ def test_init_db_adds_prewarm_excluded_uids_column_idempotently(tmp_path: Path) 
             " WHERE session_id = 'sess-legacy'"
         ).fetchone()
     assert row["prewarm_excluded_uids_json"] == "[]"
+
+
+def _fk_on_delete_map(conn: sqlite3.Connection, table: str) -> dict[str, str]:
+    """返回指定表指向 questions 的各外键列 ON DELETE 动作映射。"""
+    return {
+        str(row["from"]): str(row["on_delete"])
+        for row in conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+        if row["table"] == "questions"
+    }
+
+
+def test_question_fk_on_delete_actions_fresh_db(tmp_db: Path) -> None:
+    """P12-D：全新 init_db 库 5 处 questions 外键均具备预期 ON DELETE 动作。"""
+    with get_db_connection(tmp_db) as conn:
+        assert _fk_on_delete_map(conn, "questions")["parent_question_uid"] == "SET NULL"
+        ds_fks = _fk_on_delete_map(conn, "diagnostic_sessions")
+        assert ds_fks["question_uid"] == "CASCADE"
+        assert ds_fks["prewarm_scaffold_uid"] == "SET NULL"
+        assert ds_fks["prewarm_variant_uid"] == "SET NULL"
+        assert _fk_on_delete_map(conn, "elo_mutation_ledger")["question_uid"] == "CASCADE"
+        bda_fks = _fk_on_delete_map(conn, "blind_drill_attempts")
+        assert bda_fks["question_uid"] == "CASCADE"
+        assert bda_fks["drill_question_uid"] == "CASCADE"
+
+
+def test_question_fk_delete_runtime_behavior(tmp_db: Path) -> None:
+    """P12-D：运行时删除父题/合成题/账本目标/盲测题触发预期 SET NULL 与 CASCADE。"""
+    with get_db_connection(tmp_db) as conn:
+        for uid in ("q-parent", "q-orig", "q-scaffold", "q-variant", "q-ledger", "q-drill"):
+            _insert_question(conn, uid)
+        conn.execute(
+            """
+            INSERT INTO questions (
+                question_uid, origin_type, parent_question_uid, target_grade_and_subject,
+                stem_md, stem_hash, standard_answer_latex,
+                c_score, s_score, t_score, l_score, base_elo, tier, primary_l1_module
+            ) VALUES (
+                'q-child', 'AI_SYNTHETIC_VARIANT', 'q-parent', '高中数学-高三',
+                '子题', 'hash-c', 'x=2', 1, 1, 1, 1, 1000, 'L1_基础直达', '代数'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO diagnostic_sessions (
+                session_id, question_uid, draft_image_cas_uris_json, draft_steps_latex_json,
+                error_category, prewarm_scaffold_uid, prewarm_variant_uid
+            ) VALUES (
+                'sess-rt', 'q-orig', '[]', '[]',
+                'CONCEPT_BOTTLENECK', 'q-scaffold', 'q-variant'
+            )
+            """
+        )
+        conn.execute(
+            _INSERT_LEDGER_GRADED_SQL,
+            ("q-ledger:s:MASTERED_INIT", "q-ledger", "高中数学-高三"),
+        )
+        conn.execute(
+            """
+            INSERT INTO blind_drill_attempts (
+                question_uid, drill_question_uid, active_date, final_correct, passed
+            ) VALUES ('q-orig', 'q-drill', '2026-11-16', 1, 1)
+            """
+        )
+
+        # 1) 删除父题 → 子题保留，parent_question_uid 置 NULL
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-parent'")
+        child = conn.execute(
+            "SELECT question_uid, parent_question_uid FROM questions WHERE question_uid = 'q-child'"
+        ).fetchone()
+        assert child is not None
+        assert child["parent_question_uid"] is None
+
+        # 2) 删除预热脚手架/变式 → 会话保留，对应列置 NULL
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-scaffold'")
+        sess = conn.execute(
+            "SELECT session_id, prewarm_scaffold_uid, prewarm_variant_uid"
+            " FROM diagnostic_sessions WHERE session_id = 'sess-rt'"
+        ).fetchone()
+        assert sess is not None
+        assert sess["prewarm_scaffold_uid"] is None
+        assert sess["prewarm_variant_uid"] == "q-variant"
+
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-variant'")
+        sess = conn.execute(
+            "SELECT prewarm_variant_uid FROM diagnostic_sessions WHERE session_id = 'sess-rt'"
+        ).fetchone()
+        assert sess is not None
+        assert sess["prewarm_variant_uid"] is None
+
+        # 3) 删除账本关联题 → elo_mutation_ledger 级联删除
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-ledger'")
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM elo_mutation_ledger WHERE question_uid = 'q-ledger'"
+            ).fetchone()["n"]
+            == 0
+        )
+
+        # 4) 删除盲测变式题 → blind_drill_attempts 级联删除，原题仍保留
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-drill'")
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM blind_drill_attempts"
+                " WHERE drill_question_uid = 'q-drill'"
+            ).fetchone()["n"]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT question_uid FROM questions WHERE question_uid = 'q-orig'"
+            ).fetchone()
+            is not None
+        )
+
+
+def test_legacy_fk_upgrade_idempotent_and_preserves_all_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P12-D：旧库 4 表两次 init_db 幂等升级，列序/迁移列/数据全保真且 O(1) 无重复重建。"""
+    import backend.db.schema as schema_mod
+    from backend.db.schema import TABLE_DDLS
+
+    legacy_db = tmp_path / "legacy_p12d.db"
+    legacy_questions_ddl = TABLE_DDLS["questions"].replace(
+        "ON DELETE SET NULL", "", 1
+    )
+    legacy_sessions_ddl = (
+        TABLE_DDLS["diagnostic_sessions"]
+        .replace("prewarm_excluded_uids_json TEXT NOT NULL DEFAULT '[]',\n", "")
+        .replace(" ON DELETE SET NULL", "")
+    )
+    legacy_ledger_ddl = TABLE_DDLS["elo_mutation_ledger"].replace(" ON DELETE CASCADE", "", 1)
+    legacy_attempts_ddl = TABLE_DDLS["blind_drill_attempts"].replace(
+        "drill_question_uid TEXT NOT NULL REFERENCES questions(question_uid) ON DELETE CASCADE",
+        "drill_question_uid TEXT NOT NULL REFERENCES questions(question_uid)",
+        1,
+    )
+
+    with sqlite3.connect(legacy_db) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(legacy_questions_ddl)
+        conn.execute(legacy_sessions_ddl)
+        conn.execute(legacy_ledger_ddl)
+        conn.execute(legacy_attempts_ddl)
+        # 模拟真实 P11-B 旧库：ALTER TABLE 晚加入的列位于表尾，顺序不同于 TABLE_DDLS
+        conn.execute(
+            "ALTER TABLE diagnostic_sessions ADD COLUMN prewarm_excluded_uids_json "
+            "TEXT NOT NULL DEFAULT '[]'"
+        )
+        conn.execute(
+            "ALTER TABLE elo_mutation_ledger ADD COLUMN grade_subject TEXT NOT NULL DEFAULT ''"
+        )
+
+        for uid in ("q-parent", "q-orig", "q-scaffold", "q-variant", "q-ledger", "q-drill"):
+            conn.execute(_INSERT_QUESTION_SQL, (uid, 2))
+        conn.execute(
+            """
+            INSERT INTO questions (
+                question_uid, origin_type, parent_question_uid, target_grade_and_subject,
+                stem_md, stem_hash, standard_answer_latex,
+                c_score, s_score, t_score, l_score, base_elo, tier, primary_l1_module
+            ) VALUES (
+                'q-child', 'AI_SYNTHETIC_VARIANT', 'q-parent', '高中数学-高三',
+                '子题干', 'hash-child', 'x=2', 2, 1, 1, 1, 1100, 'L1_基础直达', '代数'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO diagnostic_sessions (
+                session_id, question_uid, draft_image_cas_uris_json, draft_steps_latex_json,
+                error_category, prewarm_scaffold_uid, prewarm_variant_uid,
+                prewarm_excluded_uids_json
+            ) VALUES (
+                'sess-1', 'q-orig', '["cas://1"]', '["x=1"]',
+                'CONCEPT_BOTTLENECK', 'q-scaffold', 'q-variant', '["q-old"]'
+            )
+            """
+        )
+        conn.execute(
+            _INSERT_LEDGER_GRADED_SQL,
+            ("q-ledger:sess-1:MASTERED_INIT", "q-ledger", "高中数学-高三"),
+        )
+        conn.execute(
+            """
+            INSERT INTO blind_drill_attempts (
+                question_uid, drill_question_uid, active_date,
+                intermediate_correct, final_correct, passed
+            ) VALUES ('q-orig', 'q-drill', '2026-11-16', 1, 1, 1)
+            """
+        )
+        conn.commit()
+
+        conn.row_factory = sqlite3.Row
+        before_rows = {
+            tbl: [
+                dict(r)
+                for r in conn.execute(f"SELECT * FROM {tbl} ORDER BY rowid").fetchall()
+            ]
+            for tbl in (
+                "questions",
+                "diagnostic_sessions",
+                "elo_mutation_ledger",
+                "blind_drill_attempts",
+            )
+        }
+        assert _fk_on_delete_map(conn, "questions")["parent_question_uid"] == "NO ACTION"
+        assert (
+            _fk_on_delete_map(conn, "diagnostic_sessions")["prewarm_scaffold_uid"]
+            == "NO ACTION"
+        )
+        assert _fk_on_delete_map(conn, "elo_mutation_ledger")["question_uid"] == "NO ACTION"
+        assert (
+            _fk_on_delete_map(conn, "blind_drill_attempts")["drill_question_uid"] == "NO ACTION"
+        )
+
+    # 第一次 init_db：触发 4 表重建迁移
+    init_db(legacy_db)
+
+    # 第二次 init_db：应零重建（O(1) 幂等）
+    rebuild_calls: list[str] = []
+    orig_rebuild = schema_mod._rebuild_table_preserving_data
+
+    def _spy_rebuild(conn: sqlite3.Connection, table: str) -> None:
+        rebuild_calls.append(table)
+        orig_rebuild(conn, table)
+
+    monkeypatch.setattr(schema_mod, "_rebuild_table_preserving_data", _spy_rebuild)
+    init_db(legacy_db)
+    assert rebuild_calls == []
+
+    with get_db_connection(legacy_db) as conn:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        after_rows = {
+            tbl: [
+                dict(r)
+                for r in conn.execute(f"SELECT * FROM {tbl} ORDER BY rowid").fetchall()
+            ]
+            for tbl in (
+                "questions",
+                "diagnostic_sessions",
+                "elo_mutation_ledger",
+                "blind_drill_attempts",
+            )
+        }
+        assert after_rows == before_rows
+
+        assert _fk_on_delete_map(conn, "questions")["parent_question_uid"] == "SET NULL"
+        ds_fks = _fk_on_delete_map(conn, "diagnostic_sessions")
+        assert ds_fks["prewarm_scaffold_uid"] == "SET NULL"
+        assert ds_fks["prewarm_variant_uid"] == "SET NULL"
+        assert _fk_on_delete_map(conn, "elo_mutation_ledger")["question_uid"] == "CASCADE"
+        assert _fk_on_delete_map(conn, "blind_drill_attempts")["drill_question_uid"] == "CASCADE"
+
+        indexes = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+        }
+        assert {
+            "idx_questions_mastery_state",
+            "idx_diagnostic_sessions_question_uid",
+            "idx_elo_mutation_ledger_l1_module",
+            "idx_elo_mutation_ledger_grade_l1",
+            "idx_blind_drill_attempts_question_date",
+        } <= indexes
+
+        # 验证升级后的库在删除时确实按新 FK 动作执行
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-parent'")
+        assert (
+            conn.execute(
+                "SELECT parent_question_uid FROM questions WHERE question_uid = 'q-child'"
+            ).fetchone()["parent_question_uid"]
+            is None
+        )
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-scaffold'")
+        assert (
+            conn.execute(
+                "SELECT prewarm_scaffold_uid FROM diagnostic_sessions WHERE session_id = 'sess-1'"
+            ).fetchone()["prewarm_scaffold_uid"]
+            is None
+        )
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-ledger'")
+        assert conn.execute("SELECT COUNT(*) FROM elo_mutation_ledger").fetchone()[0] == 0
+        conn.execute("DELETE FROM questions WHERE question_uid = 'q-drill'")
+        assert conn.execute("SELECT COUNT(*) FROM blind_drill_attempts").fetchone()[0] == 0

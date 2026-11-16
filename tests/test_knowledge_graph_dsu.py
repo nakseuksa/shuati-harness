@@ -1440,3 +1440,180 @@ async def test_watermark_grade_partition(
     assert len(calls) == 2
     await match_or_create_l3_node(conn, GRADE, "天文", "星象", round2[14], [])
     assert len(calls) == 3 and calls[-1] == (GRADE, "天文", "星象")
+
+
+# ---------------------------------------------------------------------------
+# P12-B：Delta-Preserving Revert & LIFO 依赖守卫（Risk 2）
+# ---------------------------------------------------------------------------
+
+
+def test_revert_preserves_post_merge_edges_and_deltas(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    """P12-B：合并 B1 (A->B) 后新增边 (B,Y) 与增量 (B,X)+q_post，回滚 B1 保留增量且不丢 (B,Y)。"""
+    judge.decide = _confirm_compaction
+    # B 更早创建（older 主节点），A 较新（newer 合并入 B）
+    _insert_node(conn, "B", l3=NAME_A, created_at="2026-01-01 00:00:01")
+    _insert_node(conn, "A", l3=NAME_B, created_at="2026-01-01 00:00:02")
+    _insert_node(conn, "X", l2=L2_OTHER)
+    _insert_node(conn, "Y", l2=L2_OTHER)
+    _insert_edge(
+        conn, "A", "X", active=1, historical=1, uids=("q1",),
+        last_error_at="2026-01-02 00:00:00",
+    )
+    _insert_edge(
+        conn, "B", "X", active=2, historical=3, uids=("q2", "q3"),
+        last_error_at="2026-01-03 00:00:00",
+    )
+
+    batch_b1 = run_scoped_compaction(conn, GRADE, L1, L2)
+    assert batch_b1 is not None
+    assert _redirects(conn)["A"] == "B"
+
+    # 合并后新增标红边 (B, Y) 以及对既有 (B, X) 增量写入 q_post
+    _insert_question(conn, "q_post")
+    _insert_step(conn, "sp1", "q_post", "B", index=1)
+    _insert_step(conn, "sp2", "q_post", "X", index=2)
+    record_co_error_edges(conn, "q_post")
+
+    _insert_question(conn, "q_y")
+    _insert_step(conn, "sy1", "q_y", "B", index=1)
+    _insert_step(conn, "sy2", "q_y", "Y", index=2)
+    record_co_error_edges(conn, "q_y")
+
+    # 回滚 B1
+    revert_compaction_batch(conn, batch_b1)
+    assert _redirects(conn)["A"] is None
+    assert _redirects(conn)["B"] is None
+
+    edges = {
+        (e["node_u_id"], e["node_v_id"]): e
+        for e in _dump(conn, "concept_co_errors", "node_u_id, node_v_id")
+    }
+    assert set(edges) == {("A", "X"), ("B", "X"), ("B", "Y")}
+
+    # (A, X) 原样恢复
+    ax = edges[("A", "X")]
+    assert ax["active_error_count"] == 1
+    assert ax["total_historical_count"] == 1
+    assert json.loads(ax["source_question_uids_json"]) == ["q1"]
+    assert ax["last_error_at"] == "2026-01-02 00:00:00"
+
+    # (B, X) 保留合并前 (2,3) + 合并后增量 (1,1) = (3,4) 与 q_post，且未丢弃任何后续写入
+    bx = edges[("B", "X")]
+    assert bx["active_error_count"] == 3
+    assert bx["total_historical_count"] == 4
+    assert json.loads(bx["source_question_uids_json"]) == ["q2", "q3", "q_post"]
+
+    # (B, Y) 合并后新增边完好无损
+    by = edges[("B", "Y")]
+    assert by["active_error_count"] == 1
+    assert by["total_historical_count"] == 1
+    assert json.loads(by["source_question_uids_json"]) == ["q_y"]
+
+
+def test_revert_preserves_shared_uid_and_migrated_edge_post_increment(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    """P12-B：合并双方共享同一 q_shared 时回滚不误删 pre_to 的 q_shared；纯迁移边后增量亦保留。"""
+    judge.decide = _confirm_compaction
+    _insert_node(conn, "B", l3=NAME_A, created_at="2026-01-01 00:00:01")
+    _insert_node(conn, "A", l3=NAME_B, created_at="2026-01-01 00:00:02")
+    _insert_node(conn, "X", l2=L2_OTHER)
+    _insert_node(conn, "Z", l2=L2_OTHER)
+    _insert_edge(
+        conn, "A", "X", active=1, historical=1, uids=("q_shared",),
+        last_error_at="2026-01-02 00:00:00",
+    )
+    _insert_edge(
+        conn, "B", "X", active=1, historical=1, uids=("q_shared",),
+        last_error_at="2026-01-03 00:00:00",
+    )
+    _insert_edge(
+        conn, "A", "Z", active=1, historical=1, uids=("q_az",),
+        last_error_at="2026-01-01 00:00:00",
+    )
+
+    batch_id = run_scoped_compaction(conn, GRADE, L1, L2)
+    assert batch_id is not None
+
+    # 仅在 (A, Z)->(B, Z) 上发生合并后增量 q_bz_post
+    _insert_question(conn, "q_bz_post")
+    _insert_step(conn, "s1", "q_bz_post", "B", index=1)
+    _insert_step(conn, "s2", "q_bz_post", "Z", index=2)
+    record_co_error_edges(conn, "q_bz_post")
+
+    revert_compaction_batch(conn, batch_id)
+    edges = {
+        (e["node_u_id"], e["node_v_id"]): e
+        for e in _dump(conn, "concept_co_errors", "node_u_id, node_v_id")
+    }
+    assert set(edges) == {("A", "X"), ("A", "Z"), ("B", "X"), ("B", "Z")}
+    assert json.loads(edges[("A", "X")]["source_question_uids_json"]) == ["q_shared"]
+    assert json.loads(edges[("B", "X")]["source_question_uids_json"]) == ["q_shared"]
+    assert edges[("B", "X")]["last_error_at"] == "2026-01-03 00:00:00"
+    assert json.loads(edges[("A", "Z")]["source_question_uids_json"]) == ["q_az"]
+    assert edges[("B", "Z")]["active_error_count"] == 1
+    assert json.loads(edges[("B", "Z")]["source_question_uids_json"]) == ["q_bz_post"]
+
+
+def test_revert_lifo_guard_blocks_out_of_order_direct_dependency(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    """P12-B：B1(B->A) 之后又发生 B2(C->A)，先回滚 B1 抛 ValueError；先 B2 后 B1 成功。"""
+    judge.decide = _confirm_compaction
+    _insert_node(conn, "A", l3=NAME_A, created_at="2026-01-01 00:00:01")
+    _insert_node(conn, "B", l3=NAME_B, created_at="2026-01-01 00:00:02")
+    batch_b1 = run_scoped_compaction(conn, GRADE, L1, L2)
+    assert batch_b1 is not None
+
+    _insert_node(conn, "C", l3=NAME_C, created_at="2026-01-01 00:00:03")
+    batch_b2 = run_scoped_compaction(conn, GRADE, L1, L2)
+    assert batch_b2 is not None and batch_b2 != batch_b1
+    assert _redirects(conn) == {"A": None, "B": "A", "C": "A"}
+
+    snapshot_before_err = _snapshot_all(conn)
+    with pytest.raises(ValueError, match="先回滚"):
+        revert_compaction_batch(conn, batch_b1)
+    assert _snapshot_all(conn) == snapshot_before_err
+
+    revert_compaction_batch(conn, batch_b2)
+    revert_compaction_batch(conn, batch_b1)
+    assert _redirects(conn) == {"A": None, "B": None, "C": None}
+
+
+def test_revert_lifo_guard_blocks_cross_scope_snapshot_neighbor_dependency(
+    conn: sqlite3.Connection, judge: JudgeSpy
+) -> None:
+    """P12-B：B1(A->B) 快照含跨 L1/L2 边 (A, C)，后续 B2(D->C) 跨作用域合并后先回滚 B1 抛错。"""
+    judge.decide = _confirm_compaction
+    _insert_node(conn, "B", l3=NAME_A, created_at="2026-01-01 00:00:01")
+    _insert_node(conn, "A", l3=NAME_B, created_at="2026-01-01 00:00:02")
+    _insert_node(
+        conn, "C", l1=L1_OTHER, l2=L2_OTHER, l3="动量定理求电荷量", created_at="2026-01-01 00:00:01"
+    )
+    _insert_edge(conn, "A", "C", uids=("q_cross",))
+
+    batch_b1 = run_scoped_compaction(conn, GRADE, L1, L2)
+    assert batch_b1 is not None
+
+    _insert_node(
+        conn,
+        "D",
+        l1=L1_OTHER,
+        l2=L2_OTHER,
+        l3="动量定理求电荷量大小",
+        created_at="2026-01-01 00:00:02",
+    )
+    batch_b2 = run_scoped_compaction(conn, GRADE, L1_OTHER, L2_OTHER)
+    assert batch_b2 is not None
+    assert _redirects(conn) == {"B": None, "A": "B", "C": None, "D": "C"}
+
+    with pytest.raises(ValueError, match="先回滚"):
+        revert_compaction_batch(conn, batch_b1)
+
+    revert_compaction_batch(conn, batch_b2)
+    revert_compaction_batch(conn, batch_b1)
+    assert _redirects(conn) == {"B": None, "A": None, "C": None, "D": None}
+    edges = _dump(conn, "concept_co_errors", "node_u_id, node_v_id")
+    assert [(e["node_u_id"], e["node_v_id"]) for e in edges] == [("A", "C")]

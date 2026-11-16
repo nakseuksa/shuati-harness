@@ -37,7 +37,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Literal
 
 from pydantic import BaseModel
@@ -343,7 +343,7 @@ def _build_item(conn: sqlite3.Connection, question: sqlite3.Row) -> BlindDrillIt
 
 def get_daily_blind_drill_queue(
     conn: sqlite3.Connection,
-    active_date: date,
+    active_date: date | None = None,
     limit: int | None = None,
     *,
     grade_subject: str,
@@ -355,18 +355,20 @@ def get_daily_blind_drill_queue(
       幂等返回仍在 PENDING_RETEST 的锁定题单，不重复递增曝光、不重复顺延；
     - 否则选本学段 PENDING_RETEST 且 blind_test_unlock_at <= active_date 的题，按
       unlock_at ASC 取前 cap 道：slated_drill_date=active_date、曝光 +1；
-    - 本学段溢出到期题 unlock_at/due_at 各 +1 天、system_deferred_days +1，当日不
-      排入（未 slated → 衰减判据天然冻结）；
+    - 本学段溢出到期题 unlock_at/due_at 各 +1 天（保留原日期或时间戳粒度）、
+      system_deferred_days +1，当日不排入（未 slated → 衰减判据天然冻结）；
     - 锁定后接线 elo_engine.apply_overdue_escrow_decay（全局跨学段扫描；当日已排入且
       曝光 > 阈值的题按日衰减；函数自身按 (uid, date) 幂等，重复刷新/多学段调用不重衰）。
 
+    active_date 缺省 datetime.now(UTC).date()。
     limit 缺省 settings.DAILY_BLIND_DRILL_CAP；负数抛 ValueError。limit=0 时本学段
     不产生锁定记录，所有到期题顺延（退化用法，同日重复调用会再次顺延）。
     """
     cap = settings.DAILY_BLIND_DRILL_CAP if limit is None else limit
     if cap < 0:
         raise ValueError(f"每日盲测配额不能为负：limit={cap}")
-    day = active_date.isoformat()
+    resolved_date = active_date if active_date is not None else datetime.now(UTC).date()
+    day = resolved_date.isoformat()
 
     with _savepoint(conn):
         locked_any = _query_one(
@@ -407,8 +409,17 @@ def get_daily_blind_drill_queue(
             for row in due[cap:]:
                 conn.execute(
                     "UPDATE questions SET"
-                    " blind_test_unlock_at = date(blind_test_unlock_at, '+1 day'),"
-                    " blind_test_due_at = date(blind_test_due_at, '+1 day'),"
+                    " blind_test_unlock_at = CASE"
+                    "  WHEN length(blind_test_unlock_at) > 10"
+                    "  THEN datetime(blind_test_unlock_at, '+1 day')"
+                    "  ELSE date(blind_test_unlock_at, '+1 day')"
+                    " END,"
+                    " blind_test_due_at = CASE"
+                    "  WHEN blind_test_due_at IS NULL THEN NULL"
+                    "  WHEN length(blind_test_due_at) > 10"
+                    "  THEN datetime(blind_test_due_at, '+1 day')"
+                    "  ELSE date(blind_test_due_at, '+1 day')"
+                    " END,"
                     " system_deferred_days = system_deferred_days + 1,"
                     " updated_at = CURRENT_TIMESTAMP WHERE question_uid = ?",
                     (str(row["question_uid"]),),
@@ -427,7 +438,7 @@ def get_daily_blind_drill_queue(
         items = [_build_item(conn, row) for row in rows]
         # 衰减接线（全局，不按学段过滤）：仅当日已排入且曝光 > 阈值的题衰减；
         # 顺延题未 slated → 冻结；同日幂等键保证多学段调用不重复衰减。
-        elo_engine.apply_overdue_escrow_decay(conn, active_date)
+        elo_engine.apply_overdue_escrow_decay(conn, resolved_date)
     return items
 
 
@@ -530,12 +541,12 @@ def evaluate_blind_drill_submission(
     - 无论成败均写 blind_drill_attempts 作答日志（变式曝光追踪判据来源）。
 
     题目不存在或不在 PENDING_RETEST 状态抛 ValueError（回滚，不落任何写入）。
-    active_date 缺省 date.today()。
+    active_date 缺省 datetime.now(UTC).date()。
 
     P10-D：签名与逻辑不变——本函数以 uid 操作，学段由 elo_engine/knowledge_graph
     自题目行自派生（P10-B/C）；SCAFFOLD_PRE 子题与母题同学段由构造保证。
     """
-    day = active_date if active_date is not None else date.today()
+    day = active_date if active_date is not None else datetime.now(UTC).date()
     with _savepoint(conn):
         question = _load_question(conn, question_uid)
         state = str(question["mastery_state"])

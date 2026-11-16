@@ -48,7 +48,75 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_IMPORT_ROOTS = frozenset({"sympy", "math", "fractions"})
 _FORBIDDEN_CALL_NAMES = frozenset(
-    {"open", "eval", "exec", "__import__", "getattr", "globals", "locals"}
+    {
+        "open",
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+        "getattr",
+        "setattr",
+        "delattr",
+        "globals",
+        "locals",
+        "vars",
+        "breakpoint",
+        "input",
+        "memoryview",
+    }
+)
+_FORBIDDEN_NAMES = frozenset(
+    {
+        "sys",
+        "os",
+        "subprocess",
+        "importlib",
+        "builtins",
+        "ctypes",
+        "socket",
+        "pathlib",
+        "shutil",
+        "pickle",
+        "marshal",
+    }
+)
+_FORBIDDEN_ATTR_NAMES = frozenset(
+    {
+        "sys",
+        "os",
+        "subprocess",
+        "importlib",
+        "builtins",
+        "ctypes",
+        "socket",
+        "pathlib",
+        "shutil",
+        "io",
+        "modules",
+        "system",
+        "popen",
+        "spawn",
+        "fork",
+        "execv",
+        "execl",
+        "execve",
+        "environ",
+        "read_text",
+        "write_text",
+        "read_bytes",
+        "write_bytes",
+        "open",
+        "eval",
+        "exec",
+        "compile",
+        "getattr",
+        "setattr",
+        "delattr",
+        "globals",
+        "locals",
+        "vars",
+        "breakpoint",
+    }
 )
 _SOLVER_CALL_NAMES = frozenset(
     {"solve", "solveset", "dsolve", "simplify", "Eq", "integrate", "limit", "Matrix"}
@@ -62,7 +130,7 @@ _STDERR_TAIL_CHARS = 500
 @dataclass
 class ASTValidationResult:
     """AST 静态探针结论。reason ∈ OK / VACUOUS_SCRIPT_REJECTED / FORBIDDEN_IMPORT /
-    FORBIDDEN_CALL / FORBIDDEN_ATTR / SYNTAX_ERROR。"""
+    FORBIDDEN_CALL / FORBIDDEN_ATTR / FORBIDDEN_NAME / SYNTAX_ERROR。"""
 
     ok: bool
     reason: str
@@ -85,9 +153,34 @@ class SandboxExecutionResult:
 
 
 def _import_name_allowed(name: str) -> bool:
-    """导入根模块必须在白名单内，且路径中不得含双下划线段（防 sympy.__loader__ 走私）。"""
+    """导入根模块须在白名单内，且路径不含私有或敏感段（防 sympy.__loader__ / sympy.sys 走私）。"""
     parts = name.split(".")
-    return parts[0] in _ALLOWED_IMPORT_ROOTS and not any(p.startswith("__") for p in parts)
+    return parts[0] in _ALLOWED_IMPORT_ROOTS and not any(
+        p.startswith("_") or p in _FORBIDDEN_ATTR_NAMES or p in _FORBIDDEN_NAMES for p in parts
+    )
+
+
+def _check_forbidden_name(ident: str) -> str | None:
+    """检查标识符（变量/函数名/别名）是否命中禁用调用、敏感模块名或双下划线内省。"""
+    if ident in _FORBIDDEN_CALL_NAMES:
+        return "FORBIDDEN_CALL"
+    if ident in _FORBIDDEN_NAMES:
+        return "FORBIDDEN_NAME"
+    # 加固：双下划线名字（__builtins__ / __loader__ 等）属内省逃逸面；保留单下划线局部变量 `_`
+    if ident.startswith("__"):
+        return "FORBIDDEN_ATTR"
+    return None
+
+
+def _check_forbidden_attr(attr: str) -> str | None:
+    """检查属性名是否以单/双下划线开头或命中禁用调用/敏感属性。"""
+    if attr.startswith("_"):
+        return "FORBIDDEN_ATTR"
+    if attr in _FORBIDDEN_CALL_NAMES:
+        return "FORBIDDEN_CALL"
+    if attr in _FORBIDDEN_ATTR_NAMES:
+        return "FORBIDDEN_ATTR"
+    return None
 
 
 def validate_script_ast(code_str: str) -> ASTValidationResult:
@@ -105,29 +198,41 @@ def validate_script_ast(code_str: str) -> ASTValidationResult:
             for alias in node.names:
                 if not _import_name_allowed(alias.name):
                     return ASTValidationResult(False, "FORBIDDEN_IMPORT")
+                if alias.asname is not None:
+                    reason = _check_forbidden_name(alias.asname)
+                    if reason is not None:
+                        return ASTValidationResult(False, reason)
         elif isinstance(node, ast.ImportFrom):
             if node.level != 0 or node.module is None or not _import_name_allowed(node.module):
                 return ASTValidationResult(False, "FORBIDDEN_IMPORT")
             for alias in node.names:
-                if alias.name.startswith("__"):
-                    return ASTValidationResult(False, "FORBIDDEN_ATTR")
+                reason = _check_forbidden_attr(alias.name) or _check_forbidden_name(alias.name)
+                if reason is not None:
+                    return ASTValidationResult(False, reason)
+                if alias.asname is not None:
+                    as_reason = _check_forbidden_name(alias.asname)
+                    if as_reason is not None:
+                        return ASTValidationResult(False, as_reason)
         elif isinstance(node, ast.Name):
-            if node.id in _FORBIDDEN_CALL_NAMES:
-                return ASTValidationResult(False, "FORBIDDEN_CALL")
-            # 加固：双下划线名字（__builtins__ / __loader__ 等）同样属于内省逃逸面
-            if node.id.startswith("__"):
-                return ASTValidationResult(False, "FORBIDDEN_ATTR")
+            reason = _check_forbidden_name(node.id)
+            if reason is not None:
+                return ASTValidationResult(False, reason)
         elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("__"):
-                return ASTValidationResult(False, "FORBIDDEN_ATTR")
-            if node.attr in _FORBIDDEN_CALL_NAMES:
-                return ASTValidationResult(False, "FORBIDDEN_CALL")
+            reason = _check_forbidden_attr(node.attr)
+            if reason is not None:
+                return ASTValidationResult(False, reason)
         elif isinstance(node, ast.Call):
             func = node.func
             name: str | None = None
             if isinstance(func, ast.Name):
+                reason = _check_forbidden_name(func.id)
+                if reason is not None:
+                    return ASTValidationResult(False, reason)
                 name = func.id
             elif isinstance(func, ast.Attribute):
+                reason = _check_forbidden_attr(func.attr)
+                if reason is not None:
+                    return ASTValidationResult(False, reason)
                 name = func.attr
             if name in _SOLVER_CALL_NAMES:
                 has_solver_call = True
@@ -181,6 +286,12 @@ import traceback as _traceback
 _RESULT_SENTINEL = "###RESULT###"
 _ERROR_SENTINEL = "###ERROR###"
 _ALLOWED_ROOTS = ("sympy", "math", "fractions")
+_FORBIDDEN_IMPORT_PARTS = frozenset(
+    {
+        "sys", "os", "subprocess", "importlib", "builtins", "ctypes",
+        "socket", "pathlib", "shutil", "io", "pickle", "marshal",
+    }
+)
 _real_import = _builtins.__import__
 
 
@@ -188,7 +299,12 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     parts = name.split(".")
     if level != 0 or parts[0] not in _ALLOWED_ROOTS:
         raise ImportError("sandbox: forbidden import " + repr(name))
-    if any(p.startswith("__") for p in parts):
+    if any(p.startswith("_") or p in _FORBIDDEN_IMPORT_PARTS for p in parts):
+        raise ImportError("sandbox: forbidden import " + repr(name))
+    if fromlist and any(
+        isinstance(f, str) and (f.startswith("_") or f in _FORBIDDEN_IMPORT_PARTS)
+        for f in fromlist
+    ):
         raise ImportError("sandbox: forbidden import " + repr(name))
     return _real_import(name, globals, locals, fromlist, level)
 
@@ -196,7 +312,7 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
 _DROP_BUILTINS = {
     "open", "eval", "exec", "compile", "getattr", "setattr", "delattr",
     "globals", "locals", "vars", "dir", "input", "breakpoint", "help",
-    "exit", "quit", "__import__",
+    "exit", "quit", "memoryview", "__import__",
 }
 _safe_builtins = {k: v for k, v in vars(_builtins).items() if k not in _DROP_BUILTINS}
 _safe_builtins["__import__"] = _safe_import

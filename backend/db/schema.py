@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS questions (
     origin_type TEXT NOT NULL CHECK (
         origin_type IN ('USER_CANONICAL', 'AI_SYNTHETIC_SCAFFOLD', 'AI_SYNTHETIC_VARIANT')
     ),
-    parent_question_uid TEXT REFERENCES questions(question_uid),
+    parent_question_uid TEXT REFERENCES questions(question_uid) ON DELETE SET NULL,
     target_grade_and_subject TEXT NOT NULL,      -- 如 '高中物理-高二'、'高中数学-高三'
     stem_md TEXT NOT NULL,                       -- 题干 Markdown (图片已转为 cas://sha256 URI)
     stem_hash TEXT NOT NULL,                     -- 题干内容 SHA-256 (用于二次导入 Diff)
@@ -181,8 +181,8 @@ CREATE TABLE IF NOT EXISTS diagnostic_sessions (
             'SESSION_COMPLETED'
         )
     ),
-    prewarm_scaffold_uid TEXT REFERENCES questions(question_uid),
-    prewarm_variant_uid TEXT REFERENCES questions(question_uid),
+    prewarm_scaffold_uid TEXT REFERENCES questions(question_uid) ON DELETE SET NULL,
+    prewarm_variant_uid TEXT REFERENCES questions(question_uid) ON DELETE SET NULL,
     prewarm_status TEXT NOT NULL DEFAULT 'IDLE' CHECK (
         prewarm_status IN ('IDLE', 'RUNNING', 'READY_SYMPY', 'READY_FALLBACK', 'FAILED')
     ),
@@ -217,7 +217,7 @@ CREATE TABLE IF NOT EXISTS elo_mutation_ledger (
     -- 格式: '{question_uid}:{session_id}:{mutation_trigger}'
     idempotency_key TEXT NOT NULL UNIQUE,
     l1_module TEXT NOT NULL,
-    question_uid TEXT NOT NULL REFERENCES questions(question_uid),
+    question_uid TEXT NOT NULL REFERENCES questions(question_uid) ON DELETE CASCADE,
     mutation_trigger TEXT NOT NULL CHECK (
         mutation_trigger IN (
             'MASTERED_INIT',
@@ -243,7 +243,7 @@ CREATE TABLE IF NOT EXISTS elo_mutation_ledger (
 CREATE TABLE IF NOT EXISTS blind_drill_attempts (
     attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
     question_uid TEXT NOT NULL REFERENCES questions(question_uid) ON DELETE CASCADE,
-    drill_question_uid TEXT NOT NULL REFERENCES questions(question_uid),
+    drill_question_uid TEXT NOT NULL REFERENCES questions(question_uid) ON DELETE CASCADE,
     active_date DATE NOT NULL,
     intermediate_correct INTEGER,          -- NULL = 本题不要求中间量
     final_correct INTEGER NOT NULL,
@@ -444,12 +444,139 @@ def _migrate_grade_scoping(conn: sqlite3.Connection) -> None:
         )
 
 
+_QUESTION_FK_ON_DELETE_SPECS: dict[str, dict[str, str]] = {
+    "questions": {
+        "parent_question_uid": "SET NULL",
+    },
+    "diagnostic_sessions": {
+        "prewarm_scaffold_uid": "SET NULL",
+        "prewarm_variant_uid": "SET NULL",
+    },
+    "elo_mutation_ledger": {
+        "question_uid": "CASCADE",
+    },
+    "blind_drill_attempts": {
+        "drill_question_uid": "CASCADE",
+    },
+}
+
+
+def _needs_fk_rebuild(
+    conn: sqlite3.Connection,
+    table: str,
+    expected_fks: dict[str, str],
+) -> bool:
+    """检测表指向 questions 的外键是否存在缺失或 ON DELETE 动作不匹配预期。"""
+    fk_rows = conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+    actual_on_delete: dict[str, str] = {
+        str(row["from"]): str(row["on_delete"]).upper()
+        for row in fk_rows
+        if row["table"] == "questions"
+    }
+    return any(
+        actual_on_delete.get(col) != expected_action
+        for col, expected_action in expected_fks.items()
+    )
+
+
+def _rebuild_table_preserving_data(conn: sqlite3.Connection, table: str) -> None:
+    """按最新 DDL 重建表并按列名动态保留所有既有列（含迁移附加列）与数据。"""
+    tmp_table = f"_p12d_migrate_{table}"
+    old_cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    ddl = TABLE_DDLS[table]
+    tmp_ddl = ddl.replace(
+        f"CREATE TABLE IF NOT EXISTS {table}",
+        f"CREATE TABLE {tmp_table}",
+        1,
+    )
+    if tmp_ddl == ddl:
+        raise ValueError(f"无法构造临时迁移表 DDL: {table}")
+
+    conn.execute(f"DROP TABLE IF EXISTS {tmp_table}")
+    conn.execute(tmp_ddl)
+
+    target_col_names = {
+        str(row["name"]) for row in conn.execute(f"PRAGMA table_info({tmp_table})").fetchall()
+    }
+    for col in old_cols:
+        col_name = str(col["name"])
+        if col_name not in target_col_names:
+            col_type = str(col["type"] or "TEXT")
+            notnull_sql = " NOT NULL" if col["notnull"] else ""
+            default_sql = (
+                f" DEFAULT {col['dflt_value']}" if col["dflt_value"] is not None else ""
+            )
+            conn.execute(
+                f"ALTER TABLE {tmp_table} ADD COLUMN {col_name} "
+                f"{col_type}{notnull_sql}{default_sql}"
+            )
+
+    cols_csv = ", ".join(str(col["name"]) for col in old_cols)
+    conn.execute(f"INSERT INTO {tmp_table} ({cols_csv}) SELECT {cols_csv} FROM {table}")
+    conn.execute(f"DROP TABLE {table}")
+    conn.execute(f"ALTER TABLE {tmp_table} RENAME TO {table}")
+
+
+def _index_target_table(index_ddl: str) -> str:
+    """从 CREATE INDEX DDL 中提取目标表名。"""
+    after_on = index_ddl.split(" ON ", 1)[1]
+    return after_on.split("(", 1)[0].strip()
+
+
+def _migrate_question_fk_actions(conn: sqlite3.Connection) -> None:
+    """P12-D 幂等外键迁移：为旧库 4 张表的 questions 外键补齐 ON DELETE 动作。
+
+    仅当表存在且 PRAGMA foreign_key_list 显示目标列的 on_delete 与预期不符时重建；
+    全部匹配时零重建（O(1) 幂等）。
+    """
+    existing_tables = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    tables_to_rebuild = [
+        table
+        for table, expected_fks in _QUESTION_FK_ON_DELETE_SPECS.items()
+        if table in existing_tables and _needs_fk_rebuild(conn, table, expected_fks)
+    ]
+    if not tables_to_rebuild:
+        return
+
+    # SQLite 要求 conn.in_transaction 为 False 时 PRAGMA foreign_keys=OFF/ON 才生效
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        for table in tables_to_rebuild:
+            _rebuild_table_preserving_data(conn, table)
+        for table in tables_to_rebuild:
+            violations = conn.execute(f"PRAGMA foreign_key_check({table})").fetchall()
+            if violations:
+                detail = [dict(row) for row in violations]
+                raise ValueError(f"P12-D 外键迁移后 {table} 存在外键违约: {detail}")
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.execute("PRAGMA foreign_keys = ON")
+
+    for ddl in INDEX_DDLS:
+        if _index_target_table(ddl) in existing_tables:
+            conn.execute(ddl)
+
+
 def init_db(db_path: Path | None = None) -> None:
     """幂等初始化数据库：自动创建父目录并建立 9 张核心表 + 2 张 PM 批准扩展表与全部索引。
 
     db_path 缺省取 backend.config.settings.SQLITE_PATH；重复调用不报错、不丢数据。
-    建表后在同一连接内执行 P10-A 学段分区迁移（加列回填，幂等），再建索引
-    （新索引引用 grade_subject 列，必须先完成加列）。
+    建表后在同一连接内执行 P10-A 学段分区迁移（加列回填，幂等）与 P12-D 外键动作迁移，
+    再建索引（新索引引用 grade_subject 列，必须先完成加列）。
     """
     path = db_path if db_path is not None else settings.SQLITE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -462,6 +589,7 @@ def init_db(db_path: Path | None = None) -> None:
                 "TEXT NOT NULL DEFAULT '[]'"
             )
         _migrate_grade_scoping(conn)
+        _migrate_question_fk_actions(conn)
         for ddl in INDEX_DDLS:
             conn.execute(ddl)
 

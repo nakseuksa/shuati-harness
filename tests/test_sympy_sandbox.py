@@ -95,6 +95,10 @@ def test_vacuous_script_rejected(code: str) -> None:
         "from subprocess import run\nimport sympy\nsympy.solve(sympy.Symbol('x') - 1)\n",
         "from . import x\nimport sympy\nsympy.solve(sympy.Symbol('x') - 1)\n",
         "import sympy.__loader__\n",
+        "import sympy.sys\n",
+        "import sympy._private\n",
+        "import decimal\n",
+        "import itertools\n",
     ],
 )
 def test_forbidden_import(code: str) -> None:
@@ -110,9 +114,20 @@ def test_forbidden_import(code: str) -> None:
         "open('/etc/passwd')\n",
         "eval('1 + 1')\n",
         "exec('x = 1')\n",
+        "compile('1', '<x>', 'eval')\n",
         "getattr([], 'append')\n",
+        "setattr(object(), 'x', 1)\n",
+        "delattr(object(), 'x')\n",
         "globals()\n",
         "locals()\n",
+        "vars()\n",
+        "breakpoint()\n",
+        "input()\n",
+        "memoryview(b'a')\n",
+        # 引用别名逃逸
+        "import sympy as sp\nf = eval\nf('1 + 1')\nsp.solve(sp.Symbol('x') - 1)\n",
+        "import sympy as sp\ng = getattr\nsp.solve(sp.Symbol('x') - 1)\n",
+        "import sympy as eval\n",
         # Attribute 末段匹配：即便挂在合法模块上也拦截
         "import sympy as sp\nsp.eval('1')\nsp.solve(sp.Symbol('x') - 1)\n",
     ],
@@ -130,12 +145,39 @@ def test_forbidden_call(code: str) -> None:
         "x = 1\nx.__class__\n",
         "__builtins__\n",
         "from sympy import __loader__\n",
+        # P12-A: 白名单模块链式属性逃逸 & 单下划线私有属性 & 敏感方法调用
+        "import sympy\nsympy.sys.modules['os'].system('echo pwned')\n",
+        "import fractions\nfractions.sys\n",
+        "import sympy\nsympy.os\n",
+        "import sympy\nsympy._private\n",
+        "from sympy import os as m\nm.system('id')\n",
+        "from sympy import _private as p\n",
+        "import sympy as sp\nx = sp.Symbol('x')\nx.read_text()\n",
+        "import sympy as sp\nm = sp.Symbol('x')\nm.popen('id')\n",
+        "import sympy as sp\nx = sp.Symbol('x')\nx.write_text('pwn')\n",
     ],
 )
 def test_forbidden_attr(code: str) -> None:
     result = validate_script_ast(code)
     assert result.ok is False
     assert result.reason == "FORBIDDEN_ATTR"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import sympy as sp\nsys.exit(0)\nsp.solve(sp.Symbol('x') - 1)\n",
+        "import sympy as sp\no = os\nsp.solve(sp.Symbol('x') - 1)\n",
+        "import sympy as sp\nb = builtins\nsp.solve(sp.Symbol('x') - 1)\n",
+        "import sympy as sp\ns = subprocess\nsp.solve(sp.Symbol('x') - 1)\n",
+        "import sympy as sp\np = pickle\nsp.solve(sp.Symbol('x') - 1)\n",
+        "import sympy as sys\n",
+    ],
+)
+def test_forbidden_name(code: str) -> None:
+    result = validate_script_ast(code)
+    assert result.ok is False
+    assert result.reason == "FORBIDDEN_NAME"
 
 
 @pytest.mark.parametrize("code", ["def f(:\n", "x =\n", "import\n"])
@@ -154,6 +196,14 @@ def test_syntax_error(code: str) -> None:
         "import sympy.abc\nimport math\nimport fractions\n"
         "from fractions import Fraction\nsympy.solve(sympy.abc.x - 1)\n",
         "import sympy as sp\nsp.Matrix([[1, 2], [3, 4]]).det()\nsp.solve(sp.Symbol('x'))\n",
+        # 合法数理变量名与循环占位 `_` 不被误杀
+        "import math\nfrom fractions import Fraction\nimport sympy as sp\n"
+        "def solve_kernel():\n"
+        "    x, y, t, m, g, v, F, E, N = sp.symbols('x y t m g v F E N')\n"
+        "    for _ in range(2):\n"
+        "        pass\n"
+        "    ans = sp.solve(sp.Eq(x + Fraction(1, 2), math.sqrt(9)), x)[0]\n"
+        "    return {'params': {'ans': str(ans)}, 'answer_latex': str(ans)}\n",
     ],
 )
 def test_ast_whitelist_accepts(code: str) -> None:
@@ -175,6 +225,30 @@ def test_valid_quadratic_script_runs() -> None:
     assert result.params == {"r1": 2, "r2": 3}
     assert result.answer_latex is not None
     assert "2, 3" in result.answer_latex
+
+
+def test_valid_sympy_fractions_math_script_runs() -> None:
+    code = r'''
+import math
+from fractions import Fraction
+import sympy as sp
+
+
+def solve_kernel():
+    x, y, t, m, g, v, F, E, N = sp.symbols("x y t m g v F E N")
+    eq = sp.Eq(2 * x + Fraction(1, 2), sp.Rational(int(math.sqrt(25)), 1))
+    sol = sp.solve(eq, x)[0]
+    ans = sp.sympify(sol)
+    return {
+        "params": {"ans": str(ans)},
+        "answer_latex": sp.latex(ans),
+    }
+'''
+    result = run_sympy_in_sandbox(code)
+    assert result.ok is True
+    assert result.error_kind is None
+    assert result.params == {"ans": "9/4"}
+    assert result.answer_latex == r"\frac{9}{4}"
 
 
 def test_ast_rejected_never_spawns_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:

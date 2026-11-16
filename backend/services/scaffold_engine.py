@@ -57,6 +57,7 @@ __all__ = [
     "in_flight_prewarm_tasks",
     "prewarm_session_questions",
     "retry_prewarm",
+    "schedule_session_prewarm",
     "submit_stage_answer",
 ]
 
@@ -277,6 +278,8 @@ def _parse_db_timestamp(value: str) -> datetime:
         parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
+    else:
+        parsed = parsed.astimezone(UTC)
     return parsed
 
 
@@ -445,7 +448,7 @@ def _ensure_prewarm_task(
     task = asyncio.create_task(
         prewarm_session_questions(
             session_id,
-            db_path,
+            db_path=db_path,
             refresh_scaffold=refresh_scaffold,
             refresh_variant=refresh_variant,
             exclude_uids=exclude_uids,
@@ -459,6 +462,50 @@ def _ensure_prewarm_task(
 
     task.add_done_callback(_cleanup)
     return task
+
+
+def schedule_session_prewarm(
+    session_id: str,
+    *,
+    refresh_scaffold: bool = True,
+    refresh_variant: bool = True,
+    db_path: Path | None = None,
+) -> asyncio.Task[None] | None:
+    """后台调度会话预热：标记 RUNNING 并登记在途 Task，立即返回不阻塞调用方。
+
+    若已有未完成的在途 Task 直接复用；会话已完成或所需产物均已就绪且无需刷新时返回 None。
+    """
+    existing = in_flight_prewarm_tasks.get(session_id)
+    if existing is not None and not existing.done():
+        return existing
+    with get_db_connection(db_path) as conn:
+        session = _load_session(conn, session_id)
+        if str(session["micro_stage"]) == "SESSION_COMPLETED":
+            return None
+        status = str(session["prewarm_status"])
+        need_scaffold = refresh_scaffold or session["prewarm_scaffold_uid"] is None
+        need_variant = refresh_variant or session["prewarm_variant_uid"] is None
+        if status in ("READY_SYMPY", "READY_FALLBACK") and not need_scaffold and not need_variant:
+            return None
+        clear_cols: list[str] = []
+        if status != "RUNNING":
+            clear_cols.append("prewarm_status = 'RUNNING'")
+        if refresh_scaffold and session["prewarm_scaffold_uid"] is not None:
+            clear_cols.append("prewarm_scaffold_uid = NULL")
+        if refresh_variant and session["prewarm_variant_uid"] is not None:
+            clear_cols.append("prewarm_variant_uid = NULL")
+        if clear_cols:
+            conn.execute(
+                f"UPDATE diagnostic_sessions SET {', '.join(clear_cols)}, "
+                "updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (session_id,),
+            )
+    return _ensure_prewarm_task(
+        session_id,
+        db_path,
+        refresh_scaffold=refresh_scaffold,
+        refresh_variant=refresh_variant,
+    )
 
 
 async def prewarm_session_questions(

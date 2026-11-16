@@ -32,7 +32,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -69,8 +69,8 @@ from backend.services.scaffold_engine import (
     SessionStepResponse,
     confirm_diagnostic_gate,
     get_session_view,
-    prewarm_session_questions,
     retry_prewarm,
+    schedule_session_prewarm,
     submit_stage_answer,
 )
 
@@ -669,13 +669,13 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
         active_date: Annotated[date | None, Query()] = None,
     ) -> list[BlindDrillItemDTO]:
         """指定学段当日盲测题单（P10-E：grade_subject 必填，每学段独立配额）。"""
-        day = active_date if active_date is not None else date.today()
+        day = active_date if active_date is not None else datetime.now(UTC).date()
         with get_db_connection() as conn:
             return get_daily_blind_drill_queue(conn, day, grade_subject=grade_subject)
 
     @app.post("/api/v1/drills/daily", response_model=BlindDrillOutcomeDTO)
     async def submit_drill(body: BlindDrillSubmitRequest) -> BlindDrillOutcomeDTO:
-        day = body.active_date if body.active_date is not None else date.today()
+        day = body.active_date if body.active_date is not None else datetime.now(UTC).date()
 
         def _run_submit() -> BlindDrillOutcomeDTO:
             with get_db_connection() as conn:
@@ -689,7 +689,7 @@ def create_app(frontend_dir: Path | None = None) -> FastAPI:
 
         outcome = await asyncio.to_thread(_run_submit)
         if outcome.retrain_session_id:
-            await prewarm_session_questions(
+            schedule_session_prewarm(
                 outcome.retrain_session_id,
                 refresh_scaffold=outcome.retrain_stage != "STAGE_4_DECRUTCH_VARIANT",
             )

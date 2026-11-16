@@ -29,6 +29,7 @@ from backend.services.scaffold_engine import (
     in_flight_prewarm_tasks,
     prewarm_session_questions,
     retry_prewarm,
+    schedule_session_prewarm,
     submit_stage_answer,
 )
 from backend.services.vlm_diagnosis import DiagnosisPayload
@@ -930,6 +931,42 @@ async def test_retry_prewarm_completed_rejected(
     await confirm_diagnostic_gate(sid, 2, "ALREADY_MASTERED", db_path=tmp_db)
     with pytest.raises(ValueError, match="会话已完成"):
         await retry_prewarm(sid, tmp_db)
+
+
+async def test_schedule_session_prewarm_sets_running_and_deduplicates(
+    tmp_db: Path, install_diagnosis: Any
+) -> None:
+    gate = await _concept_session(tmp_db, install_diagnosis)
+    sid = gate.session_id
+    # 尚未过门禁的会话 prewarm_status='IDLE'，验证 schedule_session_prewarm 写 RUNNING 并去重
+    task1 = schedule_session_prewarm(sid, db_path=tmp_db)
+    assert task1 is not None
+    assert in_flight_prewarm_tasks.get(sid) is task1
+    row = _one(
+        tmp_db,
+        "SELECT prewarm_status FROM diagnostic_sessions WHERE session_id = ?",
+        (sid,),
+    )
+    assert row["prewarm_status"] == "RUNNING"
+
+    task2 = schedule_session_prewarm(sid, db_path=tmp_db)
+    assert task2 is task1
+    await task1
+    assert sid not in in_flight_prewarm_tasks
+    done_row = _one(
+        tmp_db,
+        "SELECT prewarm_status FROM diagnostic_sessions WHERE session_id = ?",
+        (sid,),
+    )
+    assert done_row["prewarm_status"] in ("READY_SYMPY", "READY_FALLBACK")
+
+    # 已完成会话返回 None，不启动新任务
+    _execute(
+        tmp_db,
+        "UPDATE diagnostic_sessions SET micro_stage = 'SESSION_COMPLETED' WHERE session_id = ?",
+        (sid,),
+    )
+    assert schedule_session_prewarm(sid, db_path=tmp_db) is None
 
 
 # ---------------------------------------------------------------------------
