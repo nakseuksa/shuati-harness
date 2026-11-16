@@ -292,6 +292,9 @@ def test_clamp_rejects_non_int_raw(bad: object) -> None:
 # ===========================================================================
 
 ELO_MODULE = "电磁学"
+# P10-B：Elo 按 (学段, L1 模块) 分区核算，夹具默认学段见 _elo_make_question 的 grade。
+ELO_GRADE = "高中物理-高二"
+ELO_GRADE_B = "高中数学-高三"
 
 
 @pytest.fixture()
@@ -308,14 +311,15 @@ def _elo_make_question(
     base_elo: int,
     module: str = ELO_MODULE,
     mastery: str = "ACTIVE",
+    grade: str = ELO_GRADE,
 ) -> None:
     conn.execute(
         "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
         " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
         " base_elo, tier, primary_l1_module, mastery_state)"
-        " VALUES (?, 'USER_CANONICAL', '高中物理-高二', '题干', ?, '42', 2, 2, 2, 2,"
+        " VALUES (?, 'USER_CANONICAL', ?, '题干', ?, '42', 2, 2, 2, 2,"
         " ?, 'L3_综合中档', ?, ?)",
-        (uid, f"hash-{uid}", base_elo, module, mastery),
+        (uid, grade, f"hash-{uid}", base_elo, module, mastery),
     )
 
 
@@ -327,9 +331,14 @@ def _elo_pool(conn: sqlite3.Connection, uid: str) -> sqlite3.Row:
     return row
 
 
-def _elo_events(conn: sqlite3.Connection, module: str) -> list[sqlite3.Row]:
+def _elo_events(
+    conn: sqlite3.Connection, module: str, grade: str = ELO_GRADE
+) -> list[sqlite3.Row]:
+    """P10-B：(学段, 模块) 分区内的事件流（按 event_id 升序）。"""
     cur = conn.execute(
-        "SELECT * FROM elo_mutation_ledger WHERE l1_module = ? ORDER BY event_id", (module,)
+        "SELECT * FROM elo_mutation_ledger WHERE grade_subject = ? AND l1_module = ?"
+        " ORDER BY event_id",
+        (grade, module),
     )
     cur.row_factory = sqlite3.Row
     return cur.fetchall()
@@ -345,17 +354,22 @@ def _elo_set_slated(
     )
 
 
-def _elo_assert_chain(conn: sqlite3.Connection, module: str) -> None:
-    """账本链完整性：冷启动起点、before/after 逐事件衔接、任何事件后不倒挂。"""
+def _elo_assert_chain(
+    conn: sqlite3.Connection, module: str, grade: str = ELO_GRADE
+) -> None:
+    """账本链完整性：冷启动起点、before/after 逐事件衔接、任何事件后不倒挂。
+
+    P10-B：链衔接与终态比对都在 (学段, 模块) 分区内进行。
+    """
     prev_cov = prev_combat = settings.MODULE_ELO_INITIAL
-    for row in _elo_events(conn, module):
+    for row in _elo_events(conn, module, grade):
         assert row["coverage_elo_before"] == pytest.approx(prev_cov)
         assert row["combat_elo_before"] == pytest.approx(prev_combat)
         assert row["combat_elo_after"] <= row["coverage_elo_after"]
         assert row["explanation_text"]
         prev_cov = row["coverage_elo_after"]
         prev_combat = row["combat_elo_after"]
-    state = get_module_elo(conn, module)
+    state = get_module_elo(conn, grade, module)
     assert state.coverage_elo == pytest.approx(prev_cov)
     assert state.combat_elo == pytest.approx(prev_combat)
     assert state.combat_elo <= state.coverage_elo
@@ -368,9 +382,10 @@ def _elo_setup_decay_question(
     exposure: int,
     drill_date: str | None,
     base_elo: int = 1600,
+    grade: str = ELO_GRADE,
 ) -> None:
     """构造一道已冻结待盲测、PENDING_RETEST、指定曝光/排期的题（直接 SQL + 切片 A）。"""
-    _elo_make_question(conn, uid, base_elo=base_elo, mastery="PENDING_RETEST")
+    _elo_make_question(conn, uid, base_elo=base_elo, mastery="PENDING_RETEST", grade=grade)
     apply_draft_subgoal_floor(conn, uid, "s1", d_sub=1400)
     freeze_decrutch_escrow(conn, uid, "s1")
     _elo_set_slated(conn, uid, drill_date=drill_date, exposure=exposure)
@@ -390,7 +405,7 @@ def test_elo_full_flow_conservation_and_direct_comparison(elo_conn: sqlite3.Conn
     conn = elo_conn
     d_orig, d_sub = 1600, 1400
     _elo_make_question(conn, "q-flow", base_elo=d_orig)
-    initial = get_module_elo(conn, ELO_MODULE)
+    initial = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     assert initial == DualEloState(1200.0, 1200.0)
     snapshot = initial.combat_elo
 
@@ -410,7 +425,7 @@ def test_elo_full_flow_conservation_and_direct_comparison(elo_conn: sqlite3.Conn
     assert realize.applied
     assert _elo_pool(conn, "q-flow")["escrow_status"] == "REALIZED_MASTERED"
 
-    final = get_module_elo(conn, ELO_MODULE)
+    final = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     net = final.combat_elo - snapshot
     assert net == pytest.approx(target, abs=1e-9)
     assert floor_delta + escrow == pytest.approx(target, abs=1e-9)
@@ -433,7 +448,7 @@ def test_elo_conservation_without_floor(elo_conn: sqlite3.Connection) -> None:
     target = settings.K_COMBAT * (1.0 - expected_pass(1200.0, 1600.0))
     assert _elo_pool(conn, "q-nf")["escrow_combat_delta"] == pytest.approx(target, abs=1e-9)
     realize_or_forfeit_blind_test(conn, "q-nf", "s-blind", passed=True)
-    net = get_module_elo(conn, ELO_MODULE).combat_elo - 1200.0
+    net = get_module_elo(conn, ELO_GRADE, ELO_MODULE).combat_elo - 1200.0
     assert net == pytest.approx(target, abs=1e-9)
     _elo_assert_chain(conn, ELO_MODULE)
 
@@ -459,7 +474,7 @@ def test_elo_realize_with_decay_factor_conservation(elo_conn: sqlite3.Connection
 
     pool2 = _elo_pool(conn, "q-dec")
     assert pool2["floor_elo_applied"] == pytest.approx(floor_delta, abs=1e-9)  # floor 不受影响
-    net = get_module_elo(conn, ELO_MODULE).combat_elo - snapshot
+    net = get_module_elo(conn, ELO_GRADE, ELO_MODULE).combat_elo - snapshot
     assert net == pytest.approx(floor_delta + escrow * 0.7, abs=1e-9)
     assert net == pytest.approx(target - escrow * 0.3, abs=1e-9)
     assert net < target  # 折减
@@ -478,7 +493,7 @@ def test_elo_no_inversion_across_full_mixed_sequence(elo_conn: sqlite3.Connectio
         _elo_make_question(conn, uid, base_elo=elo)
 
     def check() -> None:
-        state = get_module_elo(conn, ELO_MODULE)
+        state = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
         assert state.combat_elo <= state.coverage_elo
         _elo_assert_chain(conn, ELO_MODULE)
 
@@ -523,7 +538,7 @@ def test_elo_forfeit_clears_escrow_and_idempotent(elo_conn: sqlite3.Connection) 
     _elo_make_question(conn, "q-for", base_elo=1600)
     apply_draft_subgoal_floor(conn, "q-for", "s1", d_sub=1400)
     freeze_decrutch_escrow(conn, "q-for", "s1")
-    before = get_module_elo(conn, ELO_MODULE)
+    before = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     assert _elo_pool(conn, "q-for")["escrow_combat_delta"] > 0
     count_before = len(_elo_events(conn, ELO_MODULE))
 
@@ -531,7 +546,7 @@ def test_elo_forfeit_clears_escrow_and_idempotent(elo_conn: sqlite3.Connection) 
     assert result.event_id is None
     assert result.combat_before == result.combat_after
     assert result.coverage_before == result.coverage_after
-    assert get_module_elo(conn, ELO_MODULE) == before  # combat/cov 分文不动
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before  # combat/cov 分文不动
     pool = _elo_pool(conn, "q-for")
     assert pool["escrow_combat_delta"] == 0.0
     assert pool["escrow_status"] == "FORFEITED_RESET"
@@ -544,7 +559,7 @@ def test_elo_forfeit_clears_escrow_and_idempotent(elo_conn: sqlite3.Connection) 
     assert not cross.applied
     pool2 = _elo_pool(conn, "q-for")
     assert pool2["escrow_status"] == "FORFEITED_RESET" and pool2["escrow_combat_delta"] == 0.0
-    assert get_module_elo(conn, ELO_MODULE) == before
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before
     assert len(_elo_events(conn, ELO_MODULE)) == count_before
 
 
@@ -556,7 +571,7 @@ def test_elo_realize_idempotent(elo_conn: sqlite3.Connection) -> None:
     first = realize_or_forfeit_blind_test(conn, "q-ri", "s-blind", passed=True)
     assert first.applied
     count = len(_elo_events(conn, ELO_MODULE))
-    state = get_module_elo(conn, ELO_MODULE)
+    state = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     second = realize_or_forfeit_blind_test(conn, "q-ri", "s-blind", passed=True)
     assert not second.applied
     assert second.event_id == first.event_id
@@ -564,7 +579,7 @@ def test_elo_realize_idempotent(elo_conn: sqlite3.Connection) -> None:
     third = realize_or_forfeit_blind_test(conn, "q-ri", "s-other", passed=True)
     assert not third.applied
     assert len(_elo_events(conn, ELO_MODULE)) == count
-    assert get_module_elo(conn, ELO_MODULE) == state
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == state
 
 
 # ---------------------------------------------------------------------------
@@ -586,11 +601,11 @@ def test_elo_decay_exposure_threshold(
     conn = elo_conn
     today = date(2026, 11, 12)
     _elo_setup_decay_question(conn, "q-d", exposure=exposure, drill_date=today.isoformat())
-    before = get_module_elo(conn, ELO_MODULE)
+    before = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     n = apply_overdue_escrow_decay(conn, today)
     assert n == expected_count
     assert _elo_pool(conn, "q-d")["decay_factor"] == pytest.approx(expected_factor)
-    assert get_module_elo(conn, ELO_MODULE) == before  # 基线不变
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before  # 基线不变
     decay_events = [
         e for e in _elo_events(conn, ELO_MODULE) if e["mutation_trigger"] == "ESCROW_TIMEOUT_DECAY"
     ]
@@ -610,10 +625,10 @@ def test_elo_decay_skips_not_slated_today(
     conn = elo_conn
     today = date(2026, 11, 12)
     _elo_setup_decay_question(conn, "q-def", exposure=4, drill_date=drill_date)
-    before = get_module_elo(conn, ELO_MODULE)
+    before = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     assert apply_overdue_escrow_decay(conn, today) == 0
     assert _elo_pool(conn, "q-def")["decay_factor"] == 1.0
-    assert get_module_elo(conn, ELO_MODULE) == before
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before
     assert not [
         e for e in _elo_events(conn, ELO_MODULE) if e["mutation_trigger"] == "ESCROW_TIMEOUT_DECAY"
     ]
@@ -626,11 +641,11 @@ def test_elo_decay_same_day_idempotent(elo_conn: sqlite3.Connection) -> None:
     assert apply_overdue_escrow_decay(conn, today) == 1
     factor1 = _elo_pool(conn, "q-idem")["decay_factor"]
     count1 = len(_elo_events(conn, ELO_MODULE))
-    before = get_module_elo(conn, ELO_MODULE)
+    before = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     assert apply_overdue_escrow_decay(conn, today) == 0  # 同日二次不重复衰减
     assert _elo_pool(conn, "q-idem")["decay_factor"] == factor1
     assert len(_elo_events(conn, ELO_MODULE)) == count1
-    assert get_module_elo(conn, ELO_MODULE) == before
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before
 
 
 def test_elo_decay_floor_at_zero(elo_conn: sqlite3.Connection) -> None:
@@ -638,17 +653,17 @@ def test_elo_decay_floor_at_zero(elo_conn: sqlite3.Connection) -> None:
     today = date(2026, 11, 12)
     _elo_setup_decay_question(conn, "q-zero", exposure=4, drill_date=today.isoformat())
     conn.execute("UPDATE question_escrow_pool SET decay_factor=0.1 WHERE question_uid='q-zero'")
-    before = get_module_elo(conn, ELO_MODULE)
+    before = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     assert apply_overdue_escrow_decay(conn, today) == 1
     assert _elo_pool(conn, "q-zero")["decay_factor"] == 0.0  # max(0, 0.1-0.15)=0
-    assert get_module_elo(conn, ELO_MODULE) == before
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before
 
 
 def test_elo_decay_multi_day_reaches_zero_never_negative(elo_conn: sqlite3.Connection) -> None:
     conn = elo_conn
     start = date(2026, 11, 12)
     _elo_setup_decay_question(conn, "q-multi", exposure=4, drill_date=start.isoformat())
-    before = get_module_elo(conn, ELO_MODULE)
+    before = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     factors: list[float] = []
     for i in range(9):
         day = start + timedelta(days=i)
@@ -657,7 +672,7 @@ def test_elo_decay_multi_day_reaches_zero_never_negative(elo_conn: sqlite3.Conne
         factor = float(_elo_pool(conn, "q-multi")["decay_factor"])
         factors.append(factor)
         assert factor >= 0.0
-        assert get_module_elo(conn, ELO_MODULE) == before  # 基线逐事件不变
+        assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before  # 基线逐事件不变
     assert factors[6] == pytest.approx(0.0)  # 1.0 - 0.15*7 < 0 → 截断为 0
     assert factors[7] == 0.0 and factors[8] == 0.0
     assert all(a >= b for a, b in zip(factors, factors[1:], strict=False))
@@ -701,10 +716,10 @@ def test_elo_replay_matches_get_module_elo_all_triggers(elo_conn: sqlite3.Connec
         "BLIND_TEST_REALIZE",
         "ESCROW_TIMEOUT_DECAY",
     }
-    state = get_module_elo(conn, ELO_MODULE)
-    rebuilt = replay_module_elo_from_ledger(conn, ELO_MODULE)
+    state = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
+    rebuilt = replay_module_elo_from_ledger(conn, ELO_GRADE, ELO_MODULE)
     assert rebuilt == state
-    assert replay_module_elo_from_ledger(conn, ELO_MODULE) == rebuilt  # 确定性
+    assert replay_module_elo_from_ledger(conn, ELO_GRADE, ELO_MODULE) == rebuilt  # 确定性
     assert rebuilt.combat_elo <= rebuilt.coverage_elo
     _elo_assert_chain(conn, ELO_MODULE)
 
@@ -726,14 +741,14 @@ def test_elo_replay_tampered_middle_after_raises(elo_conn: sqlite3.Connection) -
         (mid["event_id"],),
     )
     with pytest.raises(ValueError, match="断链"):
-        replay_module_elo_from_ledger(conn, ELO_MODULE)
+        replay_module_elo_from_ledger(conn, ELO_GRADE, ELO_MODULE)
 
 
 def test_elo_replay_empty_module(elo_conn: sqlite3.Connection) -> None:
     conn = elo_conn
-    state = replay_module_elo_from_ledger(conn, "不存在的模块")
+    state = replay_module_elo_from_ledger(conn, ELO_GRADE, "不存在的模块")
     assert state == DualEloState(1200.0, 1200.0)
-    assert state == get_module_elo(conn, "不存在的模块")
+    assert state == get_module_elo(conn, ELO_GRADE, "不存在的模块")
 
 
 # ---------------------------------------------------------------------------
@@ -750,11 +765,11 @@ def test_elo_realize_not_frozen_noop(elo_conn: sqlite3.Connection) -> None:
     conn = elo_conn
     _elo_make_question(conn, "q-nofreeze", base_elo=1600)
     apply_draft_subgoal_floor(conn, "q-nofreeze", "s1", d_sub=1400)  # 仅 FLOOR_ONLY
-    before = get_module_elo(conn, ELO_MODULE)
+    before = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
     result = realize_or_forfeit_blind_test(conn, "q-nofreeze", "s-blind", passed=True)
     assert not result.applied and result.event_id is None
     assert result.combat_before == result.combat_after
-    assert get_module_elo(conn, ELO_MODULE) == before
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before
     assert _elo_pool(conn, "q-nofreeze")["escrow_status"] == "FLOOR_ONLY"
 
 
@@ -819,3 +834,138 @@ def test_elo_slice_b_functions_never_commit(tmp_db: Path) -> None:
         assert row is not None and row[0] == 0
     finally:
         conn.close()
+
+
+# ===========================================================================
+# P10-B：Elo 学段分区（分区内守恒 / 衰减全局性 / replay 分区精度 / 事件学段派生）
+# ===========================================================================
+
+ELO_SHARED_MODULE = "方程与不等式"
+
+
+def test_elo_partition_conservation_same_module_two_grades(
+    elo_conn: sqlite3.Connection,
+) -> None:
+    """同一 L1 模块名在两个学段各自 1200 起算，保底→冻结→兑现各自严格守恒。"""
+    conn = elo_conn
+    d_orig, d_sub = 1600, 1400
+    target = settings.K_COMBAT * (1.0 - expected_pass(1200.0, d_orig))
+    nets: dict[str, float] = {}
+    for uid, grade in (("cg-a", ELO_GRADE), ("cg-b", ELO_GRADE_B)):
+        _elo_make_question(conn, uid, base_elo=d_orig, module=ELO_SHARED_MODULE, grade=grade)
+        assert get_module_elo(conn, grade, ELO_SHARED_MODULE) == DualEloState(1200.0, 1200.0)
+
+        floor = apply_draft_subgoal_floor(conn, uid, f"s-{uid}", d_sub=d_sub)
+        assert floor.applied and floor.combat_before == 1200.0  # 分区内冷启动
+        floor_delta = floor.combat_after - floor.combat_before
+        assert freeze_decrutch_escrow(conn, uid, f"s-{uid}").applied
+        escrow = float(_elo_pool(conn, uid)["escrow_combat_delta"])
+        # 分区内守恒：Δfloor + escrow ≡ Δtarget
+        assert floor_delta + escrow == pytest.approx(target, abs=1e-9)
+
+        realize = realize_or_forfeit_blind_test(conn, uid, f"s-{uid}-blind", passed=True)
+        assert realize.applied
+        net = get_module_elo(conn, grade, ELO_SHARED_MODULE).combat_elo - 1200.0
+        assert net == pytest.approx(target, abs=1e-9)
+        nets[grade] = net
+
+    # 两学段各自独立守恒（不存在跨学段累加串扰）
+    assert nets[ELO_GRADE] == pytest.approx(target, abs=1e-9)
+    assert nets[ELO_GRADE_B] == pytest.approx(target, abs=1e-9)
+    _elo_assert_chain(conn, ELO_SHARED_MODULE, ELO_GRADE)
+    _elo_assert_chain(conn, ELO_SHARED_MODULE, ELO_GRADE_B)
+
+
+def test_elo_decay_is_global_across_grades(elo_conn: sqlite3.Connection) -> None:
+    """衰减全局维护：一次 apply_overdue_escrow_decay 让两个学段的逾期题均衰减。"""
+    conn = elo_conn
+    today = date(2026, 11, 12)
+    _elo_setup_decay_question(
+        conn, "dg-a", exposure=4, drill_date=today.isoformat(), grade=ELO_GRADE
+    )
+    _elo_setup_decay_question(
+        conn, "dg-b", exposure=4, drill_date=today.isoformat(), grade=ELO_GRADE_B
+    )
+    before_a = get_module_elo(conn, ELO_GRADE, ELO_MODULE)
+    before_b = get_module_elo(conn, ELO_GRADE_B, ELO_MODULE)
+
+    assert apply_overdue_escrow_decay(conn, today) == 2  # 跨学段全局维护
+    assert _elo_pool(conn, "dg-a")["decay_factor"] == pytest.approx(0.85)
+    assert _elo_pool(conn, "dg-b")["decay_factor"] == pytest.approx(0.85)
+    # 基线分文不动（两学段各自不变）
+    assert get_module_elo(conn, ELO_GRADE, ELO_MODULE) == before_a
+    assert get_module_elo(conn, ELO_GRADE_B, ELO_MODULE) == before_b
+    # 衰减事件按题目所属学段落账
+    for grade, uid in ((ELO_GRADE, "dg-a"), (ELO_GRADE_B, "dg-b")):
+        decay_events = [
+            e
+            for e in _elo_events(conn, ELO_MODULE, grade)
+            if e["mutation_trigger"] == "ESCROW_TIMEOUT_DECAY"
+        ]
+        assert len(decay_events) == 1
+        assert decay_events[0]["grade_subject"] == grade
+        assert decay_events[0]["question_uid"] == uid
+        assert decay_events[0]["combat_elo_before"] == decay_events[0]["combat_elo_after"]
+        assert decay_events[0]["coverage_elo_before"] == decay_events[0]["coverage_elo_after"]
+    # 同日幂等键仍保证不重复衰减
+    assert apply_overdue_escrow_decay(conn, today) == 0
+    assert _elo_pool(conn, "dg-a")["decay_factor"] == pytest.approx(0.85)
+    _elo_assert_chain(conn, ELO_MODULE, ELO_GRADE)
+    _elo_assert_chain(conn, ELO_MODULE, ELO_GRADE_B)
+
+
+def test_elo_slice_b_events_write_question_grade(elo_conn: sqlite3.Connection) -> None:
+    """切片 B 事件（含衰减/兑现）的 grade_subject 亦由题目行自派生。"""
+    conn = elo_conn
+    today = date(2026, 11, 12)
+    _elo_make_question(
+        conn, "gb-init", base_elo=1600, module=ELO_MODULE, grade=ELO_GRADE_B
+    )
+    record_mastered_init(conn, "gb-init", "s0")
+    _elo_setup_decay_question(
+        conn, "gb-flow", exposure=4, drill_date=today.isoformat(), grade=ELO_GRADE_B
+    )
+    assert apply_overdue_escrow_decay(conn, today) == 1
+    assert realize_or_forfeit_blind_test(conn, "gb-flow", "s-blind", passed=True).applied
+
+    events = _elo_events(conn, ELO_MODULE, ELO_GRADE_B)
+    assert {e["mutation_trigger"] for e in events} == {
+        "MASTERED_INIT",
+        "PARTIAL_DRAFT_SUBGOAL_FLOOR",
+        "SCAFFOLD_COVER_GAIN",
+        "ESCROW_TIMEOUT_DECAY",
+        "BLIND_TEST_REALIZE",
+    }
+    assert all(e["grade_subject"] == ELO_GRADE_B for e in events)
+    # 默认学段分区零事件
+    assert _elo_events(conn, ELO_MODULE, ELO_GRADE) == []
+    _elo_assert_chain(conn, ELO_MODULE, ELO_GRADE_B)
+
+
+def test_elo_replay_scoped_by_grade(elo_conn: sqlite3.Connection) -> None:
+    """replay 按 (学段, 模块) 精确重建；一个分区断链不影响另一分区。"""
+    conn = elo_conn
+    _elo_make_question(conn, "rp-a", base_elo=1600, module=ELO_SHARED_MODULE, grade=ELO_GRADE)
+    _elo_make_question(
+        conn, "rp-b", base_elo=2000, module=ELO_SHARED_MODULE, grade=ELO_GRADE_B
+    )
+    apply_draft_subgoal_floor(conn, "rp-a", "s1", d_sub=1400)
+    freeze_decrutch_escrow(conn, "rp-a", "s1")
+    record_mastered_init(conn, "rp-b", "s2")
+
+    state_a = get_module_elo(conn, ELO_GRADE, ELO_SHARED_MODULE)
+    state_b = get_module_elo(conn, ELO_GRADE_B, ELO_SHARED_MODULE)
+    assert replay_module_elo_from_ledger(conn, ELO_GRADE, ELO_SHARED_MODULE) == state_a
+    assert replay_module_elo_from_ledger(conn, ELO_GRADE_B, ELO_SHARED_MODULE) == state_b
+    assert state_a != state_b  # 两分区取值独立
+
+    # 篡改 A 学段首个事件的 after：仅 A 分区断链，B 分区仍可确定性重放
+    tampered = _elo_events(conn, ELO_SHARED_MODULE, ELO_GRADE)[0]
+    conn.execute(
+        "UPDATE elo_mutation_ledger SET combat_elo_after = combat_elo_after + 50"
+        " WHERE event_id = ?",
+        (tampered["event_id"],),
+    )
+    with pytest.raises(ValueError, match="断链"):
+        replay_module_elo_from_ledger(conn, ELO_GRADE, ELO_SHARED_MODULE)
+    assert replay_module_elo_from_ledger(conn, ELO_GRADE_B, ELO_SHARED_MODULE) == state_b

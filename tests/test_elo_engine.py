@@ -36,6 +36,12 @@ from backend.services.elo_engine import (
 
 MODULE_A = "电磁学"
 MODULE_B = "解析几何"
+# P10-B：Elo 按 (学段, L1 模块) 分区核算，夹具默认学段见 _make_question 的 grade 参数。
+GRADE = "高中物理-高二"
+GRADE_B = "高中数学-高三"
+GRADE_C = "高中物理-高一"
+# 两学段可同名的 L1 模块（验证分区隔离而非模块名隔离）
+SHARED_MODULE = "方程与不等式"
 
 
 # ---------------------------------------------------------------------------
@@ -51,15 +57,20 @@ def conn(tmp_db: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _make_question(
-    conn: sqlite3.Connection, uid: str, *, base_elo: int, module: str = MODULE_A
+    conn: sqlite3.Connection,
+    uid: str,
+    *,
+    base_elo: int,
+    module: str = MODULE_A,
+    grade: str = GRADE,
 ) -> None:
     conn.execute(
         "INSERT INTO questions (question_uid, origin_type, target_grade_and_subject,"
         " stem_md, stem_hash, standard_answer_latex, c_score, s_score, t_score, l_score,"
         " base_elo, tier, primary_l1_module)"
-        " VALUES (?, 'USER_CANONICAL', '高中物理-高二', '题干', ?, '42', 2, 2, 2, 2,"
+        " VALUES (?, 'USER_CANONICAL', ?, '题干', ?, '42', 2, 2, 2, 2,"
         " ?, 'L3_综合中档', ?)",
-        (uid, f"hash-{uid}", base_elo, module),
+        (uid, grade, f"hash-{uid}", base_elo, module),
     )
 
 
@@ -82,10 +93,17 @@ def _event(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row:
     return row
 
 
-def _assert_ledger_chain(conn: sqlite3.Connection, module: str) -> None:
-    """账本链完整性：冷启动起点、before/after 逐事件衔接、任何事件后不倒挂。"""
+def _assert_ledger_chain(
+    conn: sqlite3.Connection, module: str, grade: str = GRADE
+) -> None:
+    """账本链完整性：冷启动起点、before/after 逐事件衔接、任何事件后不倒挂。
+
+    P10-B：链衔接在 (学段, 模块) 分区内校验。
+    """
     cur = conn.execute(
-        "SELECT * FROM elo_mutation_ledger WHERE l1_module = ? ORDER BY event_id", (module,)
+        "SELECT * FROM elo_mutation_ledger WHERE grade_subject = ? AND l1_module = ?"
+        " ORDER BY event_id",
+        (grade, module),
     )
     cur.row_factory = sqlite3.Row
     prev_cov = prev_combat = settings.MODULE_ELO_INITIAL
@@ -96,7 +114,7 @@ def _assert_ledger_chain(conn: sqlite3.Connection, module: str) -> None:
         assert row["explanation_text"]
         prev_cov = row["coverage_elo_after"]
         prev_combat = row["combat_elo_after"]
-    state = get_module_elo(conn, module)
+    state = get_module_elo(conn, grade, module)
     assert state.coverage_elo == pytest.approx(prev_cov)
     assert state.combat_elo == pytest.approx(prev_combat)
     assert state.combat_elo <= state.coverage_elo
@@ -198,19 +216,19 @@ def test_gamma_uses_settings_constants(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_module_elo_cold_start(conn: sqlite3.Connection) -> None:
-    state = get_module_elo(conn, MODULE_A)
+    state = get_module_elo(conn, GRADE, MODULE_A)
     assert state == DualEloState(coverage_elo=1200.0, combat_elo=1200.0)
-    assert get_module_elo(conn, "从未出现的模块") == state
+    assert get_module_elo(conn, GRADE, "从未出现的模块") == state
 
 
 def test_module_elo_folds_latest_event(conn: sqlite3.Connection) -> None:
     _make_question(conn, "q1", base_elo=1600)
     _make_question(conn, "q2", base_elo=2000)
     r1 = record_mastered_init(conn, "q1", "s1")
-    assert get_module_elo(conn, MODULE_A) == DualEloState(r1.coverage_after, r1.combat_after)
+    assert get_module_elo(conn, GRADE, MODULE_A) == DualEloState(r1.coverage_after, r1.combat_after)
     r2 = record_mastered_init(conn, "q2", "s2")
     assert r2.combat_after > r1.combat_after
-    assert get_module_elo(conn, MODULE_A) == DualEloState(r2.coverage_after, r2.combat_after)
+    assert get_module_elo(conn, GRADE, MODULE_A) == DualEloState(r2.coverage_after, r2.combat_after)
     _assert_ledger_chain(conn, MODULE_A)
 
 
@@ -220,10 +238,10 @@ def test_module_elo_isolation(conn: sqlite3.Connection) -> None:
     ra = record_mastered_init(conn, "qa", "sa")
     assert ra.applied
     # A 模块的事件绝不串扰 B 模块
-    assert get_module_elo(conn, MODULE_B) == DualEloState(1200.0, 1200.0)
+    assert get_module_elo(conn, GRADE, MODULE_B) == DualEloState(1200.0, 1200.0)
     rb = record_mastered_init(conn, "qb", "sb")
     assert rb.combat_before == 1200.0
-    assert get_module_elo(conn, MODULE_A) == DualEloState(ra.coverage_after, ra.combat_after)
+    assert get_module_elo(conn, GRADE, MODULE_A) == DualEloState(ra.coverage_after, ra.combat_after)
     _assert_ledger_chain(conn, MODULE_A)
     _assert_ledger_chain(conn, MODULE_B)
 
@@ -278,7 +296,7 @@ def test_mastered_init_far_below_watermark_no_event(conn: sqlite3.Connection) ->
         uid = f"q-push-{i}"
         _make_question(conn, uid, base_elo=2800)
         record_mastered_init(conn, uid, f"s{i}")
-    state = get_module_elo(conn, MODULE_A)
+    state = get_module_elo(conn, GRADE, MODULE_A)
     assert state.combat_elo > 1300.0
     _make_question(conn, "q-floor-elo", base_elo=800)
     count_before = _ledger_count(conn)
@@ -289,7 +307,7 @@ def test_mastered_init_far_below_watermark_no_event(conn: sqlite3.Connection) ->
     assert result.coverage_before == result.coverage_after == state.coverage_elo
     assert _ledger_count(conn) == count_before  # γ=0 不写事件
     assert "不加分" in result.explanation_text
-    assert get_module_elo(conn, MODULE_A) == state
+    assert get_module_elo(conn, GRADE, MODULE_A) == state
 
 
 def test_mastered_init_keeps_cov_when_combat_stays_below(conn: sqlite3.Connection) -> None:
@@ -323,7 +341,7 @@ def test_mastered_init_idempotent(conn: sqlite3.Connection) -> None:
     assert second.combat_after == first.combat_after
     assert second.explanation_text == first.explanation_text
     assert _ledger_count(conn) == count
-    assert get_module_elo(conn, MODULE_A) == DualEloState(
+    assert get_module_elo(conn, GRADE, MODULE_A) == DualEloState(
         first.coverage_after, first.combat_after
     )
 
@@ -541,7 +559,7 @@ def test_freeze_cov_settled_breaker_cross_session(conn: sqlite3.Connection) -> N
     assert second.event_id == first.event_id  # 回读原结算事件快照
     assert second.coverage_after == first.coverage_after
     assert _ledger_count(conn) == count
-    assert get_module_elo(conn, MODULE_A) == DualEloState(
+    assert get_module_elo(conn, GRADE, MODULE_A) == DualEloState(
         first.coverage_after, first.combat_after
     )
 
@@ -570,7 +588,7 @@ def test_freeze_target_uses_snapshot_not_current_combat(conn: sqlite3.Connection
     floor = apply_draft_subgoal_floor(conn, "q-snap", "s1", d_sub=1400)
     # 其他题目把模块实战分推高后，target 仍必须基于入库快照 1200 核算
     record_mastered_init(conn, "q-other", "s2")
-    current = get_module_elo(conn, MODULE_A)
+    current = get_module_elo(conn, GRADE, MODULE_A)
     assert current.combat_elo > floor.combat_after
     result = freeze_decrutch_escrow(conn, "q-snap", "s1")
     assert result.applied
@@ -637,7 +655,7 @@ def test_no_inversion_across_mixed_sequence(conn: sqlite3.Connection) -> None:
         assert result.combat_after <= result.coverage_after
         assert result.combat_before <= result.coverage_before
         for module in (MODULE_A, MODULE_B):
-            state = get_module_elo(conn, module)
+            state = get_module_elo(conn, GRADE, module)
             assert state.combat_elo <= state.coverage_elo
     _assert_ledger_chain(conn, MODULE_A)
     _assert_ledger_chain(conn, MODULE_B)
@@ -808,3 +826,97 @@ def test_result_dataclasses_are_frozen() -> None:
     )
     with pytest.raises(FrozenInstanceError):
         result.applied = True  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# P10-B：Elo 按 (学段, L1 模块) 分区核算（跨学段隔离 / 学段派生 / 解释条前缀）
+# ---------------------------------------------------------------------------
+
+
+def test_grade_partition_isolated_for_same_module_name(conn: sqlite3.Connection) -> None:
+    """不同学段的同名 L1 模块各自 1200 起算，A 学段事件不影响 B 学段折叠值。"""
+    _make_question(conn, "qa", base_elo=2000, module=SHARED_MODULE, grade=GRADE)
+    _make_question(conn, "qb", base_elo=1600, module=SHARED_MODULE, grade=GRADE_B)
+    # 两个分区均从冷启动 1200/1200 起算
+    assert get_module_elo(conn, GRADE, SHARED_MODULE) == DualEloState(1200.0, 1200.0)
+    assert get_module_elo(conn, GRADE_B, SHARED_MODULE) == DualEloState(1200.0, 1200.0)
+    # 未出现在任何学段的模块组合同样是冷启动
+    assert get_module_elo(conn, GRADE_C, SHARED_MODULE) == DualEloState(1200.0, 1200.0)
+
+    ra = record_mastered_init(conn, "qa", "sa")
+    assert ra.applied and ra.combat_before == 1200.0
+    # A 学段事件绝不串扰 B 学段同名模块
+    assert get_module_elo(conn, GRADE_B, SHARED_MODULE) == DualEloState(1200.0, 1200.0)
+    assert get_module_elo(conn, GRADE, SHARED_MODULE) == DualEloState(
+        ra.coverage_after, ra.combat_after
+    )
+
+    rb = record_mastered_init(conn, "qb", "sb")
+    assert rb.applied and rb.combat_before == 1200.0  # B 学段仍从冷启动起算
+    assert get_module_elo(conn, GRADE_B, SHARED_MODULE) == DualEloState(
+        rb.coverage_after, rb.combat_after
+    )
+    # get_module_elo 按 (学段, 模块) 精确返回
+    assert get_module_elo(conn, GRADE, SHARED_MODULE) == DualEloState(
+        ra.coverage_after, ra.combat_after
+    )
+    _assert_ledger_chain(conn, SHARED_MODULE, GRADE)
+    _assert_ledger_chain(conn, SHARED_MODULE, GRADE_B)
+
+
+def test_grade_partition_isolated_for_same_grade_other_module(
+    conn: sqlite3.Connection,
+) -> None:
+    """同一学段内不同 L1 模块各自独立（分区为二元组，非单维度）。"""
+    _make_question(conn, "qm-a", base_elo=2000, module=MODULE_A, grade=GRADE)
+    _make_question(conn, "qm-b", base_elo=2000, module=MODULE_B, grade=GRADE)
+    record_mastered_init(conn, "qm-a", "s1")
+    assert get_module_elo(conn, GRADE, MODULE_B) == DualEloState(1200.0, 1200.0)
+    record_mastered_init(conn, "qm-b", "s2")
+    assert get_module_elo(conn, GRADE, MODULE_A).combat_elo > 1200.0
+    assert get_module_elo(conn, GRADE, MODULE_B).combat_elo > 1200.0
+    _assert_ledger_chain(conn, MODULE_A, GRADE)
+    _assert_ledger_chain(conn, MODULE_B, GRADE)
+
+
+def test_write_functions_derive_grade_subject_from_question(
+    conn: sqlite3.Connection,
+) -> None:
+    """写入类函数签名不变：账本 grade_subject 由题目行 target_grade_and_subject 自派生。"""
+    _make_question(conn, "q-init", base_elo=1600, module=MODULE_A, grade=GRADE_B)
+    _make_question(conn, "q-flow", base_elo=1600, module=MODULE_A, grade=GRADE_B)
+
+    init = record_mastered_init(conn, "q-init", "s1")
+    floor = apply_draft_subgoal_floor(conn, "q-flow", "s1", d_sub=1400)
+    freeze = freeze_decrutch_escrow(conn, "q-flow", "s1")
+    assert init.event_id is not None and floor.event_id is not None
+    assert freeze.event_id is not None
+    for event_id in (init.event_id, floor.event_id, freeze.event_id):
+        assert _event(conn, event_id)["grade_subject"] == GRADE_B
+    # 事件全部落在 GRADE_B 分区，默认学段分区保持冷启动
+    assert _ledger_count(conn) == 3
+    assert get_module_elo(conn, GRADE, MODULE_A) == DualEloState(1200.0, 1200.0)
+    assert get_module_elo(conn, GRADE_B, MODULE_A) == DualEloState(
+        freeze.coverage_after, freeze.combat_after
+    )
+    _assert_ledger_chain(conn, MODULE_A, GRADE_B)
+
+
+def test_explanation_prefix_includes_grade_and_module(conn: sqlite3.Connection) -> None:
+    """解释条前缀升级为【{学段} · {模块}】（P10-B），其余措辞与数值不变。"""
+    prefix = f"【{GRADE_B} · {MODULE_A}】"
+    _make_question(conn, "q-expl-init", base_elo=1600, module=MODULE_A, grade=GRADE_B)
+    init = record_mastered_init(conn, "q-expl-init", "s1")
+    assert init.explanation_text.startswith(prefix)
+
+    _make_question(conn, "q-expl-flow", base_elo=1600, module=MODULE_A, grade=GRADE_B)
+    floor = apply_draft_subgoal_floor(conn, "q-expl-flow", "s1", d_sub=1400)
+    assert floor.explanation_text.startswith(prefix)
+    freeze = freeze_decrutch_escrow(conn, "q-expl-flow", "s1")
+    assert freeze.explanation_text.startswith(prefix)
+
+    # 门控拦截的 no-op 解释条同样带学段前缀（新学段冷启动，combat=1200 >= D_sub）
+    _make_question(conn, "q-expl-noop", base_elo=1600, module=MODULE_A, grade=GRADE_C)
+    noop = apply_draft_subgoal_floor(conn, "q-expl-noop", "s2", d_sub=1100)
+    assert not noop.applied
+    assert noop.explanation_text.startswith(f"【{GRADE_C} · {MODULE_A}】")

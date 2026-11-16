@@ -13,6 +13,11 @@
 架构约束（Alternative 3A 被否决的原因）：
 - 不建任何可变标量表；模块双轨分完全由 ``elo_mutation_ledger`` 事件流折叠得出，
   天然支持事件溯源解释与确定性重放。
+- P10-B 学段分区核算域：一切折叠/守恒/不倒挂/幂等均在 **(grade_subject, l1_module)**
+  二元组内成立——每个学段的每个 L1 模块各自从 MODULE_ELO_INITIAL 起算。写入类
+  函数签名不变（学段由题目行 ``target_grade_and_subject`` 自派生，且同时写入账本
+  事件行）；读取类函数显式接收 ``grade_subject``。逾期衰减仍按日全局维护（时间性
+  维护不随用户当前学段选择）。
 - 所有函数接收调用方管理的 sqlite3.Connection：不自行开连接、不 commit；
   账本事件 INSERT 先于同函数内其他表写入，配合 ``idempotency_key UNIQUE``
   兜底，保证幂等与调用方事务内的多表原子性。
@@ -129,17 +134,20 @@ def _query_one(
     return cur.fetchone()
 
 
-def get_module_elo(conn: sqlite3.Connection, l1_module: str) -> DualEloState:
-    """折叠账本得出模块当前双轨分：取该模块最新事件的 after 值。
+def get_module_elo(
+    conn: sqlite3.Connection, grade_subject: str, l1_module: str
+) -> DualEloState:
+    """折叠账本得出 (学段, L1 模块) 分区当前双轨分：取该分区最新事件的 after 值。
 
     无事件 → 冷启动 (MODULE_ELO_INITIAL, MODULE_ELO_INITIAL)。
-    不建可变标量表（Alternative 3A），模块间天然隔离。
+    不建可变标量表（Alternative 3A）；P10-B 起核算域为 (grade_subject, l1_module)，
+    不同学段的同名 L1 模块各自 1200 起算、互不串扰。
     """
     row = _query_one(
         conn,
         "SELECT coverage_elo_after, combat_elo_after FROM elo_mutation_ledger "
-        "WHERE l1_module = ? ORDER BY event_id DESC LIMIT 1",
-        (l1_module,),
+        "WHERE grade_subject = ? AND l1_module = ? ORDER BY event_id DESC LIMIT 1",
+        (grade_subject, l1_module),
     )
     if row is None:
         initial = settings.MODULE_ELO_INITIAL
@@ -198,7 +206,8 @@ def _noop_result(state: DualEloState, explanation: str) -> LedgerEventResult:
 def _load_question(conn: sqlite3.Connection, question_uid: str) -> sqlite3.Row:
     row = _query_one(
         conn,
-        "SELECT question_uid, base_elo, primary_l1_module FROM questions WHERE question_uid = ?",
+        "SELECT question_uid, base_elo, primary_l1_module, target_grade_and_subject"
+        " FROM questions WHERE question_uid = ?",
         (question_uid,),
     )
     if row is None:
@@ -210,6 +219,7 @@ def _insert_event(
     conn: sqlite3.Connection,
     *,
     idempotency_key: str,
+    grade_subject: str,
     l1_module: str,
     question_uid: str,
     trigger: _Trigger,
@@ -226,13 +236,14 @@ def _insert_event(
     """
     cur = conn.execute(
         "INSERT INTO elo_mutation_ledger ("
-        " idempotency_key, l1_module, question_uid, mutation_trigger,"
+        " idempotency_key, grade_subject, l1_module, question_uid, mutation_trigger,"
         " eval_difficulty_elo, watermark_gamma,"
         " coverage_elo_before, coverage_elo_after, combat_elo_before, combat_elo_after,"
         " explanation_text"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             idempotency_key,
+            grade_subject,
             l1_module,
             question_uid,
             trigger,
@@ -314,15 +325,16 @@ def record_mastered_init(
         return result
 
     question = _load_question(conn, question_uid)
+    grade = str(question["target_grade_and_subject"])
     module = str(question["primary_l1_module"])
     difficulty = int(question["base_elo"])
-    before = get_module_elo(conn, module)
+    before = get_module_elo(conn, grade, module)
 
     gamma = compute_watermark_gamma(difficulty, before.combat_elo)
     if gamma == 0.0:
         result = _noop_result(
             before,
-            f"【{module}】直接录入已掌握题：难度基准 {difficulty} 分远低于当前实战分"
+            f"【{grade} · {module}】直接录入已掌握题：难度基准 {difficulty} 分远低于当前实战分"
             f" {before.combat_elo:.1f} 的水位线下限（-{settings.WATERMARK_ZERO_MARGIN}），"
             "门控 γ=0，本次不加分。",
         )
@@ -332,7 +344,8 @@ def record_mastered_init(
     if delta == 0.0:
         result = _noop_result(
             before,
-            f"【{module}】直接录入已掌握题：难度基准 {difficulty} 分，本次增量为 0，不写事件。",
+            f"【{grade} · {module}】直接录入已掌握题：难度基准 {difficulty} 分，"
+            "本次增量为 0，不写事件。",
         )
         _log_elo_event("MASTERED_INIT", key, question_uid, session_id, module, gamma, result)
         return result
@@ -343,7 +356,8 @@ def record_mastered_init(
         combat_elo=combat_after,
     )
     explanation = (
-        f"【{module}】直接录入已掌握题：难度基准 {difficulty} 分，水位线门控 γ={gamma:.3f}，"
+        f"【{grade} · {module}】直接录入已掌握题：难度基准 {difficulty} 分，"
+        f"水位线门控 γ={gamma:.3f}，"
         f"实战分 +{delta:.1f}（{before.combat_elo:.1f} → {after.combat_elo:.1f}），"
         f"覆盖分同步至 {after.coverage_elo:.1f}。"
     )
@@ -351,6 +365,7 @@ def record_mastered_init(
         event_id = _insert_event(
             conn,
             idempotency_key=key,
+            grade_subject=grade,
             l1_module=module,
             question_uid=question_uid,
             trigger="MASTERED_INIT",
@@ -405,13 +420,14 @@ def apply_draft_subgoal_floor(
         return result
 
     question = _load_question(conn, question_uid)
+    grade = str(question["target_grade_and_subject"])
     module = str(question["primary_l1_module"])
-    before = get_module_elo(conn, module)
+    before = get_module_elo(conn, grade, module)
 
     if before.combat_elo >= d_sub:
         result = _noop_result(
             before,
-            f"【{module}】草稿子步保底未发放：当前实战分 {before.combat_elo:.1f} 已不低于"
+            f"【{grade} · {module}】草稿子步保底未发放：当前实战分 {before.combat_elo:.1f} 已不低于"
             f"子步难度基准 {d_sub} 分，无需保底推演。",
         )
         _log_elo_event(
@@ -422,7 +438,8 @@ def apply_draft_subgoal_floor(
     if delta == 0.0:
         result = _noop_result(
             before,
-            f"【{module}】草稿子步保底：子步难度基准 {d_sub} 分，本次增量为 0，不写事件。",
+            f"【{grade} · {module}】草稿子步保底：子步难度基准 {d_sub} 分，"
+            "本次增量为 0，不写事件。",
         )
         _log_elo_event(
             "PARTIAL_DRAFT_SUBGOAL_FLOOR", key, question_uid, session_id, module, 1.0, result
@@ -435,7 +452,8 @@ def apply_draft_subgoal_floor(
         combat_elo=combat_after,
     )
     explanation = (
-        f"【{module}】草稿子步保底：手写草稿独立完成前缀子目标（难度基准 D_sub={d_sub} 分），"
+        f"【{grade} · {module}】草稿子步保底：手写草稿独立完成前缀子目标"
+        f"（难度基准 D_sub={d_sub} 分），"
         f"当前实战分 {before.combat_elo:.1f} 低于该基准，发放保底 +{delta:.1f}"
         f"（→ {after.combat_elo:.1f}），覆盖分同步上推至 {after.coverage_elo:.1f}；"
         "增量已记入单题托管池，待拆拐杖/盲测阶段守恒核算。"
@@ -445,6 +463,7 @@ def apply_draft_subgoal_floor(
         event_id = _insert_event(
             conn,
             idempotency_key=key,
+            grade_subject=grade,
             l1_module=module,
             question_uid=question_uid,
             trigger="PARTIAL_DRAFT_SUBGOAL_FLOOR",
@@ -528,9 +547,10 @@ def freeze_decrutch_escrow(
         return result
 
     question = _load_question(conn, question_uid)
+    grade = str(question["target_grade_and_subject"])
     module = str(question["primary_l1_module"])
     d_orig = int(question["base_elo"])
-    before = get_module_elo(conn, module)
+    before = get_module_elo(conn, grade, module)
 
     pool = _query_one(
         conn,
@@ -550,7 +570,7 @@ def freeze_decrutch_escrow(
             return result
         result = _noop_result(
             before,
-            f"【{module}】拆拐杖覆盖分已结算过（is_cov_settled=1），本次不重复结算。",
+            f"【{grade} · {module}】拆拐杖覆盖分已结算过（is_cov_settled=1），本次不重复结算。",
         )
         _log_elo_event("SCAFFOLD_COVER_GAIN", key, question_uid, session_id, module, 1.0, result)
         return result
@@ -562,7 +582,8 @@ def freeze_decrutch_escrow(
     if cov_delta == 0.0:
         result = _noop_result(
             before,
-            f"【{module}】拆拐杖覆盖分结算：原题难度基准 {d_orig} 分，本次增量为 0，不写事件。",
+            f"【{grade} · {module}】拆拐杖覆盖分结算：原题难度基准 {d_orig} 分，"
+            "本次增量为 0，不写事件。",
         )
         _log_elo_event("SCAFFOLD_COVER_GAIN", key, question_uid, session_id, module, 1.0, result)
         return result
@@ -573,7 +594,7 @@ def freeze_decrutch_escrow(
     target = settings.K_COMBAT * (1.0 - expected_pass(snapshot, d_orig))
     escrow_delta = max(0.0, target - floor_applied)
     explanation = (
-        f"【{module}】拆拐杖当场变式通过：按原题难度基准 {d_orig} 分一次性结算覆盖分"
+        f"【{grade} · {module}】拆拐杖当场变式通过：按原题难度基准 {d_orig} 分一次性结算覆盖分"
         f" +{cov_delta:.1f}（{before.coverage_elo:.1f} → {after.coverage_elo:.1f}）；"
         f"实战分目标增量 {target:.1f}（基于入库快照 {snapshot:.1f}），扣除已发保底"
         f" {floor_applied:.1f} 后差额 {escrow_delta:.1f} 已 100% 冻结托管，"
@@ -583,6 +604,7 @@ def freeze_decrutch_escrow(
         event_id = _insert_event(
             conn,
             idempotency_key=key,
+            grade_subject=grade,
             l1_module=module,
             question_uid=question_uid,
             trigger="SCAFFOLD_COVER_GAIN",
@@ -659,9 +681,10 @@ def realize_or_forfeit_blind_test(
     Elo 账本与托管池（与切片 A 的职责边界一致）。
     """
     question = _load_question(conn, question_uid)
+    grade = str(question["target_grade_and_subject"])
     module = str(question["primary_l1_module"])
     d_orig = int(question["base_elo"])
-    before = get_module_elo(conn, module)
+    before = get_module_elo(conn, grade, module)
 
     pool = _query_one(
         conn,
@@ -684,7 +707,8 @@ def realize_or_forfeit_blind_test(
                 return result
         result = _noop_result(
             before,
-            f"【{module}】单题托管池已处于终态 {pool['escrow_status']}，盲测结算幂等无操作。",
+            f"【{grade} · {module}】单题托管池已处于终态 {pool['escrow_status']}，"
+            "盲测结算幂等无操作。",
         )
         _log_elo_event(
             "BLIND_TEST_REALIZE", f"{question_uid}:{session_id}:BLIND_TEST_REALIZE",
@@ -696,7 +720,7 @@ def realize_or_forfeit_blind_test(
     if pool is None or pool["escrow_status"] != "FROZEN_PENDING_BLIND":
         result = _noop_result(
             before,
-            f"【{module}】单题托管池尚未冻结待兑现差额，盲测结算无操作。",
+            f"【{grade} · {module}】单题托管池尚未冻结待兑现差额，盲测结算无操作。",
         )
         _log_elo_event(
             "BLIND_TEST_REALIZE", f"{question_uid}:{session_id}:BLIND_TEST_REALIZE",
@@ -714,7 +738,7 @@ def realize_or_forfeit_blind_test(
         )
         result = _noop_result(
             before,
-            f"【{module}】延迟盲测未通过：托管差额清零（FORFEITED_RESET），"
+            f"【{grade} · {module}】延迟盲测未通过：托管差额清零（FORFEITED_RESET），"
             "实战分与覆盖分基线分文不动，题目退回重训流。",
         )
         _log_elo_event(
@@ -751,7 +775,7 @@ def realize_or_forfeit_blind_test(
         combat_elo=combat_after,
     )
     explanation = (
-        f"【{module}】延迟盲测一次通过：解冻托管差额 {escrow:.1f} × 衰减系数 {factor:.2f}"
+        f"【{grade} · {module}】延迟盲测一次通过：解冻托管差额 {escrow:.1f} × 衰减系数 {factor:.2f}"
         f" = +{delta:.1f} 实战分（{before.combat_elo:.1f} → {after.combat_elo:.1f}），"
         f"覆盖分同步至 {after.coverage_elo:.1f}，托管池销账为 REALIZED_MASTERED。"
     )
@@ -760,6 +784,7 @@ def realize_or_forfeit_blind_test(
         event_id = _insert_event(
             conn,
             idempotency_key=key,
+            grade_subject=grade,
             l1_module=module,
             question_uid=question_uid,
             trigger="BLIND_TEST_REALIZE",
@@ -813,12 +838,15 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
       且 slated_exposure_count > DECAY_EXPOSURE_THRESHOLD。
     系统顺延题当日未排入 → 天然冻结，不得衰减。
 
+    P10-B：候选题查询跨学段全局（时间性维护不随用户当前学段选择），单题衰减计算
+    用其自身学段所属的 (学段, 模块) 分区快照，事件行写入题目行学段；同日幂等键
+    ``{uid}:{active_date}:ESCROW_TIMEOUT_DECAY`` 仍保证同一题每日只衰减一次。
+
     写 ESCROW_TIMEOUT_DECAY 事件（combat/cov before==after，watermark_gamma=新系数，
-    中文解释条），幂等键 ``{uid}:{active_date}:ESCROW_TIMEOUT_DECAY``（同日重复不重复衰减）。
-    返回本次衰减题数；绝不扣减 combat/cov 基线。
+    中文解释条），返回本次衰减题数；绝不扣减 combat/cov 基线。
     """
     cur = conn.execute(
-        "SELECT q.question_uid, q.primary_l1_module, q.base_elo,"
+        "SELECT q.question_uid, q.target_grade_and_subject, q.primary_l1_module, q.base_elo,"
         " q.slated_exposure_count, p.escrow_combat_delta, p.decay_factor"
         " FROM questions q JOIN question_escrow_pool p ON q.question_uid = p.question_uid"
         " WHERE q.mastery_state = 'PENDING_RETEST'"
@@ -834,10 +862,11 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
     decayed = 0
     for row in candidates:
         uid = str(row["question_uid"])
+        grade = str(row["target_grade_and_subject"])
         module = str(row["primary_l1_module"])
         key = f"{uid}:{active_date.isoformat()}:ESCROW_TIMEOUT_DECAY"
         if _find_event_by_key(conn, key) is not None:
-            state = get_module_elo(conn, module)
+            state = get_module_elo(conn, grade, module)
             _log_elo_event(
                 "ESCROW_TIMEOUT_DECAY", key, uid, None, module, float(row["decay_factor"]),
                 LedgerEventResult(
@@ -851,12 +880,13 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
                 ),
             )
             continue  # 同日已衰减，幂等跳过
-        before = get_module_elo(conn, module)
+        before = get_module_elo(conn, grade, module)
         old_factor = float(row["decay_factor"])
         new_factor = max(0.0, old_factor - settings.ESCROW_DAILY_DECAY)
         exposure = int(row["slated_exposure_count"])
         explanation = (
-            f"【{module}】逾期未测温和衰减：题目已连续 {exposure} 个活跃日排入盲测题单仍未测，"
+            f"【{grade} · {module}】逾期未测温和衰减：题目已连续 {exposure} 个活跃日"
+            "排入盲测题单仍未测，"
             f"托管兑现系数 {old_factor:.2f} → {new_factor:.2f}"
             f"（每日 -{settings.ESCROW_DAILY_DECAY:.2f}）；"
             "仅折减待兑现差额，实战分与覆盖分基线分文不动。"
@@ -865,6 +895,7 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
             event_id = _insert_event(
                 conn,
                 idempotency_key=key,
+                grade_subject=grade,
                 l1_module=module,
                 question_uid=uid,
                 trigger="ESCROW_TIMEOUT_DECAY",
@@ -909,20 +940,23 @@ def apply_overdue_escrow_decay(conn: sqlite3.Connection, active_date: date) -> i
     return decayed
 
 
-def replay_module_elo_from_ledger(conn: sqlite3.Connection, l1_module: str) -> DualEloState:
-    """从事件流确定性重建模块双轨分（设计 Target #11，事件溯源）。
+def replay_module_elo_from_ledger(
+    conn: sqlite3.Connection, grade_subject: str, l1_module: str
+) -> DualEloState:
+    """从事件流确定性重建 (学段, L1 模块) 分区双轨分（设计 Target #11，事件溯源）。
 
-    从 MODULE_ELO_INITIAL 起按 event_id 顺序重放全部事件增量，逐事件校验 before
-    与累计 after 衔接（发现断链抛 ValueError）；终态与 get_module_elo 一致。
-    空模块 → (MODULE_ELO_INITIAL, MODULE_ELO_INITIAL)。
+    从 MODULE_ELO_INITIAL 起按 event_id 顺序重放该分区全部事件增量，逐事件校验
+    before 与累计 after 衔接（发现断链抛 ValueError）；终态与 get_module_elo 一致。
+    空分区 → (MODULE_ELO_INITIAL, MODULE_ELO_INITIAL)。
     """
     initial = settings.MODULE_ELO_INITIAL
     cov = combat = initial
     cur = conn.execute(
         "SELECT event_id, coverage_elo_before, coverage_elo_after,"
         " combat_elo_before, combat_elo_after"
-        " FROM elo_mutation_ledger WHERE l1_module = ? ORDER BY event_id",
-        (l1_module,),
+        " FROM elo_mutation_ledger WHERE grade_subject = ? AND l1_module = ?"
+        " ORDER BY event_id",
+        (grade_subject, l1_module),
     )
     cur.row_factory = sqlite3.Row
     for row in cur.fetchall():
@@ -931,19 +965,21 @@ def replay_module_elo_from_ledger(conn: sqlite3.Connection, l1_module: str) -> D
             or abs(float(row["combat_elo_before"]) - combat) > 1e-9
         ):
             raise ValueError(
-                f"模块 {l1_module!r} 账本断链：event_id={row['event_id']} 的 before 值"
-                "与上一事件 after 不衔接，无法确定性重放。"
+                f"分区 {grade_subject!r} / {l1_module!r} 账本断链："
+                f"event_id={row['event_id']} 的 before 值与上一事件 after 不衔接，"
+                "无法确定性重放。"
             )
         cov = float(row["coverage_elo_after"])
         combat = float(row["combat_elo_after"])
 
     rebuilt = DualEloState(coverage_elo=cov, combat_elo=combat)
-    current = get_module_elo(conn, l1_module)
+    current = get_module_elo(conn, grade_subject, l1_module)
     if (
         abs(rebuilt.coverage_elo - current.coverage_elo) > 1e-9
         or abs(rebuilt.combat_elo - current.combat_elo) > 1e-9
     ):
         raise ValueError(
-            f"模块 {l1_module!r} 重放终态与 get_module_elo 不一致，确定性重建失败。"
+            f"分区 {grade_subject!r} / {l1_module!r} 重放终态与 get_module_elo"
+            "不一致，确定性重建失败。"
         )
     return rebuilt
