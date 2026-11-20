@@ -1,17 +1,13 @@
-# 刷题 Harness — 会话入口
+# 刷题 Harness v2（纯理科题库知识编译器 & `pi` 智能刷题底座）— 会话入口
 
-**开始工作前先读 [docs/HANDOFF.md](docs/HANDOFF.md)**（项目状态 / 环境命令 / 协作约定 / 技术决策 / 待办）。
+**开始工作前先读 [docs/HANDOFF.md](docs/HANDOFF.md) 与 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)**。
 
-## 硬性约定
+## 核心约定
 
-1. 设计权威: `docs/designs/adaptive_practice_harness.md`；实现中有问题向用户确认，不自作主张
-2. 分工: 所有代码修改委派 subagent worker（契约在 `docs/tasks/`，文件白名单制）；主会话只负责根因分析、方案设计、最终验收
-3. URL 纪律: 工具 URL 必须与当前任务目标一致；严禁擅自替换为 routify 等临时代理；不盲从历史地址；每次调用重新核对；必要调用不遗漏、不无故增加
-4. subagents 需要 pi 运行在 tmux 内
-5. worker 禁止 git commit/push 与网络调用；PM 验收后统一提交
-
-## 速查
-
-- 启动: `.venv/bin/uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000`
-- 门禁: `.venv/bin/python -m pytest -q --cov=backend --cov-fail-under=85 && .venv/bin/ruff check backend/ tests/ && .venv/bin/mypy backend/`
-- 行为审计: `data/logs/harness.jsonl`；数据库: `data/harness.db`；真实网关配置: `.env`（gitignore）
+1. **权威文档**:
+   - 需求权威：[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)
+   - 理论权威：[docs/理论基础.md](docs/理论基础.md)
+   - 架构设计：`docs/DESIGN.md`（待下一步起草并经用户确认）
+2. **历史归档保护**: `backup/v1/` 为旧版 Web 系统完整备份，**只读参考（勿修改）**；新系统在根目录从零搭建。
+3. **确认优先**: 实现与设计中有歧义先向用户确认，不自作主张；代码修改遵循清晰模块化拆分与完整自动化测试验证。
+4. **提交纪律**: 未经用户要求不自动 `git commit` / `git push`。
