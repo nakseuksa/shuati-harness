@@ -1,31 +1,26 @@
-# 纯理科题库知识编译器与 `pi` 智能刷题底座 — 架构与详细设计文档（v2.3）
+# 纯理科题库知识编译器与 `pi` 智能刷题底座 — 架构与详细设计文档（v2.4）
 
-> **状态**：v2.3 修订稿（在 v2.2 基础上合入 2026-11-20 第三轮深度评审修复与用户决策 D5/D6，待用户终审）  
+> **状态**：v2.4 修订稿（在 v2.3 基础上合入第四轮实证评审修正、补充与瘦身裁剪；保留 `S3C/S3D` 分阶段与 `meta.json` 冻结分位表，待用户终审）  
 > **更新日期**：2026-11-20  
 > **需求权威**：[REQUIREMENTS.md](REQUIREMENTS.md)（FR-1 ~ FR-11, NFR-1 ~ NFR-5）  
 > **理论权威**：[理论基础.md](理论基础.md)（非对称四维难度模型与“剥皮抽骨”五边拓扑理论）  
-> **现状核实**：本地 `题库/` 目录当前已就绪 2 个章节（`ch01_计算基础` 15 题、`ch28_平面直线图形高年级卷` 107 题，共 122 题，图片完整性 100%），后续将持续放入其余章节至 1000+ 题并平滑扩展初高中数理化。
+> **现状核实**：本地 `题库/` 目录当前已就绪 2 个章节（`ch01_计算基础` 15 题、`ch28_平面直线图形高年级卷` 107 题，共 122 题，图片完整性 100%，含实测发现同卷重扫原题对 `ch28_015`/`ch28_057`），后续将持续放入其余章节至 1000+ 题并平滑扩展初高中数理化。
 
-### v2.3 修订摘要（第三轮评审 + 用户决策 D5/D6）
-
-| 类别 | 变更 |
-| :--- | :--- |
-| **用户决策 D5** | 人工修正后的**生效数据物化为独立的 `eff_*` 生效列**：`questions` 中可覆写字段拆为 `m_*`（机器层）与 `eff_*`（生效层），检索 / 组卷 / 门禁 / FTS5 / 向量 / 导出只读 `eff_*`；唯一写入者为 `core/effective.py`（§3.2-4、§4.8） |
-| **用户决策 D6** | 学习者水位由“75 分位”改为**分学段 × 分 L1 模块在线 Elo**，按 `practice_log` 时间序确定性重放，仍为纯事件派生（§5.1） |
-| 评审建议默认采纳（可改） | 新增不泄露答案的 `shuati check` 判题命令（§5.4-2）；人工资产镜像为 git 跟踪的 `human/*.jsonl`，破坏性操作前自动快照（§3.6、不变量 9）；“数形结合”不列入泛词黑名单（与 FR-4 原文示例一致） |
-| 三轮评审 P0 | 覆写增加 `base_fingerprint` + 失配自动挂起（`OVERRIDE_STALE`）；步骤级覆写与做题卡点改用 `step_fingerprint` / 登记时快照锚定；复核页 `ADOPT_RUN` 原子整体采纳（含辅路 `visual_facts`）；编译上游通用门禁 + 跨进程编译锁 + `taxonomy lock` 事务边界修正；Prompt 构建器字段白名单（uid / 集合名含章节名，禁止入 Prompt）；人工资产 git 镜像 |
-| 三轮评审 P1/P2 | `config/collections.yaml` 集合→学段映射与 `grade-subject add`；定义 `normalize_text`（OCR 断词 / 残留图标签）；跨源副本建 raw 行（`duplicate_of_uid`）；源题消失下架检测；`SINGLE_RUN_ONLY` 改为重试优先；新增 `judge_llm` 槽位与 `TEXT_RESOLVE` 双车道；数值型选择题强制 SymPy 互校；题目级验真模式派生值 `SYMBOLIC` 更名 `DETERMINISTIC`；锚点预筛与允许缺档；DRAFT 换版清理与 L1 类覆写迁移；Stage 3d 改 Top-K 召回；先修 DAG 以 L2 粒度为主；Stage 4 改“每题 kNN 排名 + 冻结分位表 + 硬下界”、跨学段规则、`SCAFFOLD` 最小集合与 IDF 包含度、`CONTRASTIVE` 由 LLM 门控；组卷近期卷避重；外部错题 `--answer` 与验真语义；步骤独立防剧透 `hint` 字段；Windows UTF-8 输出、Job Object 内存上限、`sympify` 字符串求值拦截、复核页仅绑 `127.0.0.1`；UTC 时间约定；新增 `llm_calls` 账本（共 20 张表）；难度公式口径声明与 108 组合全枚举单测 |
-
-### v2.2 修订摘要（含 v2.1 决策与二轮审核修复）
+### v2.4 修订摘要（第四轮实证评审：修正 + 补充 + 裁剪）
 
 | 类别 | 变更 |
 | :--- | :--- |
-| **用户决策 D1** | 知识目录（L1/L2 词表）**等全量题完成 Stage 2 后再涌现并锁定**；122 题开发期只产出 `DRAFT` 草案并以“临时模式”驱动下游开发测试（§4.5） |
-| **用户决策 D2** | `pi` 接入改为 **CLI（`--json`）+ `pi` Skill 为一等公民**，MCP Server 降级为可选薄封装（§5.4） |
-| **用户决策 D3** | 答案结构**按小问（answer part）区分答案类型与验真模式**（`answer_type` + `verify_mode`），题目级验真模式改为派生值并新增 `MIXED`（§3.2、§4.3） |
-| **用户决策 D4** | `C=4` 分档阈值采用 **`2400 / 2600`**（§4.4） |
-| 一轮评审 P0/P1 | FTS5 改 `trigram`；选择题纠偏改为行首锚定正则；人工覆写与日志外键改 `RESTRICT` + 软删除；`question_uid` 加入来源集合防撞号；新增 `compile_state` / `concepts` / `question_concepts` / `taxonomy_candidates` / `relation_overrides` / `quiz_batches` 表；新增 Stage 1.5 锚点门禁；Stage 4 改分位数归一化 + `SHARED_TRAP` 防爆边；统一 `reveal` 裁剪、幂等预览与 JSON 信封 |
-| **二轮评审修复** | 补全缺失的第 4～7 章；修正建库种子外键顺序；补齐 `question_relations` / `relation_overrides` 无向边有序 `CHECK`；补齐 `practice_log` 防重复冲销唯一索引与 `SOLVED_SOLO` 约束；补齐 `redirect_to_id` 部分索引与读时展开约定；修正 `question_concepts` 按 `kind` 覆盖物化语义；扩展 `AnswerPart` 支持 `SYMBOL_FILL`（含运算符）、`SET_OR_INTERVAL` 与多选题归一；明确 `DRAFT → LOCKED` 事务迁移、`TEXT_RESOLVE` 状态转移与 FTS5 多词/特殊字符转义 |
+| **用户裁决保留** | **保留** `compile_state` 中 `S3C`（词表回填）与 `S3D`（L3 节点挂载与归并）独立逐题阶段及 `taxonomy_candidates` 表（§3.2-8、§4.1、§4.5）；**保留** `data/vectors/meta.json` 冻结 2 万对随机抽样余弦分位表（`meta_version`）与 `shuati reindex --quantiles`（§3.3、§4.6） |
+| **实题修正（Fixes）** | ① **Stage 1 判等与沙盒**：放宽 SymPy AST 探针支持算术/数论/几何函数并改为拦截无计算常量返回空壳脚本；新增 `RATIO` 比值判等（`a:b` / `a:b:c`，覆盖 `ch28_020`）；新增圆周率 $\pi \approx 3.14$ 学段兼容判等；禁止模型自造 `(1)-k` 子小问标签，改为显式编号 + 无标号“求值+说理”固定双槽（修正 `ch01_015`）+ 小问内 `collection_mode`（有序元组 `ch01_010` / 无序多重集 `ch28_025` / 键值映射）；Stage 0 提取结构化 `options_json` 支撑选择题安全互译（§3.2-3、§4.2-4、§4.3-2）。② **文本与多图**：`normalize_text` 仅合并汉字间 OCR 断词（保留句末标点分段）；提取多图末尾题注 `image_captions_json`（`ch01_012` 的 `A/B`、`ch28_083` 的 `图1/图2`）并在 VLM/复核/HTML 按序显式标号；`content_hash` 取消 `sorted(cas_images)` 保留图序（§4.2-3）。③ **重题治理**：Stage 0 统一同集合/跨集合精确去重，并新增去格式 `plain_fingerprint` + 可选 `dHash` 预检同题重扫（如 `ch28_015`/`ch28_057`）；组卷增加近期已刷题的 `CLONE` 邻居冷却降权（§4.2-3、§5.2）。④ **内部契约**：`knowledge_nodes` 增加 `node_level ('L2'\|'L3')` 隔离 L2 汇总节点；`question_steps` 新增 `m_l1/m_l2` 保护 Stage 2 原始 `raw_*` 不被 `S3C` 覆盖；`practice_log.quiz_batch_id` 改为无外键软引用防 `human restore` 崩溃；HTML 练习单第 ① 级提示修正为渲染防剧透 `hint`（§3.2、§4.5、§5.5） |
+| **闭环补充（Supplements）** | ① 外部拍照错题入库/诊断固定执行 `ImageOps.exif_transpose()` 方向矫正与长边像素上限缩放（默认 `2048px`，§4.2-2、§5.3）；② `reveal="quiz"` 锁死默认隐藏 `visual_facts`，CLI JSON 直出本地绝对路径 `image_paths`，补充 `shuati skill install` 对齐 `pi` Skill 目录（§5.4）；③ 明确 `作图操作题`（如 `ch28_031`）的 `QUALITATIVE` 验真与大留白排版（§3.2-3、§5.5）；④ `ADOPT_RUN` 覆写内嵌完整解法与脚本全文确保脱离机器表自包含（§3.2-7、§4.3-6）；⑤ `raw_chapter` 改为 `TEXT` 兼容非整数章节，`practice_log` 增加可选 `score_ratio` 支持多小问部分得分驱动在线 Elo（§3.2-2、§3.2-11、§5.1） |
+| **瘦身裁剪（Trimming）** | ① **`human/*.jsonl` 简化为幂等全表快照导出**：取代 `INSERT/DEACTIVATE/SUSPEND/RESUME` 事件流状态机重放，`git diff` 直观、`restore` 简化为 `INSERT OR REPLACE`（§3.6）；② **砍掉复核页 `TEXT_RESOLVE_A/B` 双车道自动晋级状态机**：简化为复核页 `[R] 重算参考解答` 单路草稿预填 + 人工确认定稿（§4.3-5、§4.3-6）；③ **砍掉 `step_fingerprint` 与 `STEP_ORPHANED` 半孤儿局部生效**：`taxonomy_override_json` 改为挂在 `question_uid` 上的题目级考点覆写并物化至 `questions.eff_node_ids_json`，与步骤重跑彻底解耦，覆写失配统一整条挂起（§3.2-4、§3.2-7、§4.8）；`judge_llm` 未单独配置时默认自动复用 `text_llm`（§6.1） |
+
+### 历史修订摘要（v2.1 ~ v2.3 关键决策留档）
+
+| 决策 / 批次 | 核心锁定内容 |
+| :--- | :--- |
+| **用户决策 D1 ~ D6** | **D1** 词表待全量 Stage 2 后锁定（开发期 `DRAFT`）；**D2** CLI（`--json`）+ `pi` Skill 为一等公民，MCP 可选；**D3** 按小问 `AnswerPart` 区分答案类型与验真模式（题目级派生含 `MIXED`）；**D4** `C=4` 分档阈值 `2400 / 2600`；**D5** `questions` 拆为机器层 `m_*` 与物化生效层 `eff_*`（唯一写入者 `core/effective.py`）；**D6** 学习者能力水位采用分学段 × 分 L1 模块在线 Elo 重放 |
+| **一至三轮评审留存基线** | FTS5 `trigram` + 短词 `LIKE` 回退；行首锚定选择题纠偏正则；人工覆写与日志外键 `RESTRICT` + 题目软删除 + `VACUUM INTO` 快照；`prompt_builder.py` 字段白名单防章节/路径污染；`base_fingerprint` 源题变更自动挂起（`OVERRIDE_STALE`）；Stage 1.5 黄金锚点门禁；Stage 3d Top-K 召回可逆并查集 + L2 先修 DAG 环检；Stage 4“kNN 互近邻 + 冻结分位表 + 硬下界”+ `CONTRASTIVE` LLM 门控 + `SHARED_TRAP` Top-5 防爆边；不泄露答案的 `shuati check`；Windows UTF-8 管道与 Job Object 沙盒隔离 |
 
 ---
 
@@ -109,12 +104,12 @@ flowchart TD
 3. **学段严格隔离 + 思维原型跨学段互通**：
    - `knowledge_nodes`（L1/L2/L3）、`taxonomy_*.yaml`、`anchors_*.yaml`、难度标尺与学习者分模块 Elo **严格限定在 `grade_subject` 作用域内**；
    - `concepts`（`METHOD` 思维技法 / `MOTIF` 经典母题 / `TRAP` 陷阱）为**全局注册表**，支撑跨学段同构检索（如“将军饮马”串联小学几何与初中物理光学）。
-4. **按小问区分答案类型与验真模式**：答案以 `answer parts[]` 为原子单位，每个小问独立声明 `answer_type`（`NUMERIC` / `EXPRESSION` / `SET_OR_INTERVAL` / `CHOICE` / `SYMBOL_FILL` / `TEXT` / `PROOF`）与 `verify_mode`（`SYMBOLIC` / `EXACT` / `QUALITATIVE`），且二者组合由代码白名单强校验；题目级 `eff_verification_mode` 为派生值（`DETERMINISTIC` / `QUALITATIVE` / `MIXED`）。基于 `ch01_计算基础` 实测（`(1)~(8)` 多小问、`□/○` 填数与运算符号、定性说理题 `ch01_013`/`ch01_015`）与二期初高中数理化（解集区间、多选题、“计算 + 说理”混合题）前瞻，**二期扩展无需改表**。
+4. **按小问区分答案类型与验真模式**：答案以 `answer parts[]` 为原子单位，小问标签严格依据题干显式编号（及无标号“求值+说理”固定双槽），**禁止模型自造 `(1)-k` 子标签**；同一小问内的多空/多值通过 `collection_mode`（`SINGLE` / `ORDERED_TUPLE` / `UNORDERED_MULTISET` / `LABELED_MAP`）表达。每个小问独立声明 `answer_type`（`NUMERIC` / `EXPRESSION` / `RATIO` / `SET_OR_INTERVAL` / `CHOICE` / `SYMBOL_FILL` / `TEXT` / `PROOF`）与 `verify_mode`（`SYMBOLIC` / `EXACT` / `QUALITATIVE`），二者组合由代码白名单强校验；题目级 `eff_verification_mode` 为派生值（`DETERMINISTIC` / `QUALITATIVE` / `MIXED`）。覆盖一期实题（多小问、`ch01_010` 混型填空、`ch28_020` 比值、`ch28_025` 无序多区域求值、`ch28_031` 作图操作、`ch01_015` 计算+说理混合题、圆周率 $\pi \approx 3.14$ 兼容）与二期初高中数理化（解集区间、多选题、实验探究），**二期扩展无需改表**。
 5. **难度分纯代码确定性合成**：LLM 仅输出四维行为证据（`evidence` 必须在 JSON 字段顺序上排在 `score` 之前）与 `[C, S, T, L]` 整数分，连续 `base_elo` 与非对称 8 档 `tier` 100% 由确定性 Python 模块合成；**不实现步骤级 `sub_elo`**。组卷与水位计算只使用 `base_elo`，`tier` 仅用于展示与分档统计。
-6. **SymPy 沙盒全平台安全隔离**：兼容 Windows（当前主力开发/运行环境）与 Linux/macOS，AST 静态探针（含 `sympify` / `parse_expr` 等字符串求值 API 拦截）+ 独立子进程 + 进程树超时强杀 + 内存上限（Windows Job Object / Linux `RLIMIT_AS`），绝不在宿主进程执行 `parse_expr` 或 LLM 生成代码。
+6. **SymPy 沙盒全平台安全隔离**：兼容 Windows（当前主力开发/运行环境）与 Linux/macOS，AST 静态探针（允许算术/数论/几何验算函数，拦截无计算纯常量返回空壳脚本，以及 `sympify` / `parse_expr` 等字符串求值 API 拦截）+ 独立子进程 + 进程树超时强杀 + 内存上限（Windows Job Object / Linux `RLIMIT_AS`），绝不在宿主进程执行 `parse_expr` 或 LLM 生成代码。
 7. **原始题库目录严格只读**：`题库/` 与 `backup/v1/` 在整个系统运行期间均为只读，所有拷贝、归档、索引和生成物统一落在 `data/` 目录内。
 8. **CLI 是唯一权威接入契约**：所有面向 `pi` 的能力先以 `shuati <command> --json` 形式定义与测试；Skill 只编排 CLI，MCP（若启用）只做同构透传，不得出现 CLI 不具备的能力或不同的 JSON 结构；复核页的写操作同样经由 `facade.py`。
-9. **人工资产双写防丢**：`human_overrides`、`relation_overrides`、`practice_log`、`learners` 每次写入，在同一服务调用内增量追加镜像至纳入 git 的 `human/*.jsonl`（可经 `shuati human restore` 重放恢复，§3.6）；`taxonomy lock|migrate`、`compile --force`、`graph revert-merge`、`human restore` 等破坏性操作执行前自动 `VACUUM INTO data/backups/<ts>_<command>.db`。
+9. **人工资产双写防丢**：`human_overrides`、`relation_overrides`、`practice_log`、`learners` 每次写入，在同一服务调用内按主键排序幂等原子导出全表快照至纳入 git 的 `human/*.jsonl`（可经 `shuati human restore` 一键 `INSERT OR REPLACE` 恢复，§3.6）；`taxonomy lock|migrate`、`compile --force`、`graph revert-merge`、`human restore` 等破坏性操作执行前自动 `VACUUM INTO data/backups/<ts>_<command>.db`。
 
 ---
 
@@ -144,17 +139,17 @@ shuati-harness/
 ├── 题库/                             # 原始输入题库（只读）
 │   ├── ch01_计算基础/
 │   └── ch28_平面直线图形高年级卷/
-├── human/                           # 人工资产 git 镜像（覆写 / 边裁定 / 做题日志 / 角色 JSONL，纳入版本控制，不变量 9）
+├── human/                           # 人工资产 git 镜像（覆写 / 边裁定 / 做题日志 / 角色全表快照 JSONL，纳入版本控制，不变量 9）
 ├── backup/v1/                       # 旧版 Web 系统只读归档（勿修改）
 ├── skills/
 │   └── shuati/
-│       ├── SKILL.md                 # 面向 pi 的主入口：触发条件、工作流、防剧透铁律（精简）
+│       ├── SKILL.md                 # 面向 pi 的主入口：触发条件、工作流、防剧透铁律（支持 `shuati skill install` 挂载至 .pi/skills 等目录）
 │       └── reference/
 │           └── commands.md          # 每条 CLI 命令的参数、JSON 输出样例与错误码（按需加载）
 ├── src/
 │   └── shuati/
 │       ├── __init__.py
-│       ├── config.py                # Pydantic Settings + YAML 加载器（模型槽位）
+│       ├── config.py                # Pydantic Settings + YAML 加载器（模型槽位，judge_llm 未配默认复用 text_llm）
 │       ├── models/                  # Pydantic v2 领域模型与 LLM 输出严格 Schema
 │       │   ├── domain.py            # EffectiveQuestion, AnswerPart, LearnerProfile, Envelope 等
 │       │   └── schemas.py           # Stage 1/2/3/4 LLM Structured Output Schema
@@ -162,30 +157,30 @@ shuati-harness/
 │       │   ├── connection.py        # SQLite WAL / 外键 / FTS5 连接工厂 + 单写者队列
 │       │   ├── schema.py            # 20 张核心表（questions 含 m_*/eff_* 双层列）+ FTS5 幂等建表 DDL 与迁移版本号
 │       │   ├── repository.py        # CRUD + 生效列（eff_*）读取器 + 检索索引刷新
-│       │   ├── human_mirror.py      # 人工资产 JSONL 增量镜像 / 恢复重放 / 破坏性操作前 VACUUM INTO 快照
+│       │   ├── human_mirror.py      # 人工资产 JSONL 全表原子快照导出 / 恢复导入 / 破坏性操作前 VACUUM INTO 快照
 │       │   └── exporter.py          # 一键导出 4 份标准 JSONL (NFR-1)
 │       ├── vectors/
-│       │   └── store.py             # 本地 .npz 归一化向量仓（Top-K 余弦 + 增量追加 + 过期检测 + 相似度分位统计）
+│       │   └── store.py             # 本地 .npz 归一化向量仓（Top-K 余弦 + 增量追加 + 过期检测 + 冻结相似度分位表）
 │       ├── llm/
 │       │   ├── gateway.py           # OpenAI 兼容多槽位异步网关 + 限流 + JSON 附错自愈重试 + llm_calls 记账
-│       │   ├── prompt_builder.py    # 字段白名单 Prompt 组装（禁止 uid / 集合名 / 章节 / 原始图片路径入 Prompt）
+│       │   ├── prompt_builder.py    # 字段白名单 Prompt 组装（禁止 uid / 集合名 / 章节 / 原始图片路径入 Prompt；多图显式编号）
 │       │   ├── embeddings.py        # 云端 OpenAI 兼容 / 本地兼容 Embedding 客户端
 │       │   └── mocks.py             # 全链路离线测试确定性 Mock 路由
 │       ├── verify/
 │       │   ├── sympy_sandbox.py     # 跨平台（Windows/Unix）AST 探针 + 隔离子进程 SymPy 引擎
-│       │   ├── answer_parts.py      # 小问标签归一、answer_type × verify_mode 白名单校验、小问对齐
-│       │   └── equivalence.py       # 分小问判等：SYMBOLIC 数学等价 / EXACT 规范化字面 / QUALITATIVE 语义裁判
+│       │   ├── answer_parts.py      # 显式小问归一、collection_mode 多值/多空校验、answer_type × verify_mode 白名单
+│       │   └── equivalence.py       # 分小问判等：SYMBOLIC(含比值/π≈3.14/多重集) / EXACT / QUALITATIVE 语义裁判
 │       ├── core/
 │       │   ├── effective.py         # 生效层唯一写入者：m_* ⊕ 激活且未挂起覆写 → eff_*（决策 D5）
 │       │   ├── difficulty.py        # 确定性四维非线性 Elo、8 档 tier 与 tier_rank
-│       │   ├── knowledge_graph.py   # 同域可逆并查集 Compaction（节点 + 概念）+ 分布熵 + 先修 DAG 环检
+│       │   ├── knowledge_graph.py   # 同域可逆并查集 Compaction（L3 节点 + 概念）+ 分布熵 + 先修 DAG 环检
 │       │   ├── taxonomy.py          # 词表 DRAFT/LOCKED 生命周期、候选 L2、版本迁移 remap
-│       │   ├── topology.py          # 四通道相似度 + 分位数归一化 + 五边判定 + 单题增量补边
-│       │   ├── profiler.py          # 多角色纯事件派生能力画像（分模块在线 Elo 重放/ZPD/8档通过率/雷达）
-│       │   ├── composer.py          # 专题小卷自动梯度组卷算法（2稳+2拔高+1排雷）
+│       │   ├── topology.py          # 四通道相似度 + 冻结分位表/kNN 排名 + 五边判定 + 单题增量补边
+│       │   ├── profiler.py          # 多角色纯事件派生能力画像（分模块在线 Elo 重放/部分得分/ZPD/8档通过率/雷达）
+│       │   ├── composer.py          # 专题小卷自动梯度组卷算法（2稳+2拔高+1排雷 + CLONE 冷却避重）
 │       │   └── refresh.py           # 覆写/上游变更后的单题局部重算链路（STALE 传播）
 │       ├── pipeline/
-│       │   ├── stage0_ingest.py     # 动态扫盘、图片 CAS 归档、哈希去重、脏格式初纠偏
+│       │   ├── stage0_ingest.py     # 动态扫盘、图片 CAS 归档、同源/跨源去重与重扫预检、选择题选项提取
 │       │   ├── stage1_solve.py      # 视觉转译 + 双盲双 VLM + 分小问验真 + 一题多解捕获 + 解法物化
 │       │   ├── stage1_5_anchors.py  # 黄金锚点候选生成与人工定分落盘
 │       │   ├── stage2_decompose.py  # 纯文本拆解、五维正交标签、锚点校准四维打分
@@ -245,11 +240,11 @@ shuati-harness/
 
 为满足 FR-3（人工覆盖永不丢失）、FR-11（多角色隔离）与 NFR-2（断点续跑），所有数据按生命周期拆分为四层：
 
-1. **原始与编译层（Machine-Generated，可幂等重跑）**：`grade_subjects`、`raw_questions`、`stage1_vlm_runs`、`compile_state`、`questions` 的 `m_*` 与机器专属列、`question_solutions`、`question_steps`（`m_knowledge_node_id`）、`knowledge_nodes`、`knowledge_edges`、`compaction_audit_ledger`、`taxonomy_candidates`、`concepts`、`question_concepts`、`question_relations`、`llm_calls`。
-   - **生效层（Effective，决策 D5）**：`questions.eff_*`、`question_steps.eff_knowledge_node_id`，以及按覆写物化的 `question_solutions` / `question_concepts`。生效层是“机器层 ⊕ 人工覆盖层”的确定性函数，可随时由 `shuati reindex --effective` 全量重算，**不是**独立的真相来源。
-2. **人工覆盖层（Immutable Human Truth）**：`human_overrides`（题目字段补丁）、`relation_overrides`（题目关联边的人工确认/否决）。重跑流水线绝不擦除，外键 `RESTRICT`；每次写入同步镜像至 git 跟踪的 `human/*.jsonl`。
-3. **学习者事件层（Append-Only Practice）**：`learners`、`practice_log`。仅追加记录（误登记以 `VOIDED` 冲销记录抵消，不改不删），能力水位（分模块在线 Elo 重放，决策 D6）与薄弱雷达全部由事件实时派生，杜绝状态漂移；同样镜像至 `human/practice_log.jsonl`。
-4. **会话产物层（Session Artifacts）**：`quiz_batches`（组卷快照，支撑渲染、批量登记与组卷避重）。
+1. **原始与编译层（Machine-Generated，可幂等重跑）**：`grade_subjects`、`raw_questions`、`stage1_vlm_runs`、`compile_state`、`questions` 的 `m_*` 与机器专属列、`question_solutions`、`question_steps`（`m_l1`/`m_l2`/`m_knowledge_node_id`）、`knowledge_nodes`、`knowledge_edges`、`compaction_audit_ledger`、`taxonomy_candidates`、`concepts`、`question_concepts`、`question_relations`、`llm_calls`。
+   - **生效层（Effective，决策 D5）**：`questions.eff_*`（含题目级物化有效节点列表 `eff_node_ids_json` 与选择题选项表 `eff_options_json`），以及按覆写物化的 `question_solutions` / `question_concepts`。生效层是“机器层 ⊕ 人工覆盖层”的确定性函数，可随时由 `shuati reindex --effective` 全量重算，**不是**独立的真相来源。
+2. **人工覆盖层（Immutable Human Truth）**：`human_overrides`（题目字段补丁）、`relation_overrides`（题目关联边的人工确认/否决）。重跑流水线绝不擦除，外键 `RESTRICT`；每次写入后同步导出全表原子快照至 git 跟踪的 `human/*.jsonl`。
+3. **学习者事件层（Append-Only Practice）**：`learners`、`practice_log`。仅追加记录（误登记以 `VOIDED` 冲销记录抵消，不改不删），能力水位（分模块在线 Elo 重放，支持多小问部分得分 `score_ratio`，决策 D6）与薄弱雷达全部由事件实时派生，杜绝状态漂移；同样快照导出至 `human/practice_log.jsonl`。
+4. **会话产物层（Session Artifacts）**：`quiz_batches`（组卷快照，支撑渲染、批量登记与组卷避重；`practice_log.quiz_batch_id` 对其仅作无外键软引用，保证 `human restore` 独立恢复）。
 
 ```mermaid
 erDiagram
@@ -272,7 +267,6 @@ erDiagram
     questions ||--o{ relation_overrides : adjudicated_by
     learners ||--o{ practice_log : performs
     learners ||--o{ quiz_batches : receives
-    quiz_batches ||--o{ practice_log : logged_in
     questions ||--o{ practice_log : practiced_in
 ```
 
@@ -312,13 +306,15 @@ CREATE TABLE IF NOT EXISTS raw_questions (
     source_collection TEXT NOT NULL,             -- problems.jsonl 所在目录相对 题库/ 的路径，如 'ch28_平面直线图形高年级卷'；外部错题为 'ext'
     source_file TEXT,                            -- 相对路径如 '题库/ch28_平面直线图形高年级卷/problems.jsonl'
     source_id TEXT NOT NULL,                     -- 原始 id 如 'ch28_001'（仅在集合内唯一，跨教辅可能撞号）
-    raw_chapter INTEGER,                         -- 仅归档，严禁流入 Stage 1/2
+    raw_chapter TEXT,                            -- 兼容整数转文本('28')及外部教辅章节名('专题二'/'八上第11章')；仅归档，严禁流入 Stage 1/2
     raw_question TEXT NOT NULL,                  -- 原始题干文本
     raw_images_json TEXT NOT NULL DEFAULT '[]',  -- 原始相对路径数组
-    cas_images_json TEXT NOT NULL DEFAULT '[]',  -- 归档后的 CAS 文件名数组 ["a1b2c3d4e5f67890.jpg"]
+    cas_images_json TEXT NOT NULL DEFAULT '[]',  -- 归档后的 CAS 文件名数组 ["a1b2c3d4e5f67890.jpg"]（严格保序）
+    image_captions_json TEXT NOT NULL DEFAULT '[]', -- 多图题提取的子图题注数组（如 ["A","B"]、["图1","图2"]），与 cas_images_json 等长或为空
     legacy_tags_json TEXT NOT NULL DEFAULT '{}', -- 原始 tags 完整快照（仅质检对比用）
-    content_hash TEXT NOT NULL,                  -- SHA-256(normalize_text(raw_question) + sorted(cas_images)) 防重复入库（normalize_text 规则见 §4.2-3）
-    duplicate_of_uid TEXT REFERENCES raw_questions(question_uid), -- 跨源完全同题副本：指向主题 uid；副本不建 questions / compile_state 行
+    content_hash TEXT NOT NULL,                  -- SHA-256(normalize_text + "|" + ",".join(cas_images) + "|" + ",".join(image_captions))，保序防重（§4.2-3）
+    plain_fingerprint TEXT NOT NULL DEFAULT '',  -- 去 $ 与空白及 LaTeX 包装后的纯文本指纹 + 图数，用于预检同题重扫（如 ch28_015 / ch28_057）
+    duplicate_of_uid TEXT REFERENCES raw_questions(question_uid), -- 同集合或跨源完全同题副本：指向先入库的主题 uid；副本不建 questions / compile_state 行
     is_missing_from_source INTEGER NOT NULL DEFAULT 0, -- 最近一次全量扫盘未再发现该 (collection, source_id)；驱动下架候选
     last_seen_scan_id TEXT NOT NULL DEFAULT '',  -- 最近一次扫盘批次号
     ingested_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -326,22 +322,23 @@ CREATE TABLE IF NOT EXISTS raw_questions (
     UNIQUE(grade_subject, source_collection, source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_raw_questions_hash ON raw_questions(grade_subject, content_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_questions_plain ON raw_questions(grade_subject, plain_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_raw_questions_dup ON raw_questions(duplicate_of_uid) WHERE duplicate_of_uid IS NOT NULL;
 ```
-> **uid 稳定性规则**：uid 一经生成永不改变。源 JSONL 被修正导致同一 `(collection, source_id)` 的 `content_hash` 变化时，**原地更新 raw 行**并将该题 Stage 1 起全部 `compile_state` 置 `STALE`，绝不删行重建；其上的人工覆写保留，但因 `base_fingerprint` 失配被自动挂起（§3.2-7），题目生效状态降为 `NEEDS_REVIEW`（`OVERRIDE_STALE`），并在体检报告“覆写待复核”清单中列出。CLI/Skill 允许用 `source_id`（如 `ch28_001`）简写，唯一匹配时自动解析，歧义时返回 `AMBIGUOUS_UID` 与候选列表；解析到跨源副本（`duplicate_of_uid` 非空）时自动重定向到主题 uid。
+> **uid 稳定性规则**：uid 一经生成永不改变。源 JSONL 被修正导致同一 `(collection, source_id)` 的 `content_hash` 变化时，**原地更新 raw 行**并将该题 Stage 1 起全部 `compile_state` 置 `STALE`，绝不删行重建；其上的人工覆写保留，但因 `base_fingerprint` 失配被自动挂起（§3.2-7），题目生效状态降为 `NEEDS_REVIEW`（`OVERRIDE_STALE`），并在体检报告“覆写待复核”清单中列出。CLI/Skill 允许用 `source_id`（如 `ch28_001`）简写，唯一匹配时自动解析，歧义时返回 `AMBIGUOUS_UID` 与候选列表；解析到同题副本（`duplicate_of_uid` 非空）时自动重定向到主题 uid。
 
 #### 3. Stage 1 VLM 双盲求解与验真审计表（`stage1_vlm_runs`）
 ```sql
 CREATE TABLE IF NOT EXISTS stage1_vlm_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     question_uid TEXT NOT NULL REFERENCES raw_questions(question_uid) ON DELETE CASCADE,
-    role TEXT NOT NULL CHECK (role IN ('PRIMARY', 'SECONDARY', 'TEXT_RESOLVE_A', 'TEXT_RESOLVE_B')), -- TEXT_RESOLVE_A/B=覆写 visual_facts 后的双车道纯文本重解（A=text_llm，B=vlm_secondary 纯文本模式，保持跨家族）
+    role TEXT NOT NULL CHECK (role IN ('PRIMARY', 'SECONDARY')), -- 双盲主/辅两路；复核页辅助重算草稿走 llm_calls(stage='REVIEW_RESOLVE')，不污染双盲表
     model_name TEXT NOT NULL,
     prompt_version TEXT NOT NULL,
-    input_hash TEXT NOT NULL,                    -- 题干 + 图片 + prompt_version + model 的指纹，判定是否可复用
+    input_hash TEXT NOT NULL,                    -- 题干 + 保序图片 + 子图题注 + prompt_version + model 的指纹，判定是否可复用
     run_status TEXT NOT NULL CHECK (run_status IN ('OK', 'FAILED')),
     error_message TEXT NOT NULL DEFAULT '',
-    visual_facts TEXT NOT NULL DEFAULT '',       -- 仅视觉题产出详细几何/物理拓扑事实
+    visual_facts TEXT NOT NULL DEFAULT '',       -- 仅视觉题产出详细几何/物理拓扑事实（严禁写入未画出的辅助线或隐含结论）
     visual_ambiguity_flag INTEGER NOT NULL DEFAULT 0, -- 1=模型报告图片模糊/阴影歧义
     visual_ambiguity_note TEXT NOT NULL DEFAULT '',
     method_summary TEXT NOT NULL DEFAULT '',     -- 一句话解法路线，用于一题多解判定
@@ -359,45 +356,50 @@ CREATE TABLE IF NOT EXISTS stage1_vlm_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_stage1_runs_q ON stage1_vlm_runs(question_uid, role, created_at DESC);
 ```
-> 被 `human_overrides`（`solutions_override_json.origin_run_id`）或 `question_solutions.origin_run_id` 引用的 run **永不删除**；未被引用的 `FAILED` run 可由 `shuati audit --prune-runs` 清理。Token 与费用统一另记于 `llm_calls`（§3.2-12）。
+> `ADOPT_RUN` 人工采纳某路解答时，会将该 run 的全文（`visual_facts`、`method_summary`、`solution_markdown`、`sympy_code`、`final_answers_json`）自包含拷入 `human_overrides`，`origin_run_id` 仅作溯源整数记录（无外键强依赖）；未被引用的历史 `FAILED` run 可由 `shuati audit --prune-runs` 清理。Token 与费用统一另记于 `llm_calls`（§3.2-12）。
 
 **`AnswerPart` 小问答案 Schema（决策 D3，`final_answers_json` 的数组元素）**：
 ```json
 {
-  "label": "(1)",                    // 归一化标签："主问" | "(1)" | "(1)-1" ...；（1）/①/1) 统一归一为 "(1)"
-  "answer_type": "NUMERIC",          // NUMERIC | EXPRESSION | SET_OR_INTERVAL | CHOICE | SYMBOL_FILL | TEXT | PROOF
+  "label": "(1)",                    // 显式标签："主问" | "(1)" | "(2)"...；严禁模型自造 "(1)-1" 子标签（防双盲切分粒度失配）
+  "answer_type": "NUMERIC",          // NUMERIC | EXPRESSION | RATIO | SET_OR_INTERVAL | CHOICE | SYMBOL_FILL | TEXT | PROOF
   "verify_mode": "SYMBOLIC",         // SYMBOLIC | EXACT | QUALITATIVE（受白名单约束，见下表）
+  "collection_mode": "SINGLE",       // SINGLE（默认）| ORDERED_TUPLE | UNORDERED_MULTISET | LABELED_MAP（承载同小问多空/多值）
   "answer": "12",                    // 人类可读答案（可含 LaTeX）
   "unit": "平方厘米",
-  "sympy_expr": "12",                // SYMBOLIC 必填（SET_OR_INTERVAL 可填方程/不等式/集合表达式）
-  "choice_label": null,              // CHOICE 必填，单选如 "C"、多选排序去重归一如 "AC"；选项为数值/表达式时必须同时填 sympy_expr，由代码按题干选项表互校
-  "canonical": null                  // EXACT 的规范化值，如 SYMBOL_FILL 的 "+" / "-" / ">"（全角/中文词由代码归一）
+  "sympy_expr": "12",                // SINGLE 且 SYMBOLIC 时必填（RATIO 填规范化比如 "9:4" 或 "1:2:3"）
+  "items": null,                     // collection_mode != SINGLE 时必填：如 [{"item_type":"NUMERIC","expr":"20"}, {"item_type":"SYMBOL_FILL","canonical":"-"}]
+  "choice_label": null,              // CHOICE 必填，单选如 "C"、多选排序去重归一如 "AC"；当 eff_options_json 对应项为纯数值/代数式时同步填 sympy_expr
+  "canonical": null                  // SINGLE 且 EXACT 时的规范化值，如 SYMBOL_FILL 的 "+" / "-" / ">"
 }
 ```
 
 | `answer_type` | 允许的 `verify_mode` | 判等方式 | 典型来源 |
 | :--- | :--- | :--- | :--- |
-| `NUMERIC` / `EXPRESSION` | `SYMBOLIC`（强制） | SymPy 数学等价（单位剥离、分数小数互转、有理化），保持“纯数字不放宽反号与常数比率”红线 | 面积、长度、计算题 |
+| `NUMERIC` / `EXPRESSION` | `SYMBOLIC`（强制） | SymPy 数学等价（单位剥离、分数小数互转、有理化；`小学奥数` 额外兼容 $\pi = 3.14$ 代入判等）；保持“纯数字不放宽反号与常数比率”红线；支持 `UNORDERED_MULTISET`（无序多区域求值）与 `LABELED_MAP`（多实体带名求值） | 面积、长度、圆与扇形、`ch28_025`（9 块区域面积） |
+| `RATIO` | `SYMBOLIC`（强制） | 二项比 `a:b`（含全角 `：`）化简为最简比并与分数 `Rational(a,b)` 互认（题干未限“整数比”时）；多项连比 `a:b:c` 各项经 `safe_parse` 消去公共因子后按有序最简元组比对 | `ch28_020(1)`（`AD:DB`）、物理密度/电功率比、化学原子比 |
 | `SET_OR_INTERVAL` | `SYMBOLIC`（强制） | 复用 v1 方程解集互代等价引擎 + 区间端点/开闭/有限集排序等价判定 | 二期中学多解方程、不等式区间、坐标组 |
-| `CHOICE` | `EXACT`（选项字母）＋**选项为数值/表达式时强制** `sympy_expr` 互校 | 单选/多选字母统一大写排序去重（`"CA"→"AC"`）；两路一字母一数值时按题干选项表互译后判等 | `ch28_003`、`ch28_016`、中学多选题 |
-| `SYMBOL_FILL` | `EXACT` | 规范化符号相等，覆盖比较符（`>`/`<`/`=`/`≥`/`≤`/`≠`）与四则运算符（`+`/`-`/`×`/`÷`）；同小问多空拆为 `(1)-1`..`(1)-k` | `ch01_010` 填 `□/○` |
-| `TEXT` | `QUALITATIVE`（强制） | `judge_llm` 裁判判定结论科学等价 | `ch01_013`、`ch01_015`、实验现象 |
+| `CHOICE` | `EXACT`（选项字母）＋**结构化数值/代数选项可解析时** `sympy_expr` 互校 | 单选/多选字母统一大写排序去重（`"CA"→"AC"`）；仅当 `eff_options_json` 存在且所选字母对应文本可由 `safe_parse` 解析为数值/表达式时，校验字母对应项与 `sympy_expr` 等价（文字/序号组合选项仅比对字母） | `ch28_003`、`ch28_016`、中学多选题 |
+| `SYMBOL_FILL` | `EXACT` | 规范化符号相等，覆盖比较符（`>`/`<`/`=`/`≥`/`≤`/`≠`）与四则运算符（`+`/`-`/`×`/`÷`）；同小问混填数字与符号时用 `collection_mode="ORDERED_TUPLE"` 按题面顺序装入 `items` | `ch01_010`（同问混填 `□` 数字与 `○` 运算符） |
+| `TEXT` | `QUALITATIVE`（强制） | `judge_llm` 裁判判定科学结论或作图操作方法要点等价（注：无标号“计算+说理”复合题如 `ch01_015` 固定拆为 `(1)` `NUMERIC` + `(2)` `TEXT`，整体为 `MIXED`） | `ch01_013`、`ch01_015(2)`、`ch28_031`（作图操作题）、实验现象 |
 | `PROOF` | `QUALITATIVE`（强制） | 裁判核对关键论证链完整性 | 证明题 |
 
-> 白名单由 `verify/answer_parts.py` 中的 Pydantic 校验器强制：模型**不得**把 `NUMERIC` / `EXPRESSION` / `SET_OR_INTERVAL` 小问标成 `QUALITATIVE` 以逃避 SymPy 验算；违规输出视为 Schema 错误触发自愈重试。
+> 白名单由 `verify/answer_parts.py` 中的 Pydantic 校验器强制：模型**不得**把 `NUMERIC` / `EXPRESSION` / `RATIO` / `SET_OR_INTERVAL` 小问标成 `QUALITATIVE` 以逃避 SymPy 验算；违规输出视为 Schema 错误触发自愈重试。
 
 #### 4. 编译后题目主表（`questions`，机器层 `m_*` + 生效层 `eff_*`，决策 D5）
 ```sql
 CREATE TABLE IF NOT EXISTS questions (
     question_uid TEXT PRIMARY KEY REFERENCES raw_questions(question_uid) ON DELETE RESTRICT,
     grade_subject TEXT NOT NULL REFERENCES grade_subjects(grade_subject),
-    cas_images_json TEXT NOT NULL DEFAULT '[]',  -- CAS 图片列表
+    cas_images_json TEXT NOT NULL DEFAULT '[]',  -- 保序 CAS 图片列表
+    image_captions_json TEXT NOT NULL DEFAULT '[]', -- 保序子图题注列表（与 cas_images_json 对应）
     has_images INTEGER NOT NULL DEFAULT 0,
     is_retired INTEGER NOT NULL DEFAULT 0,       -- 软删除：源题被移除/坏题下架；不参与检索与组卷，历史日志保留
     retired_reason TEXT NOT NULL DEFAULT '',
 
     -- ===== 机器层 m_*（仅流水线写入；凡可被 human_overrides 覆写的字段一律带 m_ 前缀）=====
     m_question_text TEXT NOT NULL,               -- Stage 0 经 normalize_text 清洗后的题干（支持 LaTeX）
+    m_options_json TEXT NOT NULL DEFAULT '{}',   -- Stage 0 提取的选择题选项映射 {"A":"1000 米",...}；非选择题为 '{}'
     m_format TEXT NOT NULL CHECK (
         m_format IN ('选择题', '填空题', '判断题', '计算题', '解答题', '证明题', '作图操作题', '实验探究题')
     ),
@@ -418,8 +420,8 @@ CREATE TABLE IF NOT EXISTS questions (
     -- ===== 机器专属列（不可覆写，无 eff_ 对应）=====
     review_reason TEXT NOT NULL DEFAULT '',      -- 机器原因码（逗号分隔）+ 摘要，码表见 §4.3
     part_verdicts_json TEXT NOT NULL DEFAULT '[]', -- 逐小问裁决 [{"label","verify_mode","dual_equal","sympy_ok","judge_note"}]
-    raw_l1_candidates_json TEXT NOT NULL DEFAULT '[]',    -- Stage 2 初始涌现 L1（供 Stage 3a 归纳）
-    raw_l2_candidates_json TEXT NOT NULL DEFAULT '[]',    -- Stage 2 初始涌现 L2
+    raw_l1_candidates_json TEXT NOT NULL DEFAULT '[]',    -- Stage 2 初始涌现 L1（供 Stage 3a 归纳，永不覆盖）
+    raw_l2_candidates_json TEXT NOT NULL DEFAULT '[]',    -- Stage 2 初始涌现 L2（永不覆盖）
     raw_thinking_methods_json TEXT NOT NULL DEFAULT '[]', -- 过黑名单后的原始输出；规范化查询统一走 question_concepts
     raw_classic_motifs_json TEXT NOT NULL DEFAULT '[]',   -- 同上（宁缺毋滥）
     raw_trap_tags_json TEXT NOT NULL DEFAULT '[]',        -- 6 大陷阱枚举子集；规范化查询统一走 question_concepts
@@ -427,12 +429,13 @@ CREATE TABLE IF NOT EXISTS questions (
 
     -- ===== 生效层 eff_*（唯一写入者 core/effective.py：eff = m ⊕ 激活且未挂起的覆写）=====
     eff_question_text TEXT NOT NULL DEFAULT '',
+    eff_options_json TEXT NOT NULL DEFAULT '{}', -- 由 eff_question_text 在 eff_format='选择题' 时确定性提取
     eff_format TEXT NOT NULL DEFAULT '解答题',
     eff_visual_facts TEXT NOT NULL DEFAULT '',
     eff_verification_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (
         eff_verification_status IN ('PENDING', 'VERIFIED_CONSENSUS', 'NEEDS_REVIEW', 'HUMAN_VERIFIED')
     ),
-    eff_review_reason TEXT NOT NULL DEFAULT '',  -- 机器原因码 ∪ OVERRIDE_STALE 等生效层原因码
+    eff_review_reason TEXT NOT NULL DEFAULT '',  -- 机器原因码 ∪ OVERRIDE_STALE / VISUAL_FACTS_EDITED_PENDING_CONFIRM 等生效层原因码
     eff_verification_mode TEXT NOT NULL DEFAULT 'DETERMINISTIC' CHECK (
         eff_verification_mode IN ('DETERMINISTIC', 'QUALITATIVE', 'MIXED')
     ),                                           -- 由 eff_final_answers_json 派生：全部小问 ∈ {SYMBOLIC, EXACT} → DETERMINISTIC；全部 QUALITATIVE → QUALITATIVE；否则 MIXED
@@ -440,6 +443,7 @@ CREATE TABLE IF NOT EXISTS questions (
     eff_abstract_skeleton TEXT NOT NULL DEFAULT '',
     eff_primary_l1_module TEXT NOT NULL DEFAULT '',
     eff_secondary_l1_modules_json TEXT NOT NULL DEFAULT '[]',
+    eff_node_ids_json TEXT NOT NULL DEFAULT '[]', -- 题目级生效 L3 node_id 列表（机器步骤 m_knowledge_node_id 并集 ⊕ 题目级 taxonomy_override_json，经并查集 find() 归一）
     eff_c_score INTEGER, eff_s_score INTEGER, eff_t_score INTEGER, eff_l_score INTEGER,
     eff_base_elo INTEGER CHECK (eff_base_elo IS NULL OR eff_base_elo BETWEEN 800 AND 2800), -- 恒由 core/difficulty.py 从 eff_c/s/t/l 合成
     eff_tier TEXT CHECK (
@@ -465,16 +469,16 @@ CREATE INDEX IF NOT EXISTS idx_q_eff_tier ON questions(grade_subject, eff_tier_r
 
 | 生效列 | 机器来源 | 覆写字段 | 解析规则 | 主要读者 |
 | :--- | :--- | :--- | :--- | :--- |
-| `eff_question_text` | `m_question_text` | `question_text` | 覆写优先 | FTS5、surface 向量、reveal、渲染 |
+| `eff_question_text` / `eff_options_json` | `m_question_text` / `m_options_json` | `question_text` | 覆写优先；`eff_options_json` 在选择题下由生效题干提取 | FTS5、surface 向量、选择题互校、reveal、渲染 |
 | `eff_format` | `m_format` | `format` | 覆写优先 | 检索、渲染留白 |
 | `eff_visual_facts` | `m_visual_facts` | `visual_facts` | 覆写优先 | Stage 2 输入、FTS5、surface 向量 |
 | `eff_final_answers_json` / `eff_verification_mode` | `m_final_answers_json` | `final_answers_json` | 覆写优先；mode 由生效答案派生 | `check`、`reveal=full`、渲染 |
-| `eff_verification_status` / `eff_review_reason` | `m_verification_status` / `review_reason` | `verification_status`（及验真类覆写） | ① 存在被挂起的验真类覆写（题干/读图/答案/解法/验真状态）→ `NEEDS_REVIEW` + `OVERRIDE_STALE`；② 存在激活的 `verification_status` 覆写 → 取其值；③ 否则取机器值 | S2 门禁、`eff_is_servable` |
+| `eff_verification_status` / `eff_review_reason` | `m_verification_status` / `review_reason` | `verification_status`（及验真类覆写） | ① 存在被挂起的验真类覆写或仅改 `visual_facts` 未确认答案 → `NEEDS_REVIEW` + 对应原因码；② 存在激活的 `verification_status` 覆写 → 取其值；③ 否则取机器值 | S2 门禁、`eff_is_servable` |
 | `eff_abstract_skeleton` | `m_abstract_skeleton` | `abstract_skeleton` | 覆写优先 | skeleton 向量、FTS5 |
 | `eff_primary_l1_module` / `eff_secondary_l1_modules_json` | `m_*` | 同名覆写 | 覆写优先（须属于当前生效词表） | 检索、分模块 Elo、组卷 |
 | `eff_c/s/t/l_score` → `eff_base_elo` / `eff_tier` / `eff_tier_rank` | `m_c/s/t/l_score` | `difficulty_override_json` | 覆写优先；Elo/tier 恒由 `difficulty.py` 重算 | 组卷、画像、`SCAFFOLD` |
 | `eff_is_excluded` / `eff_is_servable` | — / `is_retired` | `is_excluded` | 见列注释 | 一切检索与组卷候选池 |
-| `question_steps.eff_knowledge_node_id` | `m_knowledge_node_id` | `taxonomy_override_json` | 按 `step_fingerprint` 匹配覆写条目 | `--l3` 检索、`K_set`、雷达 |
+| `eff_node_ids_json` | `question_steps.m_knowledge_node_id` 并集 | `taxonomy_override_json` | 无覆写取机器步骤活跃 L3 节点并集；有题目级覆写按 `REPLACE`/`ADD` 合并（与步骤重跑解耦） | `--l2/--l3` 检索、`K_set`、热力与雷达 |
 | `question_solutions` / `question_concepts` | Stage 1 run / `raw_*` | `solutions_override_json` / 三类概念覆写 | 物化表本身即生效结果（§3.2-6、§3.2-9） | reveal、Stage 2、`K_set` |
 
 > **写入铁律**：① 流水线只写 `m_*` 与机器专属列，覆写服务只写 `human_overrides`，**二者均在同一事务尾部调用 `effective.recompute(uid)`**；② 除 `core/effective.py` 外任何代码不得写 `eff_*`（测试中以 `sqlite3.Connection.set_authorizer` 拦截对 `eff_*` 列的非授权 `UPDATE` 并断言）；③ 所有检索、组卷、门禁、FTS5/向量编码与导出只读 `eff_*`，读取机器层仅限 Stage Q 机审统计与复核页的双路对比展示；④ `shuati reindex --effective` 可全量重算并与现值比对，Stage Q 报告中差异数应恒为 0。
@@ -508,8 +512,8 @@ CREATE TABLE IF NOT EXISTS question_solutions (
     is_optimal INTEGER NOT NULL DEFAULT 1,       -- 1=该学段最优标准解法（难度评估基准）
     source_origin TEXT NOT NULL CHECK (
         source_origin IN ('PRIMARY_VLM', 'SECONDARY_VLM', 'HUMAN', 'KNOWN_ANSWER')
-    ),                                           -- 内容来源标记；HUMAN 内容的权威副本在 human_overrides
-    origin_run_id INTEGER REFERENCES stage1_vlm_runs(run_id),
+    ),                                           -- 内容来源标记；HUMAN 内容的自包含权威副本在 human_overrides
+    origin_run_id INTEGER,                       -- 溯源整数记录（无外键强绑定，确保 human restore 空库恢复零依赖）
     method_summary TEXT NOT NULL DEFAULT '',     -- 一句话概括该分支路线（如 '赵爽弦图补形法' vs '解析建系法'）
     solution_markdown TEXT NOT NULL,
     sympy_code TEXT,
@@ -522,23 +526,23 @@ CREATE TABLE IF NOT EXISTS question_steps (
     question_uid TEXT NOT NULL REFERENCES questions(question_uid) ON DELETE CASCADE,
     branch_id TEXT NOT NULL DEFAULT 'branch_1',
     step_index INTEGER NOT NULL,                 -- 1..5 逻辑推理步（合并纯四则计算）
-    sub_goal TEXT NOT NULL,                      -- 本步教学子目标（剧透级，仅 reveal=full 返回）
+    sub_goal TEXT NOT NULL,                      -- 本步教学子目标（剧透级，仅 reveal=full 与 HTML 第 ③ 级解析返回）
     core_formula TEXT NOT NULL DEFAULT '',       -- 核心关系式/几何转化式
-    hint TEXT NOT NULL DEFAULT '',               -- 本步防剧透提示：只给思考方向，不含辅助对象名称、中间结论与数值（hint 等级 k 返回前 k 步）
-    step_fingerprint TEXT NOT NULL DEFAULT '',   -- sha256(normalize(sub_goal + core_formula))[:16]，供步骤级覆写与做题卡点锚定
-    raw_l1 TEXT NOT NULL DEFAULT '',
-    raw_l2 TEXT NOT NULL DEFAULT '',
-    raw_l3 TEXT NOT NULL DEFAULT '',
-    m_knowledge_node_id TEXT REFERENCES knowledge_nodes(node_id),   -- Stage 3d 机器对齐结果
-    eff_knowledge_node_id TEXT REFERENCES knowledge_nodes(node_id), -- 生效节点（taxonomy_override_json 按 step_fingerprint 覆盖）；读取时经并查集 find() 解析到活跃节点
+    hint TEXT NOT NULL DEFAULT '',               -- 本步防剧透提示：只给思考方向，不含辅助对象名称、中间结论与数值（hint 等级 k 与 HTML 第 ① 级折叠区使用）
+    raw_l1 TEXT NOT NULL DEFAULT '',             -- Stage 2 初始涌现 L1（只读，严禁被 Stage 3 覆盖，供全量 propose 使用）
+    raw_l2 TEXT NOT NULL DEFAULT '',             -- Stage 2 初始涌现 L2（只读，严禁被 Stage 3 覆盖）
+    raw_l3 TEXT NOT NULL DEFAULT '',             -- Stage 2 初始脱壳 L3 算子（只读）
+    m_l1 TEXT NOT NULL DEFAULT '',               -- Stage 3c 对齐后的当前词表 L1
+    m_l2 TEXT NOT NULL DEFAULT '',               -- Stage 3c 对齐后的当前词表 L2
+    m_knowledge_node_id TEXT REFERENCES knowledge_nodes(node_id), -- Stage 3d 在 (grade_subject, taxonomy_version, m_l1, m_l2) 作用域内匹配/新建的 L3 节点
     UNIQUE(question_uid, branch_id, step_index),
     FOREIGN KEY (question_uid, branch_id) REFERENCES question_solutions(question_uid, branch_id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_steps_node ON question_steps(eff_knowledge_node_id);
+CREATE INDEX IF NOT EXISTS idx_steps_node ON question_steps(m_knowledge_node_id);
 ```
-> **`question_solutions` 是物化派生表**：由 Stage 1 收尾函数 `materialize_solutions(uid)` 依据“最新 `OK` 的 `stage1_vlm_runs` + 生效的 `solutions_override_json` / `final_answers_json` 覆写”重建，任何代码不得直接编辑；因此复核页“采纳辅路为 `branch_1`”“一题多解”等操作的权威记录永远在 `human_overrides`，重跑后可无损复现。**答案—解法一致性校验**：物化后若生效 `branch_1` 的来源 run 带有结构化答案，且其与 `eff_final_answers_json` 不等价，则在覆写写入场景直接拒绝写入，在重跑场景将题目置 `NEEDS_REVIEW` + `ANSWER_SOLUTION_CONFLICT`，杜绝“新机器解法 + 旧人工答案”的混搭流入 Stage 2。
+> **`question_solutions` 是物化派生表**：由 Stage 1 收尾函数 `materialize_solutions(uid)` 依据“最新 `OK` 的 `stage1_vlm_runs` + 激活且未挂起的自包含 `solutions_override_json`”重建，任何代码不得直接编辑；因此复核页“采纳某路为 `branch_1`”“一题多解”等操作的权威记录永远在 `human_overrides`，重跑或空库恢复后均可 100% 无损复现。**答案—解法一致性校验**：物化后若使用机器 run 作为 `branch_1` 且其声明的结构化答案与 `eff_final_answers_json` 不等价，在重跑场景将题目置 `NEEDS_REVIEW` + `ANSWER_SOLUTION_CONFLICT`，杜绝“新机器解法 + 旧人工答案”混搭流入 Stage 2。
 
-#### 7. 人工覆盖层表（`human_overrides`，永不丢失 + 指纹挂起）
+#### 7. 人工覆盖层表（`human_overrides`，永不丢失 + 指纹整条挂起）
 ```sql
 CREATE TABLE IF NOT EXISTS human_overrides (
     override_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -555,11 +559,11 @@ CREATE TABLE IF NOT EXISTS human_overrides (
     reason TEXT NOT NULL DEFAULT '',             -- 人工批注/修正说明
     source TEXT NOT NULL CHECK (source IN ('REVIEW_UI', 'PI_CLI', 'PI_MCP', 'MANUAL_YAML', 'ANCHOR_CALIBRATION')),
     bundle_id TEXT,                              -- 原子组：ADOPT_RUN 等一次操作写入的多条覆写共享同一 bundle_id，撤销/挂起按组生效
-    base_fingerprint TEXT NOT NULL,              -- 写入时所依据的上游指纹（规则见下表）
+    base_fingerprint TEXT NOT NULL,              -- 写入时所依据的源题指纹 raw_questions.content_hash
     taxonomy_version TEXT NOT NULL DEFAULT '',   -- 引用词表名称的字段记录写入时词表版本，供换版/锁表/升级迁移
     is_active INTEGER NOT NULL DEFAULT 1,        -- 新覆写生效时旧行置 0；撤回置 0 并记 revoked_at
-    is_suspended INTEGER NOT NULL DEFAULT 0,     -- 1=上游指纹失配被自动挂起：保留但不生效，等待人工确认
-    suspended_reason TEXT NOT NULL DEFAULT '',   -- SOURCE_CHANGED / STEP_ORPHANED / TAXONOMY_UNMAPPED
+    is_suspended INTEGER NOT NULL DEFAULT 0,     -- 1=指纹或词表失配被整条自动挂起：保留但不生效，等待人工确认
+    suspended_reason TEXT NOT NULL DEFAULT '',   -- SOURCE_CHANGED / TAXONOMY_UNMAPPED
     revoked_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -574,23 +578,22 @@ CREATE INDEX IF NOT EXISTS idx_overrides_suspended ON human_overrides(is_suspend
 | 字段 | 结构 |
 | :--- | :--- |
 | `final_answers_json` | `AnswerPart[]`（同 §3.2-3） |
-| `solutions_override_json` | `{"branches":[{"branch_id":"branch_1","is_optimal":1,"origin_run_id":12|null,"method_summary":"...","solution_markdown":"..."}]}`；`origin_run_id` 非空表示“采纳某路原文” |
+| `solutions_override_json` | **自包含结构**：`{"branches":[{"branch_id":"branch_1","is_optimal":1,"origin_run_id":12\|null,"method_summary":"...","solution_markdown":"...","sympy_code":"..."}]}`；`ADOPT_RUN` 时将选中 run 的全文完整拷入，不反查 `stage1_vlm_runs` |
 | `difficulty_override_json` | `{"C":3,"S":2,"T":3,"L":1,"note":"..."}`，生效层用确定性公式重算 `eff_base_elo` / `eff_tier` |
-| `taxonomy_override_json` | `{"taxonomy_version":"1.0","steps":[{"branch_id":"branch_1","step_fingerprint":"9f2c41d0a7b3e815","step_index_hint":2,"l1":"平面几何","l2":"三角形比例模型","l3":"等高三角形面积比转底边比"}]}`；**以 `step_fingerprint` 而非 `step_index` 定位步骤**，`step_index_hint` 仅供人读；词表换版/锁表时按 §4.5 迁移 |
+| `taxonomy_override_json` | **题目级考点覆写（与步骤重跑彻底解耦）**：`{"taxonomy_version":"1.0","mode":"REPLACE"\|"ADD","nodes":[{"l1":"平面几何","l2":"三角形比例模型","l3":"等高三角形面积比转底边比","node_id":"..."}]}`；直接挂在 `question_uid` 上并物化入 `questions.eff_node_ids_json`，Stage 2 换模型/改 Prompt 重跑步骤时**永不失效**；词表换版/锁表时按 §4.5 自动迁移 |
 | `thinking_methods_json` / `classic_motifs_json` / `trap_tags_json` | 名称数组；按 `(question_uid, kind)` 执行**全量替代物化**（清除同 `kind` 机器行，写入 `origin='HUMAN'` 行；撤回或挂起时恢复物化机器行） |
 | `is_excluded` | `"1"` / `"0"`：人工下架坏题（与源侧 `is_retired` 合并为 `eff_is_servable`） |
 
-**`base_fingerprint` 规则与挂起后果**：
+**`base_fingerprint` 规则与整条挂起后果**：
 
 | 字段组 | `base_fingerprint` 组成 | 失配触发 | 挂起后果 |
 | :--- | :--- | :--- | :--- |
-| 验真类：`question_text`、`visual_facts`、`final_answers_json`、`solutions_override_json`、`verification_status`、`format`、`is_excluded` | `raw_questions.content_hash` | 源题干或配图修订（§4.2-3） | 同 `bundle_id` 整组挂起；`eff_verification_status = NEEDS_REVIEW`，`eff_review_reason` 追加 `OVERRIDE_STALE`，退出组卷池 |
-| 标注类：`difficulty_override_json`、`abstract_skeleton`、`thinking_methods_json`、`classic_motifs_json`、`trap_tags_json`、`primary_l1_module`、`secondary_l1_modules_json` | `raw_questions.content_hash` | 同上 | 退回机器值，列入 Stage Q“覆写待复核”清单 |
-| 步骤知识点：`taxonomy_override_json` | `content_hash`；条目级另以 `step_fingerprint` 匹配 | 源题修订；或 Stage 2 重跑后某条目的 `step_fingerprint` 在新步骤中找不到（`STEP_ORPHANED`） | 源题修订则整条挂起；`STEP_ORPHANED` 时仅失配条目不生效，其余条目照常，整条覆写列入待复核 |
+| 验真类：`question_text`、`visual_facts`、`final_answers_json`、`solutions_override_json`、`verification_status`、`format`、`is_excluded` | `raw_questions.content_hash` | 源题干、配图或配图顺序修订（§4.2-3） | 同 `bundle_id` 整组挂起；`eff_verification_status = NEEDS_REVIEW`，`eff_review_reason` 追加 `OVERRIDE_STALE`，退出组卷池 |
+| 标注与考点类：`difficulty_override_json`、`abstract_skeleton`、`thinking_methods_json`、`classic_motifs_json`、`trap_tags_json`、`primary_l1_module`、`secondary_l1_modules_json`、`taxonomy_override_json` | `raw_questions.content_hash`（词表类另检 `taxonomy_version`） | 源题修订；或词表换版/升级时名称无法自动映射 | 整条覆写挂起（`SOURCE_CHANGED` / `TAXONOMY_UNMAPPED`），退回机器值，列入 Stage Q“覆写待复核”清单 |
 
-> **复核与解挂**：复核页（`K` 键）与 `shuati override <uid> --reconfirm` 提供“确认仍有效”，实现为**以当前指纹复制一条新覆写并停用旧行**（保留完整历史）；`--revoke` 撤销。词表名称失配（换版/锁表/升级后找不到对应 L1/L2）先由 §4.5 迁移流程按名称与 `aliases` 自动重签，迁移失败才以 `TAXONOMY_UNMAPPED` 挂起。
+> **复核与解挂**：复核页（`K` 键）与 `shuati override <uid> --reconfirm` 提供“确认仍有效”，实现为**以当前指纹复制一条新覆写并停用旧行**（保留完整历史）；`--revoke` 撤销。词表名称失配（换版/锁表/升级后找不到对应 L1/L2）先由 §4.5 迁移流程按名称与 `aliases` 自动重签，迁移失败才以 `TAXONOMY_UNMAPPED` 整条挂起。
 
-> **覆写生效规则**：覆写写入、挂起、撤销或重签后，同一事务内调用 `effective.recompute(uid)` 刷新 `eff_*`，并由 `core/refresh.py` 标记下游 `STALE`（§4.8）；重算过程**只写机器层与生效层，绝不修改覆写的值**（挂起标记仅由 `refresh.py` 在指纹比对时设置）。新增或变更的覆写行在同一服务调用内追加到 `human/overrides.jsonl`（§3.6）。
+> **覆写生效规则**：覆写写入、挂起、撤销或重签后，同一事务内调用 `effective.recompute(uid)` 刷新 `eff_*`，并由 `core/refresh.py` 标记下游 `STALE`（§4.8）；重算过程**只写机器层与生效层，绝不修改覆写的值**。事务提交后，同一服务调用内同步导出 `human/overrides.jsonl` 全表原子快照（§3.6）。
 
 #### 8. 三层知识网节点表（`knowledge_nodes`）、知识点拓扑边（`knowledge_edges`）、词表候选（`taxonomy_candidates`）与归并审计账本（`compaction_audit_ledger`）
 ```sql
@@ -598,16 +601,22 @@ CREATE TABLE IF NOT EXISTS knowledge_nodes (
     node_id TEXT PRIMARY KEY,                    -- UUID 或确定性短 ID
     grade_subject TEXT NOT NULL REFERENCES grade_subjects(grade_subject),
     taxonomy_version TEXT NOT NULL,              -- 节点所依附的词表版本（'draft-N' 为临时节点，锁表后整体重建）
+    node_level TEXT NOT NULL DEFAULT 'L3' CHECK (node_level IN ('L2', 'L3')), -- L2=汇总节点(仅供L2级拓扑边挂载), L3=脱壳原子转化算子
     l1_module TEXT NOT NULL,                     -- 词表 L1
     l2_entity TEXT NOT NULL,                     -- 词表 L2
-    l3_operator TEXT NOT NULL,                   -- 4~14 字脱壳原子转化算子
+    l3_operator TEXT NOT NULL,                   -- L3 为 4~14 字脱壳原子转化算子；L2 汇总节点恒为 ''
     aliases_json TEXT NOT NULL DEFAULT '[]',     -- 同义别称列表（上限 12）
-    redirect_to_id TEXT REFERENCES knowledge_nodes(node_id), -- 可逆并查集父指针（NULL=活跃主节点，路径压缩保证跳数 <= 1）
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    redirect_to_id TEXT REFERENCES knowledge_nodes(node_id), -- 可逆并查集父指针（仅 L3 使用；NULL=活跃主节点，路径压缩保证跳数 <= 1）
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (
+        (node_level = 'L2' AND l3_operator = '' AND redirect_to_id IS NULL)
+        OR (node_level = 'L3' AND l3_operator != '')
+    )
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_kn_active ON knowledge_nodes(grade_subject, taxonomy_version, l1_module, l2_entity, l3_operator)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_kn_active
+    ON knowledge_nodes(grade_subject, taxonomy_version, node_level, l1_module, l2_entity, l3_operator)
     WHERE redirect_to_id IS NULL;
-CREATE INDEX IF NOT EXISTS idx_kn_scope ON knowledge_nodes(grade_subject, l1_module, l2_entity, redirect_to_id);
+CREATE INDEX IF NOT EXISTS idx_kn_scope ON knowledge_nodes(grade_subject, node_level, l1_module, l2_entity, redirect_to_id);
 CREATE INDEX IF NOT EXISTS idx_kn_redirect ON knowledge_nodes(redirect_to_id) WHERE redirect_to_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS knowledge_edges (
@@ -770,15 +779,15 @@ CREATE TABLE IF NOT EXISTS practice_log (
     outcome TEXT NOT NULL CHECK (
         outcome IN ('SOLVED_SOLO', 'SOLVED_WITH_HINT', 'WRONG', 'SKIPPED', 'VOIDED')
     ),
+    score_ratio REAL CHECK (score_ratio IS NULL OR (score_ratio >= 0.0 AND score_ratio <= 1.0)), -- 可选：多小问部分得分比例（如 2/3 问做对记 0.67，驱动在线 Elo 平滑计分）
     voids_log_id INTEGER REFERENCES practice_log(log_id), -- 仅 VOIDED 冲销记录使用：指向被作废的误登记
     stuck_step_index INTEGER,                    -- 可选：卡在哪一步（1-based，仅作登记时参考）
-    stuck_step_fingerprint TEXT,                 -- 登记时快照：卡点步骤指纹
-    stuck_node_id TEXT,                          -- 登记时快照：卡点步骤的生效知识节点（读时经并查集展开；Stage 2 重跑不改变历史含义）
+    stuck_node_id TEXT,                          -- 登记时快照：卡点步骤的知识节点（读时经并查集展开；Stage 2 重跑不改变历史含义）
     stuck_sub_goal TEXT,                         -- 登记时快照：卡点步骤子目标文本
     hint_level_used INTEGER,                     -- 可选：看到第几级提示（与 detail --hint-level 对应）
     user_note TEXT NOT NULL DEFAULT '',          -- 复盘笔记
     submitted_answer TEXT,                       -- 可选：经 shuati check --log 提交的学习者答案原文
-    quiz_batch_id TEXT REFERENCES quiz_batches(quiz_batch_id),
+    quiz_batch_id TEXT,                          -- 组卷批次软引用（不设强外键，防止空库 human restore 因缺失会话表报错）
     client_request_id TEXT,                      -- 幂等键：同一 learner 下重复提交直接返回已有 log_id
     CHECK ((outcome = 'VOIDED') = (voids_log_id IS NOT NULL)),
     CHECK (outcome != 'SOLVED_SOLO' OR hint_level_used IS NULL OR hint_level_used = 0),
@@ -787,6 +796,7 @@ CREATE TABLE IF NOT EXISTS practice_log (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_practice_voids ON practice_log(voids_log_id) WHERE voids_log_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_practice_learner_time ON practice_log(learner_id, practiced_at DESC);
 CREATE INDEX IF NOT EXISTS idx_practice_learner_q ON practice_log(learner_id, question_uid, practiced_at DESC);
+CREATE INDEX IF NOT EXISTS idx_practice_batch ON practice_log(quiz_batch_id) WHERE quiz_batch_id IS NOT NULL;
 ```
 > 冲销保护规则：写入 `VOIDED` 时服务层强制校验被冲销记录存在、属于同一 `(learner_id, question_uid)`、且自身非 `VOIDED`；数据库级 `uq_practice_voids` 防止同一记录被重复冲销。画像与组卷读取 `practice_log` 时，先剔除 `VOIDED` 记录及其 `voids_log_id` 指向的记录。
 
@@ -794,7 +804,7 @@ CREATE INDEX IF NOT EXISTS idx_practice_learner_q ON practice_log(learner_id, qu
 ```sql
 CREATE TABLE IF NOT EXISTS llm_calls (
     call_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    stage TEXT NOT NULL,                         -- 'S1' / 'S1_JUDGE' / 'S1_TEXT_RESOLVE' / 'S2' / 'S3A' / 'S3C' / 'S3D_JUDGE' / 'S3E' / 'S4_REFINE' / 'DIAGNOSE' / 'CHECK_JUDGE' / 'EMBED'
+    stage TEXT NOT NULL,                         -- 'S1' / 'S1_JUDGE' / 'REVIEW_RESOLVE' / 'S2' / 'S3A' / 'S3C' / 'S3D_JUDGE' / 'S3E' / 'S4_REFINE' / 'DIAGNOSE' / 'CHECK_JUDGE' / 'EMBED'
     slot TEXT NOT NULL,                          -- vlm_primary / vlm_secondary / text_llm / judge_llm / embedding
     model_name TEXT NOT NULL,
     question_uid TEXT,                           -- 学段级批处理或草稿期可为空（不设外键）
@@ -832,7 +842,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS questions_fts USING fts5(
 - 按 `(grade_subject, channel)` 分别保存压缩的 `.npz` 文件：
   - `surface_<slug>.npz`：`uids: str[N]`, `text_hashes: str[N]`, `vectors: float32[N, D]`（已 L2 归一化，对 `eff_question_text + eff_visual_facts` 编码）
   - `skeleton_<slug>.npz`：同结构（对 `eff_abstract_skeleton` 编码）
-  - `l3_nodes_<slug>.npz`：`node_ids: str[M]`, `vectors: float32[M, D]`（对 `L1 + L2 + L3 + aliases` 编码）
+  - `l3_nodes_<slug>.npz`：`node_ids: str[M]`, `vectors: float32[M, D]`（仅对活跃 `node_level='L3'` 节点的 `L1 + L2 + L3 + aliases` 编码，排除 `L2` 汇总节点）
   - 跨学段同构检索在查询时拼接各学段 `skeleton_*` 矩阵，无需另存全局副本。
 - **过期检测**：`text_hashes` 与当前生效文本哈希不一致即视为过期，`refresh.py` 只重编码过期行。
 - **性能与增量**：10,000 题 × 1536 维 float32 仅占 ~60MB，单次 Top-K 点积耗时 `< 5ms`；单题追加时内存拼接后原子写临时文件再 `os.replace` 替换；所有 `.npz` 写入（Stage 4 全量、`refresh.py`、`ingest-mistake`）须先获取跨进程文件锁 `data/vectors/.lock`，防止“读—改—写”丢更新。
@@ -901,11 +911,11 @@ anchors:
 
 > 学习者数据（`practice_log` / `quiz_batches`）属个人隐私，不进入默认导出；如需备份使用 `shuati export --learner-data`。
 
-### 3.6 人工资产 git 镜像与破坏性操作快照（不变量 9）
+### 3.6 人工资产 git 快照镜像与破坏性操作备份（不变量 9）
 
-- **镜像文件**（纳入 git，与已 gitignore 的 `data/` 分离）：`human/overrides.jsonl`、`human/relation_overrides.jsonl`、`human/practice_log.jsonl`、`human/learners.jsonl`。每行一条事件（含原始主键、全部列值与 `op ∈ {INSERT, DEACTIVATE, SUSPEND, RESUME}`），**只追加**；由 `db/human_mirror.py` 在写库事务提交后、同一服务调用内追加并 `fsync`。系统只写文件，**不自动 `git commit`**（遵循仓库提交纪律，由用户自行提交）。
-- **恢复**：`shuati human restore [--from human/]` 在空库或现库上按事件顺序幂等重放（以原始主键 / `client_request_id` 去重），随后执行 `reindex --effective`。
-- **一致性巡检**：`shuati human verify` 与 Stage Q 比对库内行数、最大 ID 与镜像末行，不一致即告警。
+- **全表原子快照文件**（纳入 git，与已 gitignore 的 `data/` 分离）：`human/overrides.jsonl`、`human/relation_overrides.jsonl`、`human/learners.jsonl`（以及当 `include_practice_log: true` 时的 `human/practice_log.jsonl`）。每份文件存放对应表**按主键升序排列的完整行记录**（含 `is_active=0` 与 `VOIDED` 历史行，确定性键序 JSON，每行一记录）；每次人工写库事务提交后，由 `db/human_mirror.py` 在同一服务调用内写出临时文件并 `os.replace` 原子覆盖（几百～几千行耗时 `< 5ms`，`git diff` 直接呈现真实字段变更，无需复杂事件流重放状态机）。系统只写文件，**不自动 `git commit`**（遵循仓库提交纪律，由用户自行提交）。
+- **恢复**：`shuati human restore [--from human/]` 在空库或现库单一事务内按 `learners → human_overrides → relation_overrides → practice_log` 顺序执行幂等 `INSERT OR REPLACE`（`practice_log.quiz_batch_id` 为软引用，不依赖会话表），随后执行 `reindex --effective`。
+- **一致性巡检**：`shuati human verify` 与 Stage Q 直接比对库内全表导出结果与磁盘 `human/*.jsonl` 内容哈希，不一致即告警。
 - **快照**：`taxonomy lock|migrate`、`compile --force`、`graph revert-merge`、`human restore` 执行前自动 `VACUUM INTO data/backups/<ts>_<command>.db`，默认保留最近 10 份。
 - **隐私开关**：`human/practice_log.jsonl` 含学习者做题记录；若仓库会推送到公共远端，可在 `settings.yaml` 中设 `human_mirror.include_practice_log: false`，改用 `export --learner-data` 本地备份。
 
@@ -922,11 +932,11 @@ anchors:
 
    | 阶段 | `compile_state.stage` | `input_hash` 组成要素 |
    | :--- | :--- | :--- |
-   | Stage 1 | `S1` | `Effective(question_text, cas_images)` + `vlm_primary.model` + `vlm_secondary.model` + `dual_vlm_policy` + `s1_prompt_version` |
+   | Stage 1 | `S1` | `Effective(question_text, cas_images, image_captions)` + `vlm_primary.model` + `vlm_secondary.model` + `dual_vlm_policy` + `s1_prompt_version` |
    | Stage 2 | `S2` | `Effective(question_text, visual_facts, solutions, final_answers)` + `grade_subject.anchors_version` + `text_llm.model` + `s2_prompt_version` |
-   | Stage 3c | `S3C` | `Stage2 产物哈希` + `grade_subject.taxonomy_version` + `s3c_prompt_version` |
-   | Stage 3d | `S3D` | `question_steps(raw_l1, raw_l2, raw_l3)` + `taxonomy_version` + `embedding.model` |
-   | Stage 4 | `S4` | `Effective(abstract_skeleton, node_ids, concept_ids, base_elo)` + `vectors.meta_version` + `topology.rule_version` |
+   | Stage 3c | `S3C` | `Stage2 产物哈希(raw_l1_candidates, question_steps.raw_l1/raw_l2)` + `grade_subject.taxonomy_version` + `s3c_prompt_version` |
+   | Stage 3d | `S3D` | `question_steps(m_l1, m_l2, raw_l3)` + `Active(taxonomy_override_json)` + `taxonomy_version` + `embedding.model` |
+   | Stage 4 | `S4` | `Effective(abstract_skeleton, eff_node_ids_json, concept_ids, base_elo)` + `vectors.meta_version` + `topology.rule_version` |
 
    > 表中 `Effective(x)` 均指对应的 `eff_*` 生效列（或物化生效表）。`question_uid` / `source_collection` 不计入任何指纹，也不进入 Prompt（不变量 1）。
 
@@ -934,7 +944,7 @@ anchors:
    - 执行 `shuati compile --stage <stage> [--grade-subject ...] [--only-uids ...] [--force]` 时，仅处理 `status ∈ {PENDING, FAILED, STALE}` 或当前计算出的 `input_hash != compile_state.input_hash` 的题；`OK` 且指纹一致的题跳过；`is_retired = 1` 或 `eff_is_excluded = 1` 的题跳过；
    - **上游门禁（通用规则）**：某题第 N 阶段仅当其全部上游阶段（S1 → S2 → S3C → S3D → S4）均为 `OK` 时才可执行，否则置 `BLOCKED` 且不消耗 Token；上游转为 `OK` 时由 `refresh.py` 将直接下游的 `BLOCKED` 改为 `STALE`。S2 额外要求 `eff_verification_status ∈ {VERIFIED_CONSENSUS, HUMAN_VERIFIED}`；
    - **已人工定稿题的 S1 策略**：`eff_verification_status = HUMAN_VERIFIED`（存在激活且未挂起的验真类覆写）的题，S1 因换模型或 Prompt 变 `STALE` 时**默认跳过**（机器结果不会生效，避免浪费视觉 Token），传 `--include-human-verified` 才重跑以供对比；
-   - 若某题生效状态 `eff_verification_status` 为 `NEEDS_REVIEW`（含覆写挂起导致的 `OVERRIDE_STALE`），其 `S2` 状态自动标记为 `BLOCKED`（不消耗后续 Token）；人工复核转为 `HUMAN_VERIFIED` 后自动解除 `BLOCKED` 并置 `S2 = STALE`；
+   - 若某题生效状态 `eff_verification_status` 为 `NEEDS_REVIEW`（含覆写挂起导致的 `OVERRIDE_STALE` 或单独改读图未定稿答案），其 `S2` 状态自动标记为 `BLOCKED`（不消耗后续 Token）；人工复核转为 `HUMAN_VERIFIED` 后自动解除 `BLOCKED` 并置 `S2 = STALE`；
    - 任何阶段开始前将 `compile_state.status` 置 `RUNNING`、`attempts += 1`，进程异常中断重启时将遗留 `RUNNING` 自动重置为 `PENDING` 续跑；
    - **跨进程编译锁**：`ingest`、`compile`、`ingest-mistake`、`taxonomy lock|migrate`、`graph compact|revert-merge`、`reindex` 启动时须独占获取 `data/.compile.lock`（Windows `msvcrt.locking` / Unix `fcntl.flock`，锁文件内记录 PID 与启动时间），获取失败即以 `PRECONDITION_FAILED` 退出；**只有持锁进程才允许把遗留 `RUNNING` 重置为 `PENDING`**。学习者命令（`log`、`check`、`override`、`profile` 等）无需此锁，依靠 WAL + `busy_timeout` 与编译进程的单题小事务共存；
    - **单写者队列**：异步协程并发请求外部 API（受各槽位 `Semaphore` + 令牌桶限流），结果统一推入 `asyncio.Queue`，由单一 SQLite 写协程按单题小事务落盘，彻底杜绝并发写锁冲突。
@@ -948,68 +958,75 @@ anchors:
 1. **来源集合与确定性主键**：
    - `source_collection` = `problems.jsonl` 父目录相对 `题库/` 的 POSIX 路径（如 `ch28_平面直线图形高年级卷`）；
    - `question_uid = f"{slug}:{source_collection}:{source_id}"`，跨章节、跨教辅永不撞号。
-2. **图片完整性体检与 CAS 归档**：
-   - 解析 `chapter_dir / img_rel`，校验文件存在且 Pillow `Image.verify()` 通过（记录宽高与格式；损坏或缺失则记入体检报告并拒入该题）；
-   - 计算图片内容 `SHA-256` 前 16 位写入 `data/assets/images/<hash>.<ext>`（已存在则原子跳过），原始 `题库/` 目录全程只读。
-3. **文本规范化、内容哈希与跨源去重**：
-   - **`normalize_text` 规则**（确定性、可单测；结果写入 `m_question_text`，原文保留在 `raw_question`）：① `$...$` 内的 LaTeX 原样保留；② 两侧均为汉字或中文标点的换行直接合并（修复 OCR 断词，如 `ch28_010` 中被断开的“面\n\n积”、`ch28_030`、`ch28_096`）；③ 删除仅含单个大写字母的孤立行（OCR 残留的图中标签，如 `ch01_012` 末尾的 `A\n\nB`），选项行（`A. ...`）不受影响；④ 行首尾去空白、连续空白折叠为单空格、多个空行折叠为一个；⑤ 全角数字与字母转半角（`Ａ`→`A`），中文标点保持不变。规则以 `tests/fixtures/` 中的真实样本回归锁定；
-   - `content_hash = sha256(normalize_text(raw_question) + "|" + ",".join(sorted(cas_images)))`；
-   - **同 `(grade_subject, source_collection, source_id)` 再次导入**：
-     - `content_hash` 未变 → 幂等跳过；
-     - `content_hash` 变化（源题干/配图修订）→ **原地更新** `raw_questions` 与 `questions` 基础字段，将 `S1` 起所有 `compile_state` 置 `STALE`（绝不删行）；保留既有 `human_overrides` 并在 Stage Q 报告中列出“源题变更且含覆写待复核清单”。
-   - **不同来源但同 `grade_subject` 命中相同 `content_hash`**：视为跨教辅完全同题——**副本照常建 `raw_questions` 行**（保留其 `source_id` 与 `legacy_tags`）并置 `duplicate_of_uid = 主题 uid`，但不建 `questions` / `compile_state` 行；重复导入按 `(collection, source_id)` 幂等；`source_id` 简写解析到副本时自动重定向主题；若此后任一方源侧修订导致哈希不再相同，副本自动解除 `duplicate_of_uid` 并作为新题进入流水线。
+2. **图片完整性体检、EXIF 规范与保序 CAS 归档**：
+   - 解析 `chapter_dir / img_rel`，校验文件存在且 Pillow 可正常解码（记录宽高、格式与 EXIF Orientation；损坏或缺失则记入体检报告并拒入该题；若 `min(width, height) < 120` 或含非正向 EXIF 旋转标记，记入体检告警）；
+   - **原始 `题库/` 图片**：保持只读无损原字节计算 `SHA-256` 前 16 位写入 `data/assets/images/<hash>.<ext>`（Stage 1 送 VLM 前在内存中执行 `ImageOps.exif_transpose()` 保证正向）；
+   - **外部拍照错题图片（`diagnose` / `ingest-mistake`）**：入库归档前固定执行 `ImageOps.exif_transpose()` 矫正方向、RGBA/P 转 RGB，并将长边等比限制在 `max_external_image_px`（默认 `2048px`）后再计算 CAS 哈希归档，杜绝手机横竖屏 90°/180° 翻转读图错误及超大内联 HTML。
+3. **文本规范化、多图题注绑定、保序哈希与同源/跨源去重**：
+   - **`normalize_text` 与多图题注提取规则**（确定性、可单测；结果写入 `m_question_text` 与 `image_captions_json`，原文保留在 `raw_question`）：
+     ① `$...$` 内的 LaTeX 原样保留；
+     ② **精确修复 OCR 断词而不吞段落**：仅当换行左侧为汉字（或非句末标点 `，、`）、右侧为汉字，且右侧行不构成独立图注（如 `^图\s*[0-9一二三四五六七八九十]+$`）时直接合并换行（修复 `ch28_010`“面\n\n积”、`ch28_030`“小\n\n叶”、`ch28_096`“的\n\n面积”）；句末/分句标点（`。？！；：`）后的换行完整保留（保护 `ch01_016` 等正常分段）；
+     ③ **多图子图题注绑定 vs 单图残留字母清理**：当 `len(images) >= 2` 且题干末尾连续孤立短行数量恰好等于图片数、匹配子图标签序列（如 `ch01_012` 末尾 `A` / `B`、`ch28_083` 末尾 `图1` / `图2`，原图内部均无此印刷标签）时，将其提取为保序的 `image_captions_json` 与 `cas_images_json` 一一绑定，再从题干末尾剥离；仅在非多图题注序列时删除孤立单个大写字母行，选项行（`A. ...`）不受影响；
+     ④ 行首尾去空白、连续空白折叠为单空格、多个空行折叠为一个；
+     ⑤ 全角数字与字母转半角（`Ａ`→`A`），中文标点保持不变。
+   - **保序内容哈希**：`content_hash = sha256(normalize_text + "|" + ",".join(cas_images) + "|" + ",".join(image_captions))`（**严禁对 `cas_images` 排序**，确保修正多图顺序时能触发更新重算）；
+   - **去格式重扫预检指纹**：同步计算 `plain_fingerprint`（剥离 `$`、空白并将 `\triangle`→`△` 等同义符号归一后的纯文本哈希 + 图片数，有图题辅以 Pillow `8×8 dHash`）：
+     - **同 `(grade_subject, source_collection, source_id)` 再次导入**：`content_hash` 未变 → 幂等跳过；`content_hash` 变化 → **原地更新** `raw_questions` 与 `questions` 基础字段，将 `S1` 起所有 `compile_state` 置 `STALE`（绝不删行），指纹失配覆写自动整条挂起；
+     - **同一 `grade_subject` 下任意已入库的不同 `question_uid`（含同集合内不同 `source_id` 及跨教辅）命中相同 `content_hash`**：副本照常建 `raw_questions` 行并置 `duplicate_of_uid = 主题 uid`，不建 `questions` / `compile_state` 行；`source_id` 简写解析到副本时自动重定向主题；
+     - **疑似同题重扫检测（如实测 `ch28_015` 与 `ch28_057`）**：`content_hash` 不同但 `plain_fingerprint` 相同（且配图 `dHash` 汉明距离 $\le 4$）时，在 Stage 0 报告列入“高置信疑似重扫重题清单”，支持传 `--dedup-near` 直接标为 `duplicate_of_uid` 省去双倍 VLM 开销。
    - **源题消失检测**：每次全量扫盘生成 `scan_id`，本次出现的 raw 行更新 `last_seen_scan_id`；已扫描集合内本次未出现的 raw 行置 `is_missing_from_source = 1`，列入体检报告“下架候选”，经 `shuati ingest --apply-retire` 确认后才置 `questions.is_retired = 1`（防止误删目录导致批量下架）。
-4. **行首锚定选择题纠偏正则（防误伤几何字母）**：
+4. **行首锚定选择题纠偏正则与选项表提取（防误伤几何字母）**：
    - 仅当题干满足以下**全部条件**时，才将原 `format`（如 `填空题`/`解答题`）纠偏为 `选择题`：
      1. 按行扫描，存在行首匹配的选项 `A`：`^[ \t]*[AＡ][\.\、．\)\）]\s*\S+`；
      2. 在其后存在行首匹配的选项 `B`：`^[ \t]*[BＢ][\.\、．\)\）]\s*\S+`（可选后续 `C`/`D`/`E`，允许单行内以 `\s{2,}` 分隔的横向选项 `A. ...  B. ...  C. ...  D. ...`）；
      3. 选项行内容非纯几何顶点声明（如不含“如图”“点 A. ”类句中句号）。
-   - 该正则在 `tests/fixtures/` 中针对 122 题全量样本（含 `ch28_003`、`ch28_016` 正例，以及其余 76 道同时含 `A`/`B` 几何字母的易误伤反例；v2.3 评审实测当前正则仅命中上述 2 道正例、零误伤，并正确跳过 `ch01_012` 的 OCR 残留标签行）做回归锁定；
-   - 原 `操作构造题` 映射为标准枚举 `作图操作题`。
+   - 识别为 `选择题` 时，同步将各选项内容解析为结构化字典写入 `m_options_json` / `eff_options_json`（如 `{"A": "1000 米", "B": "1200 米", "C": "1300 米", "D": "1700 米"}`；解析不确定时留空 `{}`）；
+   - 该正则针对 122 题全量样本（命中 `ch28_003`、`ch28_016` 2 道正例，76 道含 `A`/`B` 几何字母反例零误伤）做回归锁定；原 `操作构造题`（如 `ch28_031`）映射为标准枚举 `作图操作题`。
 5. **旧标签物理隔离**：
-   - `chapter` 与 `tags` 仅写入 `raw_questions.raw_chapter` / `legacy_tags_json`，`questions` 表初始化不拷贝这两字段。
+   - `chapter`（转为字符串）与 `tags` 仅写入 `raw_questions.raw_chapter` / `legacy_tags_json`，`questions` 表初始化不拷贝这两字段。
 
 ---
 
 ### 4.3 Stage 1：视觉转译 + 双盲双 VLM + 分小问验真 + 复核页（`pipeline/stage1_solve.py` & `review/`）
 
-**硬隔离契约**：Stage 1 唯一允许接收的输入对象为 `Stage1Input(question_uid, grade_subject, question_text, cas_images)`，**类型定义上不含 `raw_chapter` 与 `legacy_tags`**；`question_uid` 仅用于请求元数据与日志关联，`llm/prompt_builder.py` 只把 `question_text`（取 `eff_question_text`）与图片字节写入 messages，**uid、`source_collection`、原始图片路径（如 `images/ch28_001_1.jpg`）一律不得进入 Prompt**（回归测试见不变量 1）。
+**硬隔离契约**：Stage 1 唯一允许接收的输入对象为 `Stage1Input(question_uid, grade_subject, question_text, cas_images, image_captions)`，**类型定义上不含 `raw_chapter` 与 `legacy_tags`**；`question_uid` 仅用于请求元数据与日志关联，`llm/prompt_builder.py` 只把 `question_text`（取 `eff_question_text`）与经内存 `exif_transpose` 后的图片字节写入 messages（当 `len(cas_images) >= 2` 时，在每张图前插入文本块显式标明 `【配图 1（<caption 若有>）】`、`【配图 2（<caption 若有>）】`），**uid、`source_collection`、原始图片路径（如 `images/ch28_001_1.jpg`）一律不得进入 Prompt**（回归测试见不变量 1）。
 
 #### 1. 一次性视觉事实转译与双盲求解
 - **有图题（`has_images = 1`）**：
-  - 主路 VLM（`vlm_primary`）接收题干与全部配图（支持多图如 `ch01_012`、`ch28_083`），JSON 首位强制先输出 `visual_facts`（精确描述顶点字母、线面拓扑、垂直/平行/等长/角度标注、**以及阴影区域的精确封闭边界与包含关系**）与 `visual_ambiguity_flag`（图模糊、标注不清或阴影界限有歧义时必须置 `true`）；
-  - 辅路 VLM（`vlm_secondary`，跨模型家族）独立盲看题干与配图，同样输出 `visual_facts`、`method_summary`、`solution_markdown`、`final_answers`（`AnswerPart[]`）。
+  - 主路 VLM（`vlm_primary`）接收题干与全部保序配图（支持多图如 `ch01_012`、`ch28_050`、`ch28_083`），JSON 首位强制先输出 `visual_facts`（精确描述顶点字母、线面拓扑、垂直/平行/等长/角度标注、**以及阴影区域的精确封闭边界与包含关系**；**严禁写入原图未画出的辅助线或推导结论**）与 `visual_ambiguity_flag`（图模糊、标注不清或阴影界限有歧义时必须置 `true`）；
+  - 辅路 VLM（`vlm_secondary`，跨模型家族）独立盲看题干与配图，同样输出 `visual_facts`、`method_summary`、`solution_markdown`、`final_answers`（`AnswerPart[]`）；
+  - Prompt 统一数值约定：题干未显式指定近似值（如未写“$\pi$ 取 $3.14$”）时，`sympy_expr` 保留精确符号 `pi` / `sqrt` / 分数。
 - **纯文字题（`has_images = 0`）**：
   - `visual_facts = ""`，不发送图片，直接走文本求解；
   - 受 `pipeline.dual_vlm_policy` 控制：默认 `"always"`（双盲两路并行）；若配为 `"visual_or_unverified"`，则纯文字题在主路全部小问为 `SYMBOLIC` 且 SymPy 验算全过时跳过辅路（**带图题始终强制双盲**）。
 
 #### 2. 分小问验真流水线（决策 D3，`verify/`）
-1. **小问归一化与对齐（`verify/answer_parts.py`）**：
-   - 标签归一：`（1）`、`①`、`1)`、`1.` 统一归一为 `"(1)"`；单问题归一为 `"主问"`；同一小问含多个独立填空（如 `ch01_010`）按序编号 `"(1)-1"`..`"(1)-k"`；
-   - Pydantic 校验器强检 `answer_type × verify_mode` 白名单（§3.2-3），严禁把 `NUMERIC`/`EXPRESSION`/`SET_OR_INTERVAL` 降级为 `QUALITATIVE` 逃避验算。
+1. **小问归一化、多值封装与白名单校验（`verify/answer_parts.py`）**：
+   - **显式标签归一（禁止自造 `(1)-k` 子标签）**：题干含显式 `（1）`、`①`、`1)`、`1.` 时统一归一为 `"(1)"`, `"(2)"`...；题干无显式编号但同时含“计算/求值 + 说明理由/思考过程”复合指令（如 `ch01_015`）时，固定拆为 `"(1)"`（定量问）与 `"(2)"`（定性说理问）；其余单问题一律归一为 `"主问"`；
+   - **单小问内多空/多值（`collection_mode`）**：同一小问含多个按序填空（如 `ch01_010` 混填 `□` 与 `○`）用 `ORDERED_TUPLE`；无标号多区域求值（如 `ch28_025` 求 9 块区域面积）用 `UNORDERED_MULTISET`；多命名对象求值（如求鸡、兔数量）用 `LABELED_MAP`；
+   - Pydantic 校验器强检 `answer_type × verify_mode` 白名单（§3.2-3），严禁把 `NUMERIC`/`EXPRESSION`/`RATIO`/`SET_OR_INTERVAL` 降级为 `QUALITATIVE` 逃避验算。
 2. **跨平台 SymPy 沙盒（`verify/sympy_sandbox.py`）**：
-   - 继承 v1 AST 静态探针（导入白名单仅 `sympy`/`math`/`fractions`，拦截双下划线内省、禁用调用与空壳脚本）；
+   - **AST 静态探针（适配纯理科全题型 + 防空壳作弊）**：
+     - 导入白名单仅 `sympy`/`math`/`fractions`（支持 `Rational`, `sqrt`, `nsimplify`, `simplify`, `solve`, `solveset`, `Eq`, `factorint`, `divisor_count`, `divisors`, `gcd`, `lcm`, `binomial`, `factorial`, `Polygon`, `Triangle` 等算术/数论/几何计算，不强求必调 `solve`，避免误杀奥数计算与几何题）；
+     - **反空壳探针（Anti-Tautology）**：拦截双下划线内省与禁用调用，并静态检查 `verify()` 返回字典的每个值**不得为无计算的纯字面量常量**（必须经由算术表达式或白名单函数计算得出，杜绝 `return {"主问": "42"}` 硬编码复读答案）；
    - **Windows + Linux/macOS 跨平台子进程隔离**：
      - 非 `win32` 平台保留 `resource.RLIMIT_CPU`（Linux 额外启用 `RLIMIT_AS`）与 `start_new_session=True` + `os.killpg`；
      - `win32` 平台跳过 `resource`，启动参数用 `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP`，超时执行 `taskkill /F /T /PID <pid>`（失败回退 `proc.kill()`）彻底强杀进程树；
      - `win32` 平台额外以 `ctypes` 创建 **Job Object**，设置 `JOB_OBJECT_LIMIT_PROCESS_MEMORY`（默认 512MB，`sympy_memory_limit_mb`）与 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，防止 `10**10**8` 一类代码在超时前耗尽内存；
-     - **字符串求值拦截**：AST 探针额外禁止调用 `sympify` / `parse_expr` / `S(<字符串>)` / `lambdify` / `eval` / `exec` / `compile` / `open` / `getattr` / `__import__` 以及基于字符串拼接的动态属性访问（这些 API 会对字符串做 `eval`，可绕过对 `__` 字面量的拦截）；判等时需要解析模型给出的 `sympy_expr` 字符串，统一由沙盒内受控的 `safe_parse()`（`parse_expr` + 受限 `local_dict`/`global_dict` + 长度上限）完成，不由 LLM 代码自行调用；
+     - **字符串求值拦截**：AST 探针禁止 LLM 代码调用 `sympify` / `parse_expr` / `S(<字符串>)` / `lambdify` / `eval` / `exec` / `compile` / `open` / `getattr` / `__import__` 及动态属性拼接；判等解析 `sympy_expr` 统一由沙盒内受控 `safe_parse()` 完成；
      - 子进程以空的临时目录为 `cwd`、以精简环境变量启动；
-   - 契约要求主路 `sympy_code` 实现 `verify() -> dict[str, str]`（键为归一化小问 `label`，值为 SymPy 计算结果表达式），对所有 `verify_mode == 'SYMBOLIC'` 的小问逐一核验其与主路 `sympy_expr` 数学等价。
+   - 契约要求主路 `sympy_code` 实现 `verify() -> dict[str, str | list[str]]`（键为归一化小问 `label`），对所有 `verify_mode == 'SYMBOLIC'` 的小问逐一核验其与主路声明答案数学等价。
 3. **逐小问双盲判等（`verify/equivalence.py`）**：
-   - 先校验主/辅两路小问数量与 `label` 集合可对齐（不对齐直接记 `PART_COUNT_MISMATCH`）；
-   - 对齐后逐小问按 `verify_mode` 判等：
-     - `SYMBOLIC`：复用并增强 v1 `latex_to_plain` + 全角/单位剥离 + SymPy 符号等价（保持“纯数字严格相等、不放宽反号与常数比率”红线）；`SET_OR_INTERVAL` 走解集互代等价与区间开闭端点比对；
-     - `EXACT`：`CHOICE` 字母大写排序去重比对（若一路给字母、一路给数值，结合题干选项表互译后判等；选项为数值或表达式时（如 `ch28_003` 的“1300 米”）两路还须各自给出 `sympy_expr`，字母经选项表互译后须与其数学等价，否则记 `SYMPY_FAILED`）；`SYMBOL_FILL` 全角与中文词归一后精确比对；
-     - `QUALITATIVE`：先做文本规范化比对，不等时调用一次 `judge_llm` 裁判判断科学结论等价性；
-   - 将逐小问裁决写入 `questions.part_verdicts_json`，并由 `effective.recompute` 依据生效答案派生 `questions.eff_verification_mode`：
-     - 全部小问 `verify_mode ∈ {SYMBOLIC, EXACT}` → `DETERMINISTIC`；
-     - 全部小问 `verify_mode == QUALITATIVE` → `QUALITATIVE`；
-     - 其余混合情况 → `MIXED`。
+   - 先校验主/辅两路小问数量与 `label` 集合对齐（不对齐直接记 `PART_COUNT_MISMATCH`）；
+   - 对齐后逐小问按 `verify_mode` 与 `collection_mode` 判等：
+     - `SYMBOLIC`：复用并增强 v1 `latex_to_plain` + 全角/复合单位换算 + SymPy 符号等价（纯数字严格相等，不放宽反号与常数比率）；**`RATIO`** 支持 `a:b` 与 `Rational(a,b)` 互认及多项连比 `a:b:c` 约分元组比对；**圆周率兼容**：在允许 $\pi \approx 3.14$ 的学段（`小学奥数` 默认开启），一方含 `pi` 而另一方为有限小数/有理数时，代入 `pi = Rational(314, 100)` 相等亦视为等价（优先保留含精确 `pi` 的表达）；`UNORDERED_MULTISET` 对化简值排序后做多重集匹配；`LABELED_MAP` 复用 v1 `_parse_labeled_numbers` 按实体名比对；`SET_OR_INTERVAL` 走解集互代与区间端点比对；
+     - `EXACT`：`CHOICE` 字母大写排序去重比对（当 `eff_options_json` 存在且对应选项文本可由 `safe_parse` 解析为数值/表达式时，额外核验字母对应项与 `sympy_expr` 数学等价，不等记 `SYMPY_FAILED`；两路一字母一数值时亦经 `eff_options_json` 互译判等）；`SYMBOL_FILL` 全角与中文词归一后精确比对；
+     - `QUALITATIVE`：先做文本规范化比对，不等时调用一次 `judge_llm` 裁判判断科学结论或作图操作核心方法等价性；
+   - 将逐小问裁决写入 `questions.part_verdicts_json`，并由 `effective.recompute` 依据生效答案派生 `questions.eff_verification_mode`（`DETERMINISTIC` / `QUALITATIVE` / `MIXED`）。
 
 #### 3. 一题多解自动捕获与物化（`materialize_solutions`）
 - 当全部小问双盲一致时，对比主/辅两路的 `method_summary` 与解法主体：若经 `judge_llm` 判定两者属于**本质不同的解题路线**（如“赵爽弦图补形” vs “相似比例建方程”），则同时留存为 `branch_1`（主路，默认 `is_optimal = 1`）与 `branch_2`（辅路）；
-- `materialize_solutions(uid)` 每次由“最新有效 `stage1_vlm_runs` + 激活的 `human_overrides.solutions_override_json`”幂等重建 `question_solutions`，确保人工裁决永远优先且重跑不丢。
+- `materialize_solutions(uid)` 每次由“最新有效 `stage1_vlm_runs` + 激活的自包含 `human_overrides.solutions_override_json`”幂等重建 `question_solutions`，确保人工裁决永远优先且重跑不丢。
 
 #### 4. 置信分级门禁与 `review_reason` 原因码表
 - **`VERIFIED_CONSENSUS`**：双路均无 `visual_ambiguity_flag` AND 全部小问双盲等价 AND 所有 `SYMBOLIC` 小问 SymPy 验算通过 → 自动放行至 Stage 2；
@@ -1022,29 +1039,23 @@ anchors:
 | `SYMPY_FAILED` | 至少一个 `SYMBOLIC` 小问 SymPy 脚本报错、AST 被拒或结果与声称答案不等 |
 | `SYMPY_TIMEOUT` | SymPy 沙盒执行超时 |
 | `VISUAL_AMBIGUITY` | 主路或辅路报告图片模糊、遮挡或阴影区域边界存在歧义 |
-| `QUALITATIVE_UNCERTAIN` | 定性小问裁判置信不足或分歧 |
+| `QUALITATIVE_UNCERTAIN` | 定性/作图小问裁判置信不足或分歧 |
 | `SINGLE_RUN_ONLY` | 仅用于 `dual_vlm_policy = visual_or_unverified` 下纯文字题主路被允许单跑、但 SymPy 未全部通过的情况。**API/网络失败不进入复核**：记 `compile_state = FAILED` 并指数退避重试，连续 `max_stage_attempts`（默认 3）轮仍失败才转人工（见 `RUN_FAILED_EXHAUSTED`） |
 | `RUN_FAILED_EXHAUSTED` | 某一路模型调用在重试上限内始终失败 |
-| `ANSWER_SOLUTION_CONFLICT` | 生效解法所声明的答案与生效答案不等价（§3.2-6） |
-| `OVERRIDE_STALE` | 生效层原因码：验真类人工覆写因源题修订被挂起，待人工重签或修正（§3.2-7） |
+| `ANSWER_SOLUTION_CONFLICT` | 生效机器解法所声明的答案与生效答案不等价（§3.2-6） |
+| `OVERRIDE_STALE` | 生效层原因码：验真类人工覆写因源题修订被整组挂起，待人工重签或修正（§3.2-7） |
+| `VISUAL_FACTS_EDITED_PENDING_CONFIRM` | 生效层原因码：经 CLI 单独修改了 `visual_facts` 但尚未确认标准答案，待复核定稿 |
 | `KNOWN_ANSWER_MISMATCH` | 外部错题用户提供的已知答案与双盲共识不一致（§5.3） |
 
-#### 5. 人工覆写 `visual_facts` 后的 `TEXT_RESOLVE` 状态转移规则
-当用户在复核页或 CLI 仅修正了 `visual_facts`（未同时手写标准答案）时，无需重新花视觉 Token 调 VLM，而是触发纯文本重解（`role = 'TEXT_RESOLVE'`）：
-1. 若用户**同时覆写了 `visual_facts` 与 `final_answers_json`** → 直接置 `HUMAN_VERIFIED`，写入 `human_overrides`，令 `S2 = STALE`；
-2. 若用户**只覆写了 `visual_facts`** → 触发 `TEXT_RESOLVE`（双车道纯文本重解：A 车道为 `text_llm` 并附 SymPy 脚本，B 车道为 `vlm_secondary` 的纯文本模式（不传图，保持跨模型家族），分别记入 `stage1_vlm_runs(role='TEXT_RESOLVE_A' / 'TEXT_RESOLVE_B')`）：
-   - 双纯文本一致且所有 `SYMBOLIC` 小问 SymPy 通过 → 状态转为 `VERIFIED_CONSENSUS`，物化新解法并自动解除 `S2 = BLOCKED`；
-   - 仍有分歧或验算失败 → 保持 `NEEDS_REVIEW`，更新 `review_reason` 并在复核页展示新的 `TEXT_RESOLVE` 解法供人工拍板。
-
-#### 6. 极简本地键盘复核页（`review/server.py` + `review.html`，FR-3）
-- 启动：`shuati review [--grade-subject 小学奥数] [--port 8765]`，基于 Python 标准库 `http.server`（零 FastAPI 依赖），审完 `Ctrl+C` 关闭；**强制绑定 `127.0.0.1`**；图片只按 CAS 文件名白名单（`^[0-9a-f]{16}\.(jpg|jpeg|png|webp)$`）从 `data/assets/images/` 提供，杜绝路径穿越；所有写操作经 `facade.py`（与 CLI 共用同一服务层）；支持 `--audit` 模式处理假共识抽检队列（§4.7）；
-- 布局：顶部队列进度与 `review_reason` 徽章；左侧高清可缩放原图 + 题干 + `visual_facts`；右侧双栏并排展示主/辅路解法、逐小问答案高亮差异与 SymPy 验算状态；
+#### 5. 极简本地键盘复核页与 `[R]` 辅助重算草稿（`review/server.py` + `review.html`，FR-3）
+- 启动：`shuati review [--grade-subject 小学奥数] [--port 8765]`，基于 Python 标准库 `http.server`（零 FastAPI 依赖），审完 `Ctrl+C` 关闭；**强制绑定 `127.0.0.1`**；图片只按 CAS 文件名白名单（`^[0-9a-f]{16}\.(jpg|jpeg|png|webp)$`）从 `data/assets/images/` 提供，杜绝路径穿越；所有写操作经 `facade.py`；支持 `--audit` 模式处理假共识抽检队列（§4.7）；
+- 布局：顶部队列进度与 `review_reason` 徽章；左侧高清可缩放原图（多图显式标注 `配图 1 / 配图 2` 及子图题注）+ 题干 + `visual_facts`；右侧双栏并排展示主/辅路解法、逐小问答案高亮差异与 SymPy 验算状态；
 - 全键盘闭环：
-  - `1`：**`ADOPT_RUN(主路 run_id)`**——在单一事务内以同一 `bundle_id` 原子写入该 run 的 `visual_facts`、`final_answers_json`、`solutions_override_json`（`branch_1` 指向该 run）与 `verification_status = HUMAN_VERIFIED` 四条覆写，然后自动跳到下一题；
-  - `2`：**`ADOPT_RUN(辅路 run_id)`**——同上，四条覆写全部取自辅路（**包括辅路的 `visual_facts`**，防止主路读错的图继续污染 Stage 2、FTS5 与 surface 向量）；
-  - `B`：双路答案均对且为一题多解（`ADOPT_RUN(主路)` + 追加辅路为 `branch_2`）；
-  - `E`：内联编辑 `visual_facts` / 逐小问 `final_answers` / 解法要点（支持勾选“仅改读图并触发纯文本重解”或“直接定稿”）；
-  - `X`：标记坏题下架（写 `human_overrides.is_excluded = "1"`）；
+  - `1`：**`ADOPT_RUN(主路 run_id)`**——在单一事务内以同一 `bundle_id` 原子写入自包含的 `visual_facts`、`final_answers_json`、`solutions_override_json`（内嵌主路完整解法与脚本全文）与 `verification_status = HUMAN_VERIFIED` 四条覆写，自动跳到下一题；
+  - `2`：**`ADOPT_RUN(辅路 run_id)`**——同上，四条覆写全部取自辅路（**包括辅路的 `visual_facts`**，防止主路读错的图污染 Stage 2、FTS5 与 surface 向量）；
+  - `B`：双路答案均对且为一题多解（`ADOPT_RUN(主路)` + 内嵌辅路全文为 `branch_2`）；
+  - `E` + `R`：内联编辑 `visual_facts` / 逐小问 `final_answers` / 解法；当人工修正了读图描述后，按 **`R`（重算参考解答草稿）** 单次调用 `text_llm` + SymPy 沙盒（记入 `llm_calls(stage='REVIEW_RESOLVE')`，零视觉 Token、无需双车道二次排队），将算出的参考步骤、答案与验算结果实时回填至编辑框，人工扫一眼确认即原子保存为 `HUMAN_VERIFIED`；
+  - `X`：标记坏题或重扫重题下架（写 `human_overrides.is_excluded = "1"`）；
   - `S`：暂跳过；`K`：对 `OVERRIDE_STALE` 题“确认原覆写仍有效”（按当前指纹重签，§3.2-7）；`U`：按 `bundle_id` 整组撤销上一次提交（置 `is_active = 0` 并恢复队列项）。
 
 ---
@@ -1063,12 +1074,12 @@ anchors:
 - **强制 JSON Schema 字段顺序**（`models/schemas.py`）：
   1. `corrected_format`（兜底纠偏正则未识别的脏格式）；
   2. `abstract_skeleton`（去情境化抽象骨架，用于 $V_{\text{skeleton}}$）；
-  3. `solution_branches[]`（每条已验真分支拆 1~5 个有教学意义的 `steps[]`，合并纯四则代入，每步产出 `sub_goal`、`hint`、`core_formula`、`raw_l1`、`raw_l2`、`raw_l3`（严格 4~14 字脱壳中文短语，正则拦截题干具体数字与单字母顶点如 `△ABC`））；**`hint` 为防剧透提示**：只给思考方向（如“先比较这两个三角形的高有什么关系”），禁止出现辅助线/辅助对象的具体名称、中间结论与任何数值，代码以正则（数字、`=`、顶点字母组合、“连接/作/得”+对象等模式）拦截，违规时触发自愈重试；`step_fingerprint` 由代码在落库时计算；
+  3. `solution_branches[]`（每条已验真分支拆 1~5 个有教学意义的 `steps[]`，合并纯四则代入，每步产出 `sub_goal`、`hint`、`core_formula`、`raw_l1`、`raw_l2`、`raw_l3`（严格 4~14 字脱壳中文短语，正则拦截题干具体数字与单字母顶点如 `△ABC`））；**`hint` 为防剧透提示**：只给思考方向（如“先比较这两个三角形的高有什么关系”），禁止出现辅助线/辅助对象的具体名称、中间结论与任何数值，代码以正则（数字、`=`、顶点字母组合、“连接/作/得”+对象等模式）拦截，违规时触发自愈重试；
   4. `primary_raw_l1` & `secondary_raw_l1s`；
   5. `thinking_methods`（经 `config/method_blacklist.yaml` 确定性剔除“转化与化归”“逻辑推理”等万金油泛词；“数形结合”作为可操作技法保留，不列入黑名单）与 `classic_motifs`（宁缺毋滥）；
   6. `trap_tags`（强约束为 6 大预置 `TRAP_*` 枚举子集）；
   7. `dimensions.{C, S, T, L}`（**每个维度内 `evidence` 必须排在 `score` 之前**）。
-- Stage 2 落库后同步将 `raw_thinking_methods_json` / `raw_classic_motifs_json` / `raw_trap_tags_json` 经 `concepts` 物化至 `question_concepts(origin='MACHINE')`（若某 `(uid, kind)` 已有激活且未挂起的人工覆写则跳过覆盖），随后调用 `effective.recompute(uid)`；并执行**步骤指纹核对**：对该题激活的 `taxonomy_override_json` 条目按 `step_fingerprint` 重新匹配，找不到的条目标记为 `STEP_ORPHANED`（§3.2-7）。
+- Stage 2 落库后同步将 `raw_thinking_methods_json` / `raw_classic_motifs_json` / `raw_trap_tags_json` 经 `concepts` 物化至 `question_concepts(origin='MACHINE')`（若某 `(uid, kind)` 已有激活且未挂起的人工覆写则跳过覆盖），随后调用 `effective.recompute(uid)`（由于 `taxonomy_override_json` 挂在 `question_uid` 层，Stage 2 重建步骤完全不影响人工考点覆写）。
 
 #### 3. 确定性非线性难度合成引擎（`core/difficulty.py`，决策 D4）
 LLM 严禁输出总分或等级。代码执行确定性合成：
@@ -1103,34 +1114,38 @@ $$\text{base\_elo} = \min\Big(2800,\ \max\big(800,\ 750 + 85 \cdot (2^C - 1) + 1
 为了避免仅凭 2 章 122 题过早锁死不完整的 L1/L2 目录，同时不阻塞开发期验证全链路：
 
 - **阶段 A：开发验证期（`taxonomy_status = 'DRAFT'`）**
-  - 运行 `shuati taxonomy propose --grade-subject 小学奥数`：汇总已过 Stage 2 题目的 `raw_l1 / raw_l2` 频次，对 `raw_l2` 做 Embedding 聚类，由强文本模型归纳生成 `config/taxonomies/taxonomy_<slug>.draft.yaml`（`status: DRAFT`, `version: draft-1`）；
-  - 系统在 `DRAFT` 模式下允许正常执行 S3C（回填）、S3D（L3 归并）、S3E（先修/共现边）与 Stage 4（织网），所有 `knowledge_nodes` 均打上 `taxonomy_version = 'draft-1'` 临时标签；
+  - 运行 `shuati taxonomy propose --grade-subject 小学奥数`：汇总已过 Stage 2 题目只读保留的 `question_steps.(raw_l1, raw_l2)` 与 `questions.raw_l1_candidates_json` 频次，对 `raw_l2` 做 Embedding 聚类，由强文本模型归纳生成 `config/taxonomies/taxonomy_<slug>.draft.yaml`（`status: DRAFT`, `version: draft-1`）；
+  - 系统在 `DRAFT` 模式下允许正常执行 `S3C`（词表回填）、`S3D`（L3 节点挂载与归并）、`S3E`（先修/共现边）与 Stage 4（织网），所有 `knowledge_nodes` 均打上 `taxonomy_version = 'draft-1'` 临时标签；
   - `DRAFT` 模式下**不产生** `taxonomy_candidates`，可随时迭代草案；**草案换版（`draft-N → draft-N+1`）执行与锁表相同的“迁移 + 清理 + 置 STALE”流程**（下述步骤 1～5，目标版本为新草案），保证同一学段任何时刻库内只存在一个生效词表版本的节点。
 
 - **阶段 B：全量 Stage 2 完成后的正式锁表（`DRAFT → LOCKED 1.0`）**
-  - 待全量 1000+ 题完成 Stage 2 后，重新运行 `shuati taxonomy propose` 基于全库涌现完整候选树（6~12 个 L1），人工审定微调并保存为 `config/taxonomies/taxonomy_<slug>.yaml`（`status: LOCKED`, `version: 1.0`）；
+  - 待全量 1000+ 题完成 Stage 2 后，重新运行 `shuati taxonomy propose` 基于全库纯净 `raw_l1/raw_l2`（未被 `draft-1` 覆盖）涌现完整候选树（6~12 个 L1），人工审定微调并保存为 `config/taxonomies/taxonomy_<slug>.yaml`（`status: LOCKED`, `version: 1.0`）；
   - 执行 `shuati taxonomy lock --grade-subject 小学奥数 --file config/taxonomies/taxonomy_<slug>.yaml`（先自动 `VACUUM INTO` 快照并获取编译锁）：**步骤 1～4 在单一写事务内完成（纯本地数据操作，毫秒～秒级）；步骤 5 在事务提交后作为普通断点续跑任务执行**（含 LLM 调用，绝不长时间持有写事务）：
-    1. 检查所有引用词表名称的旧版本覆写——`taxonomy_override_json`、**`primary_l1_module`、`secondary_l1_modules_json`**（以 `human_overrides.taxonomy_version` 识别）：尝试按新词表的名称与 `aliases` 自动映射（成功则以新版本号重签覆写），无法自动对齐的条目生成 `data/reports/taxonomy_override_migration.json` 提示人工核对（若存在未解决项默认中止或经 `--allow-stale-overrides` 标记待复核）；
-    2. `UPDATE question_steps SET m_knowledge_node_id = NULL, eff_knowledge_node_id = NULL WHERE question_uid IN (该学段题目)`（解除外键引用，防删除报错）；
+    1. 检查所有引用词表名称的旧版本覆写——题目级 `taxonomy_override_json`、**`primary_l1_module`、`secondary_l1_modules_json`**（以 `human_overrides.taxonomy_version` 识别）：尝试按新词表的名称与 `aliases` 自动映射（成功则清空待重解 `node_id` 并以新版本号重签覆写），无法自动对齐的条目生成 `data/reports/taxonomy_override_migration.json` 提示人工核对（若存在未解决项默认中止或经 `--allow-stale-overrides` 整条置 `TAXONOMY_UNMAPPED` 挂起）；
+    2. 清空对齐派生引用：`UPDATE question_steps SET m_l1 = '', m_l2 = '', m_knowledge_node_id = NULL WHERE question_uid IN (该学段题目)`，并将该学段 `questions.eff_node_ids_json` 重置为 `'[]'`（解除外键引用，防删除报错，而 `raw_l1/raw_l2/raw_l3` 完好无损）；
     3. 清理该学段 `taxonomy_version LIKE 'draft-%'` 的 `knowledge_edges` 与 `knowledge_nodes`（草案期 `compaction_audit_ledger` 置 `is_reverted = 1` 归档）；
     4. 更新 `grade_subjects` 为 `taxonomy_status = 'LOCKED'`, `taxonomy_version = '1.0'`，自动将该学段所有 `S3C`、`S3D`、`S4` 置为 `STALE`；
     5. 事务提交后，按断点续跑重跑 S3C → S3D → S3E → S4，完成正式知识网编译（中途中断可续跑，期间学习者命令照常可用）。
 
 - **阶段 C：锁表后的增量演进（`1.0 → 1.1`）**
   - 增量新题或 `ingest-mistake` 遇到锁定词表覆盖不到的全新 L2 时，写入 `taxonomy_candidates(status='PENDING')`（先暂挂最接近 L2 不阻断入库）；
-  - 人工批准新 L2 或重命名 L2 后写入 YAML `changelog` 并升级 `version: "1.1"`，运行 `shuati taxonomy migrate` 按 `changelog` 精准迁移受影响的节点、题目以及引用旧名称的覆写（同步骤 1 规则），无需全库重跑。
+  - 人工经 `shuati taxonomy candidates` 批准新 L2 或重命名 L2 后写入 YAML `changelog` 并升级 `version: "1.1"`，运行 `shuati taxonomy migrate` 按 `changelog` 精准迁移受影响的节点、题目以及引用旧名称的覆写（同步骤 1 规则），无需全库重跑。
 
-#### 2. Step 3c / 3d / 3e 详细机制
-- **Step 3c（L1/L2 词表回填）**：优先按锁定 YAML 的名称与 `aliases` 精确/规范化匹配（零 LLM 成本）；未命中项按批（每批 20 题）调用 `text_llm` 从锁定枚举中严格映射，更新 `questions.primary_l1_module`、`secondary_l1_modules_json` 与 `question_steps.(raw_l1, raw_l2)` 对齐值。
-- **Step 3d（同域可逆并查集归并 — L3 节点 & 全局 `concepts`）**：
-  - **L3 节点归并**严格限定在同一 `(grade_subject, taxonomy_version, l1_module, l2_entity)` 作用域内，代码写入前硬断言，绝不跨学段/跨 L1/L2；
+#### 2. Step 3c / 3d / 3e 详细机制（严格分离 `S3C` 与 `S3D`）
+- **Step 3c（`S3C`：L1/L2 词表回填与 L2 汇总节点准备）**：
+  - 优先按当前生效 YAML 的名称与 `aliases` 对 `raw_l1 / raw_l2` 精确/规范化匹配（零 LLM 成本）；未命中项按批（每批 20 题）调用 `text_llm` 从词表枚举中严格映射；
+  - 写入 `questions.(m_primary_l1_module, m_secondary_l1_modules_json)` 与 `question_steps.(m_l1, m_l2)`（**严禁改写 `raw_l1 / raw_l2`**）；
+  - 为当前词表中的每个 `(L1, L2)` 幂等建立 `knowledge_nodes(node_level='L2', l3_operator='')` 汇总节点。
+- **Step 3d（`S3D`：L3 节点挂载 + 同域可逆并查集归并）**：
+  - **逐题挂载**：对每步的 `(m_l1, m_l2, raw_l3)`（及激活的题目级 `taxonomy_override_json` 条目），在 `(grade_subject, taxonomy_version, node_level='L3', m_l1, m_l2)` 作用域内精确/别名匹配或新建 `L3` 节点，写入 `question_steps.m_knowledge_node_id`，并由 `effective.recompute(uid)` 物化写入 `questions.eff_node_ids_json`；
+  - **L3 节点并查集归并**严格限定在同一 `(grade_subject, taxonomy_version, node_level='L3', l1_module, l2_entity)` 作用域内（过滤排除 `node_level='L2'` 汇总节点，代码写入前硬断言，绝不跨学段/跨 L1/L2）；
   - **全局 `concepts` 归并**严格限定在同一 `kind ∈ {'METHOD', 'MOTIF'}` 内（`is_seed = 1` 的 6 大 `TRAP` 禁止合并）；
-  - 双路召回近义候选对：同作用域内向量余弦 **Top-K（默认 K=5，不设绝对余弦阈值**，与 Stage 4“绝对余弦随 Embedding 模型漂移”的立场一致；可选以作用域分位 `P ≥ 0.90` 预筛）$\cup$ 字符 2/3-gram Jaccard（`> 0.15`）；
-  - AI 裁判确认语义同一后，在单对 `SAVEPOINT` 事务内执行一次性路径压缩（`from` 及其直属子节点统一指向 `to`，跳数恒 $\le 1$）、合并 `aliases_json`（上限 12）、写入 `compaction_audit_ledger`；
+  - 双路召回近义候选对：同作用域内 `l3_nodes_<slug>.npz`（仅编码活跃 `node_level='L3'` 节点）向量余弦 **Top-K（默认 K=5，不设绝对余弦阈值**；可选以作用域分位 `P ≥ 0.90` 预筛）$\cup$ 字符 2/3-gram Jaccard（`> 0.15`）；
+  - AI 裁判确认语义同一后，在单对 `SAVEPOINT` 事务内执行一次性路径压缩（`from` 及其直属子节点统一指向 `to`，跳数恒 $\le 1$）、合并 `aliases_json`（上限 12）、写入 `compaction_audit_ledger`，并刷新受影响题目的 `eff_node_ids_json`；
   - 支持 `shuati graph revert-merge <batch_id>` 按 `merge_id` 逆序精确无损恢复父指针与别名；若该批次之后另有批次在相同节点上继续合并，命令会检测依赖、提示正确的回滚顺序，并拒绝乱序回滚。
 - **Step 3e（知识点拓扑边：树 → 网）**：
-  - **跨模块耦合共现边（`CO_OCCURRENCE`）**：纯确定性统计每道跨模块综合题中不同 L1 下活跃 L3 节点对（均经并查集 `find()` 解析）的共现频次与支撑题集；
-  - **先修依赖 DAG（`PREREQUISITE`）以 L2 粒度为主**：步骤先后只反映“使用顺序”而非严格先修，且“1～5 步 × 碎片化 L3”的共现矩阵极度稀疏，因此先在 **L2 层**统计“步骤 $i$ 的 L2 先于步骤 $j$ 的 L2”的有序频次，连同锁定词表送强推理模型梳理先修边（每条边附支撑题数与模型理由，写入 `evidence_json`）；L2 级边的端点使用 Stage 3c 为每个 L2 自动建立的汇总节点（`l3_operator = '*'`）。L3 层先修边为可选增强，仅在同一 L2 内且支撑题数 ≥ 3 时保留；落库前执行 **Kahn 拓扑排序环检测**，若出现环则自动剔除环中权重最低边并写入 Stage Q 体检告警，保证强无环（DAG）。
+  - **跨模块耦合共现边（`CO_OCCURRENCE`）**：纯确定性统计每道跨模块综合题中不同 L1 下活跃 `node_level='L3'` 节点对（均经并查集 `find()` 解析）的共现频次与支撑题集；
+  - **先修依赖 DAG（`PREREQUISITE`）以 L2 粒度为主**：先在 **L2 层**统计“步骤 $i$ 的 `m_l2` 先于步骤 $j$ 的 `m_l2`”的有序频次，连同词表送强推理模型梳理先修边（每条边附支撑题数与模型理由，写入 `evidence_json`），端点挂载在 `node_level='L2'` 汇总节点上。`node_level='L3'` 层先修边为可选增强，仅在同一 L2 内且支撑题数 ≥ 3 时保留；落库前执行 **Kahn 拓扑排序环检测**，若出现环则自动剔除环中权重最低边并写入 Stage Q 体检告警，保证强无环（DAG）。
 
 ---
 
@@ -1143,7 +1158,7 @@ $$\text{base\_elo} = \min\Big(2800,\ \max\big(800,\ 750 + 85 \cdot (2^C - 1) + 1
 3. **每题排名**：$\text{rank}_{\text{ch}}(A \to B)$ 为 B 在 A 的该通道近邻列表中的名次（从 1 开始）；**互为近邻**定义为 $\max(\text{rank}(A \to B), \text{rank}(B \to A)) \le k$；
 4. **跨学段对**：分位取两端各自学段分位表的较小值 $P = \min(P_{\text{scope}(A)}, P_{\text{scope}(B)})$，排名在拼接后的跨学段骨架矩阵中计算；
 5. 集合指纹：
-   - $K_{\text{set}}$：经并查集解析后的活跃 `eff_knowledge_node_id` $\cup$ 全局 `MOTIF` `concept_id`（一题多解按分支分别计算，取最大覆盖）；包含度采用 **IDF 加权 Tversky**：$I_w(A \subset B) = \frac{\sum_{x \in K_A \cap K_B} \text{idf}(x)}{\sum_{x \in K_A} \text{idf}(x)}$，压低“几乎每题都有”的泛节点；
+   - $K_{\text{set}}$：经并查集解析后的活跃 `questions.eff_node_ids_json`（仅 `node_level='L3'` 节点）$\cup$ 全局 `MOTIF` `concept_id`（无人工 `REPLACE` 覆写且存在一题多解时，可按各分支 `m_knowledge_node_id` 分别计算并取最大覆盖）；包含度采用 **IDF 加权 Tversky**：$I_w(A \subset B) = \frac{\sum_{x \in K_A \cap K_B} \text{idf}(x)}{\sum_{x \in K_A} \text{idf}(x)}$，压低“几乎每题都有”的泛节点；
    - $E_{\text{trap}}$：规范化 `TRAP` `concept_id` 集合，计算 **IDF 加权陷阱重合度**：
      $$S_{\text{trap}}^{\text{IDF}}(A, B) = \frac{\sum_{t \in E_A \cap E_B} \text{idf}(t)}{\sum_{t \in E_A \cup E_B} \text{idf}(t)}, \quad \text{idf}(t) = \ln\frac{N + 1}{\text{df}(t) + 1}$$
      （有效压低 `TRAP_ARITHMETIC_SLIP` 等泛陷阱的权重，放大 `TRAP_DOMAIN_BOUNDARY`/`TRAP_EXTRANEOUS_ROOT` 等高危陷阱的区分度）。
@@ -1171,27 +1186,27 @@ $$\text{base\_elo} = \min\Big(2800,\ \max\big(800,\ 750 + 85 \cdot (2^C - 1) + 1
 每次全量或增量编译结束，自动在 `data/reports/audit_<timestamp>.md`（及 `.json`）输出 7 大板块量化体检：
 1. **Stage 1 验真体检**：总题数、按小问统计的 `SYMBOLIC`/`EXACT`/`QUALITATIVE` 占比、双盲共识率、SymPy 通过率、`NEEDS_REVIEW` 数量及 `review_reason` 分布、一题多解占比、单题平均 Token 与成本（取自 `llm_calls`）；**假共识抽检**：每批随机抽取 `consensus_audit_ratio`（默认 5%，至少 5 题）的 `VERIFIED_CONSENSUS` 题进入抽检队列（`shuati review --audit`），累计报告假共识率及其 Wilson 95% 置信上界；
 2. **难度分布体检**：8 档 `tier` 直方图、`[C, S, T, L]` 四维边缘分布（监测是否出现全打 2 分的折中偏见或 L5 异常膨胀）；
-3. **知识网收敛度体检**：当前词表状态（`DRAFT`/`LOCKED` 与版本）、L1/L2 覆盖率、单 L2 下活跃 L3 数量分布、**分布熵校准收敛度**（借鉴 v1 `knowledge_graph.py` 熵公式防单点垃圾桶坍缩）、先修 DAG 无环检测结论、断边记录与每条先修边的支撑题数、待处理 `taxonomy_candidates` 数量；
+3. **知识网收敛度体检**：当前词表状态（`DRAFT`/`LOCKED` 与版本）、L1/L2 覆盖率、单 L2 下活跃 `node_level='L3'` 数量分布、**分布熵校准收敛度**（仅统计活跃 `node_level='L3'` 节点，排除 `L2` 汇总节点，防单点垃圾桶坍缩）、先修 DAG 无环检测结论、断边记录与每条先修边的支撑题数、待处理 `taxonomy_candidates` 数量；
 4. **五边拓扑体检**：5 类边数量、每题平均度数及 `expected_degree` 护栏结论、孤立题占比、`CLONE` 疑似重复题清单、增量 vs 全量重建的边差异率；
 5. **新旧标签纠偏对比**：与 `raw_questions.legacy_tags_json` 对比 `format` 纠偏数、`domain → primary_l1_module` 纠偏例证、万金油泛词清除统计；
-6. **覆写一致性巡检**：`OVERRIDE_STALE` 挂起覆写清单（含 `SOURCE_CHANGED` / `STEP_ORPHANED` / `TAXONOMY_UNMAPPED` 分类）、`ANSWER_SOLUTION_CONFLICT` 清单、`reindex --effective` 全量重算差异数（应为 0）、人工资产 git 镜像一致性（§3.6）；
-7. **入库健康**：`collections.yaml` 未映射集合、下架候选（`is_missing_from_source`）、跨源副本数、`normalize_text` 修复统计。
+6. **覆写一致性巡检**：`OVERRIDE_STALE` 整条挂起覆写清单（含 `SOURCE_CHANGED` / `TAXONOMY_UNMAPPED` 分类）、`VISUAL_FACTS_EDITED_PENDING_CONFIRM` 清单、`ANSWER_SOLUTION_CONFLICT` 清单、`reindex --effective` 全量重算差异数（应为 0）、人工资产 git 全表快照一致性（§3.6）；
+7. **入库健康**：`collections.yaml` 未映射集合、下架候选（`is_missing_from_source`）、精确同题副本数、`plain_fingerprint` 疑似重扫重题清单、`normalize_text` 与多图题注提取统计。
 
 ---
 
 ### 4.8 覆写与上游变更后的单题局部重算链（`core/refresh.py` + `core/effective.py`）
 
-任何来自复核页、CLI `override`、Stage 0 源题更新、Stage 2 重跑或词表锁定的变更，均统一经 `core/refresh.py` 触发精准传播：**第一步固定为指纹核对（必要时挂起覆写）→ 第二步 `effective.recompute(uid)` 刷新 `eff_*` → 第三步按生效列的实际变化同步 FTS5、向量过期标记，并将下游阶段置 `STALE`**。整条链路**绝不修改覆写的值**。
+任何来自复核页、CLI `override`、Stage 0 源题更新、Stage 2 重跑或词表锁定的变更，均统一经 `core/refresh.py` 触发精准传播：**第一步固定为指纹核对（失配时整条/整组挂起覆写）→ 第二步 `effective.recompute(uid)` 刷新 `eff_*` → 第三步按生效列的实际变化同步 FTS5、向量过期标记，并将下游阶段置 `STALE`**。整条链路**绝不修改覆写的值**。
 
 | 变更事件 / 覆写字段 | 即时同步动作（毫秒级） | 标记 `STALE` 的下游阶段 | 说明 |
 | :--- | :--- | :--- | :--- |
-| 源题 `content_hash` 变化 | 更新 `raw_questions` / `m_question_text` 等；**指纹失配的覆写全部自动挂起**；`eff_verification_status` 降为 `NEEDS_REVIEW`（`OVERRIDE_STALE`）；刷新 FTS5 | `S1, S2, S3C, S3D, S4` | 挂起清单进入复核页与 Stage Q；人工按 `K` 重签或直接修正 |
-| Stage 2 重跑（锚点 / Prompt / 模型变化） | 重建 `question_steps`（生成新 `step_fingerprint`）；核对 `taxonomy_override_json` 条目，找不到的标 `STEP_ORPHANED` | `S3C, S3D, S4` | 历史 `practice_log` 依赖登记时快照（`stuck_node_id` 等），含义不受影响 |
-| 覆写 `question_text` | 刷新 FTS5、标记 `surface` 向量过期 | `S1, S2, S3C, S3D, S4` | 若仅修错别字，可传 `--no-reverify` 跳过 `S1` |
-| 覆写 `visual_facts`（未手填答案） | 刷新 FTS5、标记 `surface` 向量过期 | 触发 `TEXT_RESOLVE` → 成功后 `S2, S3C, S3D, S4` | 详见 §4.3-5 状态转移 |
-| `ADOPT_RUN` / 覆写 `final_answers_json` / `solutions_override_json` | 重建 `question_solutions` 并做答案—解法一致性校验；`eff_verification_status = HUMAN_VERIFIED`；解除 `S2 BLOCKED` | `S2, S3C, S3D, S4` | 权威副本永存 `human_overrides`，并镜像至 `human/overrides.jsonl` |
+| 源题 `content_hash` 变化 | 更新 `raw_questions` / `m_question_text` 等；**指纹失配的覆写全部整条自动挂起**；`eff_verification_status` 降为 `NEEDS_REVIEW`（`OVERRIDE_STALE`）；刷新 FTS5 | `S1, S2, S3C, S3D, S4` | 挂起清单进入复核页与 Stage Q；人工按 `K` 重签或直接修正 |
+| Stage 2 重跑（锚点 / Prompt / 模型变化） | 重建 `question_steps`（保留新 `raw_l1/l2/l3`） | `S3C, S3D, S4` | 题目级 `taxonomy_override_json` 与历史 `practice_log.stuck_node_id` 均与步骤文本解耦，100% 不受影响 |
+| 覆写 `question_text` | 重解析 `eff_options_json`、刷新 FTS5、标记 `surface` 向量过期 | `S1, S2, S3C, S3D, S4` | 若仅修错别字，可传 `--no-reverify` 跳过 `S1` |
+| CLI 单独覆写 `visual_facts`（未传答案） | 刷新 FTS5、标记 `surface` 向量过期；`eff_verification_status = NEEDS_REVIEW`（`VISUAL_FACTS_EDITED_PENDING_CONFIRM`） | `S2` 置 `BLOCKED` | 复核页中改读图可直接按 `R` 预填草稿并原子提交答案定稿 |
+| `ADOPT_RUN` / 覆写 `final_answers_json` / `solutions_override_json` | 由自包含覆写重建 `question_solutions` 并做答案—解法一致性校验；`eff_verification_status = HUMAN_VERIFIED`；解除 `S2 BLOCKED` | `S2, S3C, S3D, S4` | 权威副本永存 `human_overrides`，并原子快照导出至 `human/overrides.jsonl` |
 | 覆写 `difficulty_override_json` | 重算 `eff_base_elo` / `eff_tier` / `eff_tier_rank` | `S4`（可选即时跑 `weave_single_question`） | 只影响与 $\Delta D$ 相关的边；学习者 Elo 重放自动采用新难度 |
-| 覆写 `primary_l1_module` / `taxonomy_override_json` | 更新 `eff_primary_l1_module` / `question_steps.eff_knowledge_node_id` | `S4`（即时局部重织边） | 影响 `K_set`、跨 L1 排雷加权与分模块 Elo 归属 |
+| 覆写 `primary_l1_module` / `taxonomy_override_json` | 解析覆写节点并更新 `eff_primary_l1_module` / `questions.eff_node_ids_json` | `S3D`（若含待建 L3）、`S4`（即时局部重织边） | 影响 `K_set`、跨 L1 排雷加权与分模块 Elo 归属 |
 | 覆写 `thinking_methods_json` / `classic_motifs_json` / `trap_tags_json` | 按 `(uid, kind)` 清除同 `kind` 机器行并物化 `HUMAN` 行 | `S4`（即时局部重织边） | 撤回或挂起时自动恢复物化 `MACHINE` 行 |
 | 覆写 `abstract_skeleton` | 刷新 FTS5、重编码该题 `skeleton` 向量 | `S4`（即时局部重织边） | 零 LLM 调用 |
 | 覆写 `is_excluded = "1"` | `eff_is_servable = 0`，从检索候选与组卷池屏蔽，清理其非人工裁定边 | 无 | 历史 `practice_log` 完好保留 |
@@ -1211,7 +1226,7 @@ $$\text{base\_elo} = \min\Big(2800,\ \max\big(800,\ 750 + 85 \cdot (2^C - 1) + 1
    - **作用域**：每个 `(learner_id, grade_subject, L1)` 一个评分 $R$；另维护一个学段总评分 $R_{\text{all}}$（全部作答参与），供跨模块或无专题过滤的组卷使用。每次作答更新该题 `eff_primary_l1_module` 对应模块的 $R$；次要 L1 模块以 $0.5K$ 同步更新（`secondary_l1_weight`，可设 0 关闭）；
    - **初值**：$R_0 = 1300$（`learner_elo.initial`，冷启动）；
    - **预期得分**（学习者视角）：$E = \dfrac{1}{1 + 10^{(D - R)/400}}$，其中 $D$ 为该题 `eff_base_elo`；
-   - **实际得分** $A$：`SOLVED_SOLO = 1.0`；`SOLVED_WITH_HINT = 0.5`（`hint_level_used` 每多一级再减 0.1，下限 0.2）；`WRONG = 0`；`SKIPPED` 不参与更新；
+   - **实际得分** $A$：当 `score_ratio` 非空（如多小问题部分做对）时，基础分取 `score_ratio`（若用过提示再乘提示折扣系数 `max(0.2, 0.5 - 0.1 * (hint_level_used - 1))`）；否则按 `outcome` 映射：`SOLVED_SOLO = 1.0`；`SOLVED_WITH_HINT = 0.5`（`hint_level_used` 每多一级再减 0.1，下限 0.2）；`WRONG = 0`；`SKIPPED` 不参与更新；
    - **更新**：$R \leftarrow R + K \cdot (A - E)$；该模块前 10 次有效作答（快速收敛期）$K = 48$，此后 $K = 24$；同一题在上次作答后 7 天内再次作答时 $K$ 减半（防止背答案刷分）；
    - **题目难度保持固定**：学习者人数少，不按作答数据反向校准题目难度（[理论基础.md](理论基础.md) 第一部分第四节的动态后验校准留作后续可选功能）；
    - **派生输出**：当前水位 $R$、有效作答数、`is_provisional`（有效作答 < 5 时为 true）、最近 10 次水位走势；**历史最高攻克** $R_{\text{peak}}$ = 已 `SOLVED_SOLO` 题目中的最大 `eff_base_elo`；**推荐最近发展区（ZPD）** $[R + 50,\ R + 200]$；
@@ -1220,14 +1235,18 @@ $$\text{base\_elo} = \min\Big(2800,\ \max\big(800,\ 750 + 85 \cdot (2^C - 1) + 1
    - 按 `eff_tier_rank 1..8` 统计每档 `attempts`、`solo_rate`、`hint_rate`、`wrong_rate`，**L4-A 与 L4-B 并列展示**（§4.4-3）；
    - 自动诊断输出：`L4-A` 显著低于 `L4-B`（差值 $\ge 20\%$ 且各档样本 $\ge 3$）时标出“偏怕繁琐计算与分类讨论”；反之标出“偏怕技巧构造与隐蔽转化”。
 3. **薄弱考点与高危陷阱雷达**：
-   - 筛选近期 `WRONG` / `SOLVED_WITH_HINT` 记录（最近 30 天权重 `1.5`，尚未通过后续 `SOLVED_SOLO` 转正的题权重 `2.0`），按 `expand_canonical_ids` 归并后的活跃 `L2`、`L3`、`MOTIF`、`TRAP` 汇总加权错频，输出 Top-5 薄弱项；
+   - 筛选近期 `WRONG` / `SOLVED_WITH_HINT` 记录（最近 30 天权重 `1.5`，尚未通过后续 `SOLVED_SOLO` 转正的题权重 `2.0`），按 `expand_canonical_ids` 归并后的活跃 `L2`、`L3`（取 `questions.eff_node_ids_json`）、`MOTIF`、`TRAP` 汇总加权错频，输出 Top-5 薄弱项；
    - **卡点分布**按登记时快照 `stuck_node_id`（经并查集展开）统计，而不是按 `stuck_step_index` 位置统计，因此 Stage 2 重跑不会改变历史卡点的含义。
 
 ### 5.2 专题小卷自动梯度组卷算法（`core/composer.py`，FR-9）
 
-输入：`learner_id`（默认当前 `is_current=1` 角色）、`grade_subject`、专题过滤（`l1`/`l2`/`l3`/`motif`/`method`/`trap` 任选）、`count=5`、`mix="2:2:1"`（稳固:拔高:排雷）、`exclude_solved_days=60`、`exclude_recent_quiz_batches=3`、`target_elo?`（可手动覆盖水位）。**水位 $R$ 的选取**：专题过滤落在单一 L1（`--l1`，或由 `--l2/--l3` 反查所属 L1）时取该模块的 $R$；`--motif/--method/--trap` 等跨模块过滤或无过滤时取学段总评分 $R_{\text{all}}$。
+输入：`learner_id`（默认当前 `is_current=1` 角色）、`grade_subject`、专题过滤（`l1`/`l2`/`l3`/`motif`/`method`/`trap` 任选）、`count=5`、`mix="2:2:1"`（稳固:拔高:排雷）、`exclude_solved_days=60`、`exclude_clone_days=14`、`exclude_recent_quiz_batches=3`、`target_elo?`（可手动覆盖水位）。**水位 $R$ 的选取**：专题过滤落在单一 L1（`--l1`，或由 `--l2/--l3` 反查所属 L1）时取该模块的 $R$；`--motif/--method/--trap` 等跨模块过滤或无过滤时取学段总评分 $R_{\text{all}}$。
 
-1. **可用候选池**：仅选 `eff_is_servable = 1` 的题（SQL 直接命中 `idx_q_eff_serve`）；排除该角色近 `exclude_solved_days` 天内已 `SOLVED_SOLO` 的题；**组卷避重（FR-11）**：排除该角色最近 `exclude_recent_quiz_batches` 份 `quiz_batches` 中出现过、但尚未登记任何 `practice_log` 的题（卷子发了还没做，不重复出）；
+1. **可用候选池与 `CLONE` 跨次冷却避重**：
+   - 仅选 `eff_is_servable = 1` 的题（SQL 直接命中 `idx_q_eff_serve`）；
+   - 排除该角色近 `exclude_solved_days` 天内已 `SOLVED_SOLO` 的题；
+   - **组卷避重（FR-11）**：排除该角色最近 `exclude_recent_quiz_batches` 份 `quiz_batches` 中出现过、但尚未登记任何 `practice_log` 的题（卷子发了还没做，不重复出）；
+   - **`CLONE` 孪生邻域冷却**：对近 `exclude_clone_days`（默认 14 天）内已作答的题及上述未登记 `quiz_batches` 内题目的 **`CLONE` 邻居**打上冷却标记——常规候选充足时直接排除，仅在槽位耗尽降级时作为末位兜底并附 `warnings`（彻底杜绝刚做完 `ch28_015` 下一张卷又抽到同题/孪生题 `ch28_057`）；
 2. **三段梯度抽取**：
    - **稳固槽（默认 2 题）**：优先从目标专题内历史 `WRONG`/`SOLVED_WITH_HINT` 且尚未转正的题中最多抽 1 题（错题回练），其余选 `eff_base_elo ∈ [R - 150, R + 50]` 的新题；
    - **拔高槽（默认 2 题）**：选 `eff_base_elo ∈ [R + 50, R + 200]`（ZPD），若稳固槽已选定题目，优先沿其 `SCAFFOLD`（升维母题）或 `ISOMORPHIC`（跨域同构）边延伸；
@@ -1240,12 +1259,12 @@ $$\text{base\_elo} = \min\Big(2800,\ \max\big(800,\ 750 + 85 \cdot (2^C - 1) + 1
 ### 5.3 外部新错题实时诊断与一键入库（`diagnose` & `ingest-mistake`）
 
 1. **`shuati diagnose`（只读实时诊断，不污染主库）**：
-   - 输入：新错题文本 + `--image <path>`（可多个）+ `--grade-subject` + 可选 `--answer "<已知标准答案>"`（如老师批改时给出的答案）；
+   - 输入：新错题文本 + `--image <path>`（可多个，先经 `ImageOps.exif_transpose()` 矫正方向并限制长边 `2048px`）+ `--grade-subject` + 可选 `--answer "<已知标准答案>"`（如老师批改时给出的答案）；
    - 流程：经同一 `prompt_builder` 调用主路 VLM，提取 `visual_facts` + 解答与分小问答案 + `abstract_skeleton` + 匹配当前词表 `L1/L2` 与候选 `L3`/`concepts` + 四维难度打分（确定性算出 `base_elo`/`tier`）；若提供了 `--answer`，用 `equivalence.py` 与主路答案逐小问比对，并在诊断卡中标出一致性；实时编码 `surface` / `skeleton` 向量，在本地 `.npz` 中做内存 1 vs $N$ 检索（只读，不写向量文件）；
    - 输出：诊断卡 + 匹配到的**降阶铺垫题**（`SCAFFOLD` 方向，低 200+ Elo）、**跨域同构变式**（`ISOMORPHIC`）、**形似神异 / 同坑排雷题**（候选均限 `eff_is_servable = 1`）；完整结构化结果缓存至 `data/drafts/<draft_id>.json`（默认保留 7 天），入库时无需重复调用模型。诊断阶段只有单路结果，诊断卡显式标注“未经双盲验真”。
 2. **`shuati ingest-mistake`（一键收入题库）**：
    - 输入：`--draft-id <id>`（或直接传入题干与图片）+ 可选 `--answer`，支持 `--dry-run` 预览落库 diff，支持 `--log-wrong --learner <id> --note "..."` 同步记错题日志；需获取编译锁；
-   - 动作：图片 CAS 归档 → 写入 `raw_questions(source_type='EXTERNAL_MISTAKE')` + `questions`（`m_*`）+ 全部阶段的 `compile_state` 行 → **补齐 Stage 1 验真**（草稿中的主路结果复用为 `PRIMARY` run，补跑 `SECONDARY` 双盲，按 §4.3 正常分级）→ 若提供了 `--answer`，将其作为 `KNOWN_ANSWER` 第三方核验：与双盲共识一致时写入 `final_answers_json` + `verification_status = HUMAN_VERIFIED` 覆写（`source = 'PI_CLI'`），不一致则置 `NEEDS_REVIEW`（`KNOWN_ANSWER_MISMATCH`）→ 验真通过后执行 Stage 2（当且仅当 S2 `input_hash` 一致时复用草稿结果）→ L1/L2 校验（`LOCKED` 下遇到新 L2 记入 `taxonomy_candidates`）→ L3 与概念同域并查集对齐 → `effective.recompute` → 刷新 FTS5 → 追加 `.npz` 向量 → `weave_single_question` 增量补建五边；
+   - 动作：图片 EXIF 方向矫正 + 长边缩放上限 + CAS 归档 → 写入 `raw_questions(source_type='EXTERNAL_MISTAKE')` + `questions`（`m_*`）+ 全部阶段的 `compile_state` 行 → **补齐 Stage 1 验真**（草稿中的主路结果复用为 `PRIMARY` run，补跑 `SECONDARY` 双盲，按 §4.3 正常分级）→ 若提供了 `--answer`，将其作为 `KNOWN_ANSWER` 第三方核验：与双盲共识一致时写入 `final_answers_json` + `verification_status = HUMAN_VERIFIED` 覆写（`source = 'PI_CLI'`），不一致则置 `NEEDS_REVIEW`（`KNOWN_ANSWER_MISMATCH`）→ 验真通过后执行 Stage 2（当且仅当 S2 `input_hash` 一致时复用草稿结果）→ `S3C` L1/L2 校验（`LOCKED` 下遇到新 L2 记入 `taxonomy_candidates`）→ `S3D` L3 与概念同域并查集对齐 → `effective.recompute` → 刷新 FTS5 → 追加 `.npz` 向量 → `weave_single_question` 增量补建五边；
    - 未通过验真（`NEEDS_REVIEW`）的外部错题照常入库，但 `eff_is_servable = 0`，在复核页定稿之前不进入组卷与检索候选；`--log-wrong` 的错题记录不受影响。
 
 ### 5.4 面向 `pi` 的 CLI 一等公民契约、防剧透裁剪与 Skill 设计（决策 D2）
@@ -1253,13 +1272,14 @@ $$\text{base\_elo} = \min\Big(2800,\ \max\big(800,\ 750 + 85 \cdot (2^C - 1) + 1
 遵循**决策 D2**与**不变量 8**：`shuati <command> --json` + `skills/shuati/SKILL.md` 为唯一一等接入通道；所有业务逻辑收敛于 `src/shuati/services/facade.py`，可选 MCP Server（`uv sync --extra mcp`，`shuati mcp-serve`）仅做同构参数透传，不得拥有差异行为。
 
 #### 1. 统一防剧透裁剪器（`services/reveal.py`）
-所有返回题目数据的命令（`search`、`related`、`compose-quiz`、`detail`、`check`）必须经过 `apply_reveal(question, reveal, hint_level)` 裁剪，默认 `reveal="quiz"`：
+所有返回题目数据的命令（`search`、`related`、`compose-quiz`、`detail`、`check`）必须经过 `apply_reveal(question, reveal, hint_level, include_visual_facts)` 裁剪，默认 `reveal="quiz"` 且 `include_visual_facts=False`：
 
 | 字段类别 | `reveal="quiz"`（默认，严防剧透） | `reveal="hint"`（`--hint-level k`，默认 `k=1`） | `reveal="full"`（讲题/核对模式） |
 | :--- | :---: | :---: | :---: |
-| `question_uid`, `source_id`, `grade_subject`, `format`, `question_text`, `cas_images` | ✅ | ✅ | ✅ |
+| `question_uid`, `source_id`, `grade_subject`, `format`, `question_text`, `options`（选择题） | ✅ | ✅ | ✅ |
+| `cas_images`, `image_paths`（解析好的本地绝对路径数组）, `image_captions` | ✅ | ✅ | ✅ |
 | `base_elo`, `tier`, `primary_l1_module`（仅粗模块）, `reason_public` | ✅ | ✅ | ✅ |
-| `visual_facts`（几何文字描述，默认不泄露辅助线） | ⚪ 可选开关 | ✅ | ✅ |
+| `visual_facts`（原图纯客观几何描述） | ❌（**默认关闭**，显式传 `--include-visual-facts` 才开） | ✅ | ✅ |
 | `hints`（最优解前 `k` 步的防剧透 `question_steps.hint`，不含 `sub_goal` 与公式） | ❌ | ✅（`1..k` 步） | ✅（全部步骤的 `hint` + `sub_goal` + `core_formula`） |
 | `final_answers`, `solutions`（含多解法分支）, `difficulty_evidence` | ❌ | ❌ | ✅ |
 | 剧透型细粒度标签：`L2`, `L3`, `thinking_methods`, `classic_motifs`, `trap_tags`, `pedagogical_note`, `reason_full` | ❌ | ❌ | ✅ |
@@ -1267,11 +1287,11 @@ $$\text{base\_elo} = \min\Big(2800,\ \max\big(800,\ 750 + 85 \cdot (2^C - 1) + 1
 #### 2. 不泄露答案的判题命令（`shuati check`）
 `pi` 需要判断学习者答案对错时，**禁止**为此调用 `detail --reveal full`（答案会进入 Agent 上下文，有剧透风险），统一使用：
 ```bash
-shuati check <uid> --answer "(1)12;(2)C" [--learner xiaoming] [--hint-level 0] [--log] [--request-id <id>] --json
+shuati check <uid> --answer "(1)9:4;(2)156" [--learner xiaoming] [--hint-level 0] [--log] [--request-id <id>] --json
 ```
-- 把学习者答案解析为 `AnswerPart[]`（标签归一同 §4.3-2；单问题可省略标签），复用 `verify/equivalence.py`，与 `eff_final_answers_json` 逐小问判等：`SYMBOLIC`/`EXACT` 小问确定性判定；`QUALITATIVE` 小问调用 `judge_llm`，返回 `correct | incorrect | uncertain`；
-- 输出只含逐小问 `{"label", "verdict"}`、缺答/多答的小问标签与总体 `all_correct`，**绝不返回正确答案、解法或剧透型标签**（由 `reveal.py` 的 `check` 裁剪档强制保证）；
-- 传 `--log` 时按结果自动登记 `practice_log`：全对且未用提示 → `SOLVED_SOLO`；全对但用过提示（`--hint-level ≥ 1`）→ `SOLVED_WITH_HINT`；否则 → `WRONG`；同时写入 `submitted_answer`；
+- 把学习者答案解析为 `AnswerPart[]`（显式标签归一同 §4.3-2；单问题可省略标签），复用 `verify/equivalence.py`，与 `eff_final_answers_json` 逐小问判等：`SYMBOLIC`（含比值、多重集、`小学奥数` $\pi \approx 3.14$ 兼容）/`EXACT` 小问确定性判定；`QUALITATIVE` 小问（含 `作图操作题` 思路要点核对）调用 `judge_llm`，返回 `correct | incorrect | uncertain`；
+- 输出只含逐小问 `{"label", "verdict"}`、缺答/多答的小问标签、`parts_correct` / `parts_total` 与总体 `all_correct`，**绝不返回正确答案、解法或剧透型标签**（由 `reveal.py` 的 `check` 裁剪档强制保证）；
+- 传 `--log` 时按结果自动登记 `practice_log`：全对且未用提示 → `SOLVED_SOLO`（`score_ratio=1.0`）；全对但用过提示（`--hint-level ≥ 1`）→ `SOLVED_WITH_HINT`；未全对 → `WRONG`（多小问题自动写入 `score_ratio = parts_correct / parts_total`，使做对前几问在在线 Elo 中获得相应比例分而非按 `0` 分重罚）；同时写入 `submitted_answer`；
 - 题目 `eff_is_servable = 0`（如待复核）时返回 `PRECONDITION_FAILED`，不做判定。
 
 #### 3. 统一 JSON 返回信封与退出码
@@ -1315,11 +1335,11 @@ shuati check <uid> --answer "(1)12;(2)C" [--learner xiaoming] [--hint-level 0] [
 | `shuati search` | 多维条件 + FTS5（`trigram`+短词回退）+ 骨架语义查题（`--l1/--l2/--l3/--motif/--method/--trap/--tier/--elo-min/--elo-max/--query/--semantic/--exclude-solved/--reveal quiz\|full`） |
 | `shuati related <uid>` | 沿五边拓扑查铺垫/升维/同构/形似神异/同坑排雷题（`--types`, `--direction pre\|post\|both`, `--exclude-solved`, `--reveal`） |
 | `shuati compose-quiz` | 按角色当前水位一键梯度组专题小卷（`--learner`, `--grade-subject`, `--l1/--l2/--motif/--trap`, `--count 5`, `--mix 2:2:1`） |
-| `shuati detail <uid>` | 查看单题（`--reveal quiz\|hint\|full`，默认 `quiz`；`--hint-level 1..5`） |
+| `shuati detail <uid>` | 查看单题（`--reveal quiz\|hint\|full`，默认 `quiz`；`--hint-level 1..5`，`--include-visual-facts`） |
 | `shuati check <uid>` | 不泄露答案的逐小问判题（`--answer`, `--learner`, `--hint-level`, `--log`, `--request-id`），见 §5.4-2 |
 | `shuati diagnose` | 实时诊断外部新错题并匹配铺垫/变式/排雷题（`--text`, `--image`, `--grade-subject`, `--answer`），返回 `draft_id` |
 | `shuati ingest-mistake` | 将外部新错题一键入库并增量建五边（`--draft-id`, `--answer`, `--log-wrong`, `--learner`, `--dry-run`） |
-| `shuati log` / `log-batch` / `log-void` | 单题登记、按 `quiz_batch_id` 整卷批量登记（带 `--request-id` 幂等）与误登记冲销 |
+| `shuati log` / `log-batch` / `log-void` | 单题登记（支持 `--score-ratio`）、按 `quiz_batch_id` 整卷批量登记（带 `--request-id` 幂等）与误登记冲销 |
 | `shuati profile` | 查询角色分模块在线 Elo 水位（含走势与 ZPD）、8 档通过率阶梯与薄弱雷达；子命令 `learner list\|create\|use` 管理与切换当前角色 |
 | `shuati render-sheet` | 将题单或 `quiz_batch_id` 渲染为双模式静态 HTML（`--embed-images`, `--print-answers-at-end`, `--out`） |
 | `shuati override <uid>` | 写入/撤回人工覆写（`--field`, `--value`, `--reason`, `--revoke`, `--reconfirm`, `--dry-run`），触发 `core/refresh.py` 局部刷新 |
@@ -1328,31 +1348,33 @@ shuati check <uid> --answer "(1)12;(2)C" [--learner xiaoming] [--hint-level 0] [
 
 | 命令 | 职责 |
 | :--- | :--- |
-| `shuati ingest` | 执行 Stage 0 扫盘入库、图片 CAS 归档与清洗体检（`--apply-retire` 确认下架候选） |
+| `shuati ingest` | 执行 Stage 0 扫盘入库、图片 CAS 归档与清洗体检（`--dedup-near` 归并疑似重扫重题，`--apply-retire` 确认下架候选） |
 | `shuati grade-subject add\|list` | 注册新学段学科（`--name`, `--slug`, `--family`），查看各学段词表与锚点状态 |
-| `shuati compile --stage <1\|2\|3\|4\|all>` | 断点续跑各编译阶段（支持 `--only-uids`、`--stress-test-25`、`--force`） |
-| `shuati review` | 按需临时启动极简本地键盘复核页处理 `NEEDS_REVIEW` |
+| `shuati compile --stage <1\|2\|3c\|3d\|3e\|4\|all>` | 断点续跑各编译阶段（支持 `--only-uids`、`--stress-test-25`、`--force`） |
+| `shuati review` | 按需临时启动极简本地键盘复核页处理 `NEEDS_REVIEW`（支持 `[R]` 辅助重算草稿与 `--audit` 抽检模式） |
 | `shuati anchors init\|validate` | Stage 1.5 黄金难度锚点筛选与校验激活 |
 | `shuati taxonomy propose\|lock\|migrate\|candidates` | 词表 `DRAFT` 草案涌现、全量后 `LOCKED` 锁表重建、版本迁移与候选 L2 审批 |
 | `shuati graph compact\|revert-merge\|check-dag` | 执行或一键回滚 L3/概念并查集归并、先修 DAG 环检 |
-| `shuati audit` / `shuati reindex` / `shuati export` | 生成 Stage Q 质量体检报告、重建 FTS5 / 向量索引 / 分位表 / 生效列（`reindex --fts\|--vectors\|--quantiles\|--effective`）、导出 4 份标准 JSONL |
-| `shuati human restore\|verify` | 从 `human/*.jsonl` 镜像重放恢复人工资产，校验镜像与库内是否一致（§3.6） |
+| `shuati audit` / `shuati reindex` / `shuati export` | 生成 Stage Q 质量体检报告、重建 FTS5 / 向量索引 / 冻结分位表 / 生效列（`reindex --fts\|--vectors\|--quantiles\|--effective`）、导出 4 份标准 JSONL |
+| `shuati human restore\|verify` | 从 `human/*.jsonl` 全表快照一键 `INSERT OR REPLACE` 恢复人工资产，校验快照与库内一致性（§3.6） |
+| `shuati skill install` | 将 `skills/shuati/` 安装/软链至 `pi` 的项目或用户 Skill 目录（默认 `.pi/skills/shuati`） |
 | `shuati mcp-serve` *(可选)* | 启动本地 stdio MCP Server（仅安装 `mcp` extra 后启用） |
 
 #### 5. `pi` Skill 结构设计（`skills/shuati/`）
-- `skills/shuati/SKILL.md`（精简常驻加载，< 150 行）：明确触发条件、角色解析步骤（先确认当前 `learner`）、**防剧透铁律**（出题只允许 `reveal=quiz`，给提示逐级升 `hint-level`，判对错只用 `shuati check`，绝不提前剧透答案与 L3/Motif）、几何带图题优先 `render-sheet` 输出 HTML 看图与打印；
+- 仓库权威源码位于 `skills/shuati/`，通过 `shuati skill install [--target .pi/skills/shuati]` 一键软链或同步至 `pi` 自动发现目录（如 `.pi/skills/shuati/` 或 `~/.pi/agent/skills/shuati/`）；
+- `skills/shuati/SKILL.md`（精简常驻加载，< 150 行）：明确触发条件、角色解析步骤（先确认当前 `learner`）、**防剧透铁律**（出题只允许 `reveal=quiz` 且不带 `--include-visual-facts`，给提示逐级升 `hint-level`，判对错只用 `shuati check`，绝不提前剧透答案与 L3/Motif）、几何带图题直接使用返回的 `image_paths` 展示或调 `render-sheet` 输出 HTML 看图与打印；
 - `skills/shuati/reference/commands.md`（按需查阅）：全部命令的完整参数表、JSON 信封样例与错误码处理指南。
 
 ### 5.5 自包含静态 HTML 练习单双模式（`render/sheet_renderer.py`）
 
 - **屏幕交互模式**：
   - 优先内联或引用本地打包的精简 KaTeX 静态资源（完全断网可用），支持行内 `$...$` 与块级 `$$...$$` 公式渲染；
-  - 默认 `--embed-images` 将 CAS 图片以 `data:image/...;base64,...` 内联至单个 HTML，拷贝发给其他设备或直接打印零断图；
-  - 每题下方提供原生 `<details>` 三级默认折叠区：**① 逐步思路提示**（按 `sub_goal` 逐条）→ **② 标准答案**（按小问分列）→ **③ 完整解析与知识卡片**（支持一题多解标签页切换，附 `tier` 与 `L2/L3/Motif/Trap`）。
+  - 默认 `--embed-images` 将 CAS 图片以 `data:image/...;base64,...` 内联至单个 HTML（多图按序并排并渲染 `配图 1 / 配图 2` 及 `image_captions` 子图标签），拷贝发给其他设备或直接打印零断图；
+  - 每题下方提供原生 `<details>` 三级默认折叠区：**① 逐步思路提示**（严格按防剧透的 `question_steps.hint` 逐条展示，不含公式、辅助对象名与中间数值）→ **② 标准答案**（按小问分列）→ **③ 完整解析与知识卡片**（含各步 `sub_goal` + `core_formula`、支持一题多解标签页切换，附 `tier` 与 `L2/L3/Motif/Trap`）。
 - **打印友好版（`@media print`）**：
   - 自动隐藏所有 `<details>` 展开器、屏幕工具栏与阴影背景；
   - 单题容器设 `break-inside: avoid`，按“题干 + 配图 + 留白”估算高度动态分页（几何带图解答题通常每页 1～2 题，纯文字计算/填空题每页 3～4 题）；
-  - 每题下方依据题型与 `s_score`/`l_score` 自动预留纸笔作图/草稿演算留白框（几何解答题 `7cm`，普通填空/计算题 `3.5cm`）；
+  - 每题下方依据题型与 `s_score`/`l_score` 自动预留纸笔作图/草稿演算留白框（`作图操作题` `8cm`，几何解答题 `7cm`，普通填空/计算题 `3.5cm`）；
   - 启用 `--print-answers-at-end`（默认开启）时，在 `page-break-before: always` 后的末页集中排版紧凑版参考答案与关键步骤要点，便于撕页核对。
 
 ---
@@ -1390,10 +1412,10 @@ llm:
     max_concurrency: 12
     rpm_limit: 120
     max_retries: 3
-  judge_llm:                              # 定性判等 / 一题多解 / L3·概念归并裁判 / Stage 4 精裁 / check 定性小问
-    base_url: "${JUDGE_LLM_BASE_URL}"
-    api_key: "${JUDGE_LLM_API_KEY}"
-    model: "${JUDGE_LLM_MODEL}"           # 建议与 vlm_primary 不同家族，降低同源偏差
+  judge_llm:                              # 可选独立配置（未配 JUDGE_LLM_* 时自动回退复用 text_llm, temperature=0.0）
+    base_url: "${JUDGE_LLM_BASE_URL:-}"
+    api_key: "${JUDGE_LLM_API_KEY:-}"
+    model: "${JUDGE_LLM_MODEL:-}"         # 建议与 vlm_primary 不同家族，降低同源偏差
     temperature: 0.0
     timeout_seconds: 60
     max_concurrency: 8
@@ -1414,6 +1436,8 @@ pipeline:
   max_stage_attempts: 3                   # 单题单阶段 API 失败最大轮数，超出转人工（RUN_FAILED_EXHAUSTED）
   sympy_memory_limit_mb: 512              # Windows Job Object / Linux RLIMIT_AS
   consensus_audit_ratio: 0.05             # VERIFIED_CONSENSUS 假共识抽检比例
+  max_external_image_px: 2048             # 外部拍照错题图片长边缩放上限
+  allow_pi_314_subjects: ["小学奥数"]      # 允许 π ≈ 3.14 兼容判等的学段列表
 
 timezone: "Asia/Shanghai"                 # 存储一律 UTC，统计与编号按此时区换算
 
@@ -1428,10 +1452,11 @@ learner_elo:                              # 决策 D6
 
 composer:
   exclude_solved_days: 60
+  exclude_clone_days: 14                  # 近期已作答题的 CLONE 孪生邻居冷却天数
   exclude_recent_quiz_batches: 3
 
 topology:
-  rule_version: "2.3-init"
+  rule_version: "2.4-init"
   expected_degree: {CLONE: [0, 1], ISOMORPHIC: [1, 5], SCAFFOLD: [1, 6], CONTRASTIVE: [0, 2], SHARED_TRAP: [0, 5]}
 
 human_mirror:
@@ -1460,15 +1485,15 @@ human_mirror:
 在放量编译 1000+ 题之前，基于当前 `题库/` 122 题执行 **25 题分层几何压力测试**：
 
 1. **固定分层抽样清单（25 题）**：
-   - **阴影面积与曲线/直线组合图（8 题）**：含 `ch01_011`、`ch28_004`、`ch28_005`、`ch28_009` 等重度依赖读图的阴影边界题；
-   - **弦图/勾股/割补/极值难题（7 题）**：含 `ch28_001`、`ch28_006`、`ch28_007`、`ch28_010`、`ch28_011` 等高难度构造题；
-   - **双图与跨模块综合题（4 题）**：含 `ch01_012`（双平面图）、`ch28_002`（几何×行程）、`ch28_083`（双图）、`ch28_091`（双图）；
-   - **脏格式、多小问与非符号边界题（6 题）**：含 `ch28_003`（将军饮马错标选择题）、`ch28_016`（错标选择题）、`ch01_006`（6 小问计算）、`ch01_010`（填 `□/○` 运算符号）、`ch01_013`（定性说理）、`ch01_015`（计算+说理 `MIXED` 混合题）。
-2. **附带人工标注题对校准集**：每类边至少 20 个正例 + 20 个负例（含表皮相似但内核无关的负例），合计约 150～200 对；先由 `judge_llm` 粗标候选、再人工审定，在 M2 逐步积累，开发集中正例不足的边类型在 M4 全量后补齐；用于校准 Stage 4 的排名与分位阈值（替代拍脑袋硬编码）。
+   - **阴影面积与曲线/直线组合图（7 题）**：含 `ch01_011`、`ch28_004`、`ch28_005`、`ch28_009` 等重度依赖读图的阴影边界题；
+   - **弦图/勾股/割补/极值与比值/多值题（7 题）**：含 `ch28_001`、`ch28_006`、`ch28_007`、`ch28_010`、`ch28_011`、`ch28_020`（`RATIO` 比值小问）、`ch28_025`（`UNORDERED_MULTISET` 9 块区域面积）；
+   - **多图与跨模块综合题（4 题）**：含 `ch01_012`（双平面图 + `A/B` 子图题注）、`ch28_002`（几何×行程）、`ch28_083`（双图 + `图1/图2` 子图题注）、`ch28_091`（双图）；
+   - **脏格式、混型多空、作图与非符号边界题（7 题）**：含 `ch28_003`（将军饮马错标选择题 + 选项提取）、`ch28_016`（错标选择题）、`ch01_006`（6 小问计算）、`ch01_010`（`ORDERED_TUPLE` 混填 `□` 数字与 `○` 运算符）、`ch01_013`（纯定性说理）、`ch01_015`（无标号计算+说理固定双槽 `MIXED`）、`ch28_031`（`作图操作题` 定性验真）。
+2. **附带人工标注题对校准集**：每类边至少 20 个正例 + 20 个负例（含表皮相似但内核无关的负例，及实测重扫对 `ch28_015`/`ch28_057`），合计约 150～200 对；先由 `judge_llm` 粗标候选、再人工审定，在 M2 逐步积累，开发集中正例不足的边类型在 M4 全量后补齐；用于校准 Stage 4 的排名与分位阈值（替代拍脑袋硬编码）。
 3. **5 项硬性准出标准（达标后才进入全量放量）**：
    - **双盲共识率** $\ge 75\%$（几何难题存在合理分歧转入复核页属健康行为，若过低说明需更换更强 VLM）；
    - **共识集人工全量抽检准确率** $= 100\%$（杜绝两路 VLM 同时看错图却凑巧得到同错答案的假阳性）；
-   - **`visual_facts` 独立可还原度** $\ge 90\%$（遮住原图仅读 `visual_facts` 能准确还原阴影与拓扑关系）；
+   - **`visual_facts` 独立可还原度** $\ge 90\%$（遮住原图仅读 `visual_facts` 能准确还原阴影与拓扑关系，且零辅助线剧透）；
    - **`SYMBOLIC` 小问 SymPy 沙盒可执行通过率** $\ge 85\%$；
    - **单题实测平均耗时与成本**落在可接受预算区间内。
 4. **统计效力说明**：25 题中约 19 题能达成共识，即使抽检全部正确，假共识率的 Wilson 95% 置信上界仍约为 15%。因此：① 25 题划分为 15 道“Prompt 调优集”与 10 道“留出验证集”，准出标准以留出集结果为准，防止 Prompt 过拟合；② 放量后持续执行 5% 假共识抽检（§4.7），作为长期质量信号。
@@ -1479,8 +1504,8 @@ human_mirror:
 
 | 里程碑 | 核心交付物 | 自动化与实证验收标准 |
 | :--- | :--- | :--- |
-| **M0：工程基座与 Stage 0 入库体检** | `pyproject.toml`（`uv` 管理）、`config/` 模板（含 `collections.yaml`）、20 表（`questions` 含 `m_*`/`eff_*` 双层列）+ FTS5 `trigram` DDL 与 bootstrap 顺序、`core/effective.py`、`db/human_mirror.py`、`normalize_text`、单写者连接工厂、CAS 归档、`stage0_ingest.py`（行首锚定选择题正则） | DDL/外键/约束单元测试全绿；122 题全量正则无误伤（含 76 道 A/B 字母反例回归）；`eff_*` 写入权限审计测试与人工资产镜像重放测试全绿；当前 122 题入库零缺图、体检报告输出完整 |
-| **M1：Stage 1 验真闭环 + 复核页 + 25 题真实压测** | 跨平台 Windows/Unix SymPy 沙盒、`answer_parts.py` + `equivalence.py`（全小问类型白名单与判等）、多槽位自愈网关、`prompt_builder.py`（字段白名单 + 章节泄漏回归测试）、`stage1_solve.py`（含 `TEXT_RESOLVE` 双车道、`ADOPT_RUN`）、极简键盘复核页 `shuati review` | Mock 端到端单测 + Windows 超时进程树强杀测试通过；**真实 VLM 跑完 25 题压力测试并通过 5 项准出标准** |
-| **M2：Stage 1.5 ~ Stage 4 离线编译与知识网（122 题 DRAFT 贯通）** | `stage1_5_anchors.py`、`stage2_decompose.py`、`difficulty.py`（D4 `2400/2600`）、`stage3_taxonomy.py`（D1 `DRAFT` 草案词表 + L3/概念可逆并查集 + 先修 DAG 环检）、`vectors/store.py`、`stage4_weave.py`（分位数阈值 + `SHARED_TRAP` Top-5 防爆边 + 人工边裁定）、`refresh.py`、`audit.py`、`exporter.py` | 全模块单测 + 122 题完整跑通 Stage 0→4；人工题对集校准 Stage 4 阈值；成功导出 4 份标准 JSONL 与 Stage Q 体检报告 |
-| **M3：`pi` CLI/Skill 交互底座与静态双模式打印单** | `facade.py`、`reveal.py`（`quiz`/`hint`/`full`/`check` 裁剪）、`profiler.py`（分模块在线 Elo 重放）、`check` 判题、`composer.py`、`diagnose` + `ingest-mistake`、Typer CLI（统一 JSON 信封/退出码/幂等/`--dry-run`）、`skills/shuati/SKILL.md` + `reference/commands.md`、`sheet_renderer.py`（KaTeX + 内联图片 + 屏幕/打印双模式）、可选 `mcp_server` 薄封装 | CLI JSON 契约快照测试、防剧透测试、`check` 不泄露答案测试、冲销与幂等测试、Windows 管道 UTF-8 测试全绿；实机浏览器验收屏幕折叠与 A4 打印排版效果 |
-| **M4：全量 1000+ 题增量编译与正式锁表** | 将其余全部小学奥数章节放入 `题库/` → 增量跑 Stage 0~2 → 复核分歧队列 → **全量涌现并人工锁定 `taxonomy_primary_olympiad.yaml` (`LOCKED 1.0`)** → 执行 `DRAFT → LOCKED` 迁移与全量 Stage 3/4 编译 | 全量质量体检报告通过 NFR-1 ~ NFR-5 验收；交付可长期演进的本地题库资产 |
+| **M0：工程基座与 Stage 0 入库体检** | `pyproject.toml`（`uv` 管理）、`config/` 模板（含 `collections.yaml`）、20 表（`questions` 含 `m_*`/`eff_*` 双层列，`knowledge_nodes` 含 `node_level`）+ FTS5 `trigram` DDL 与 bootstrap 顺序、`core/effective.py`、`db/human_mirror.py`（全表原子快照导出与恢复）、`normalize_text` + 多图题注绑定、单写者连接工厂、保序 CAS 归档与 EXIF 处理、`stage0_ingest.py`（行首锚定选择题正则 + 选项提取 + `plain_fingerprint` 重扫预检） | DDL/外键/约束单元测试全绿；122 题全量正则无误伤（含 76 道 A/B 字母反例回归）且准确检出 `ch28_015`/`ch28_057` 重扫对与 `ch01_012`/`ch28_083` 多图题注；`eff_*` 写入权限审计测试与人工资产快照空库恢复测试全绿；122 题入库零缺图、体检报告完整 |
+| **M1：Stage 1 验真闭环 + 复核页 + 25 题真实压测** | 跨平台 Windows/Unix SymPy 沙盒（算术/数论/几何支持 + 反空壳探针）、`answer_parts.py` + `equivalence.py`（含 `RATIO`、$\pi \approx 3.14$、`collection_mode` 多值/多空、选择题安全互译与作图定性判等）、多槽位自愈网关、`prompt_builder.py`（字段白名单 + 多图编号 + 章节泄漏回归测试）、`stage1_solve.py`（含自包含 `ADOPT_RUN`）、极简键盘复核页 `shuati review`（含 `[R]` 重算参考草稿） | Mock 端到端单测 + Windows Job Object / 超时进程树强杀测试通过；**真实 VLM 跑完 25 题压力测试并通过 5 项准出标准** |
+| **M2：Stage 1.5 ~ Stage 4 离线编译与知识网（122 题 DRAFT 贯通）** | `stage1_5_anchors.py`、`stage2_decompose.py`、`difficulty.py`（D4 `2400/2600`）、`stage3_taxonomy.py`（D1 `DRAFT` 草案词表 + `S3C`/`S3D` 分离 + L3/概念可逆并查集 + L2 先修 DAG 环检）、`vectors/store.py`（含 `meta.json` 冻结分位表）、`stage4_weave.py`（kNN 排名 + 冻结分位表 + `SHARED_TRAP` Top-5 防爆边 + 人工边裁定）、`refresh.py`、`audit.py`、`exporter.py` | 全模块单测 + 122 题完整跑通 Stage 0→4（`raw_l1/l2` 零污染、`L2` 汇总节点零污染向量与熵）；人工题对集校准 Stage 4 阈值；成功导出 4 份标准 JSONL 与 Stage Q 体检报告 |
+| **M3：`pi` CLI/Skill 交互底座与静态双模式打印单** | `facade.py`、`reveal.py`（`quiz` 默认关 `visual_facts` + `image_paths` 直出 / `hint` / `full` / `check` 裁剪）、`profiler.py`（分模块在线 Elo 重放 + `score_ratio` 部分得分）、`check` 判题、`composer.py`（含 `CLONE` 14 天冷却避重）、`diagnose` + `ingest-mistake`（含外部照片 EXIF/缩放）、Typer CLI、`skills/shuati/` + `shuati skill install`、`sheet_renderer.py`（第 ① 级渲染 `hint` + KaTeX + 内联多图 + 打印分题型留白）、可选 `mcp_server` 薄封装 | CLI JSON 契约快照测试、防剧透测试、`check` 不泄露答案测试、冲销与幂等测试、Windows 管道 UTF-8 测试全绿；实机浏览器验收屏幕折叠与 A4 打印排版效果 |
+| **M4：全量 1000+ 题增量编译与正式锁表** | 将其余全部小学奥数章节放入 `题库/` → 增量跑 Stage 0~2 → 复核分歧队列 → **全量涌现并人工锁定 `taxonomy_primary_olympiad.yaml` (`LOCKED 1.0`)** → 执行 `DRAFT → LOCKED` 迁移与全量 `S3C → S3D → S3E → S4` 编译 | 全量质量体检报告通过 NFR-1 ~ NFR-5 验收；交付可长期演进的本地题库资产 |
