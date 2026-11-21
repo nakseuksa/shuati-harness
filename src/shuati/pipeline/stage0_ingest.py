@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import fnmatch
 import json
+import re
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -58,20 +59,145 @@ class Stage0IngestReport:
         return asdict(self)
 
 
+def _posix_glob_to_regex(pattern: str) -> str:
+    pat = pattern.replace("\\", "/").strip("/")
+    i = 0
+    n = len(pat)
+    res: list[str] = ["^"]
+    while i < n:
+        if pat[i : i + 4] == "/**/":
+            res.append("(?:/.+)?/")
+            i += 4
+        elif pat[i : i + 3] == "/**":
+            if i + 3 == n:
+                res.append("/.+")
+                i += 3
+            else:
+                res.append("/.*")
+                i += 3
+        elif pat[i : i + 3] == "**/":
+            res.append("(?:.+/)?")
+            i += 3
+        elif pat[i : i + 2] == "**":
+            res.append(".*")
+            i += 2
+        elif pat[i] == "*":
+            res.append("[^/]*")
+            i += 1
+        elif pat[i] == "?":
+            res.append("[^/]")
+            i += 1
+        else:
+            res.append(re.escape(pat[i]))
+            i += 1
+    res.append("$")
+    return "".join(res)
+
+
+def _posix_glob_match(path_posix: str, pattern: str) -> bool:
+    regex_str = _posix_glob_to_regex(pattern)
+    path_clean = path_posix.replace("\\", "/").strip("/")
+    return bool(re.match(regex_str, path_clean))
+
+
 def _match_collection_rule(collection: str, rules: list[dict[str, str]]) -> str | None:
     """按顺序匹配 collections.yaml 中的 glob 规则。"""
-    c_posix = collection.replace("\\", "/")
+    c_posix = collection.replace("\\", "/").strip("/")
     for rule in rules:
         pattern = rule.get("match", "")
         gs = rule.get("grade_subject", "")
-        if fnmatch.fnmatch(c_posix, pattern) or fnmatch.fnmatch(c_posix, f"{pattern}/*"):
+        if pattern and _posix_glob_match(c_posix, pattern):
             return gs
-        try:
-            if PurePosixPath(c_posix).match(pattern):
-                return gs
-        except Exception:
-            pass
     return None
+
+
+def _promote_orphan(
+    conn: sqlite3.Connection,
+    orphan_row: sqlite3.Row | dict[str, Any],
+    grade_subject: str,
+) -> None:
+    """将孤儿副本晋升为独立主题记录并补建 questions/compile_state 并重算。"""
+    orphan_uid = orphan_row["question_uid"]
+    conn.execute(
+        "UPDATE raw_questions SET duplicate_of_uid = NULL, updated_at = datetime('now') WHERE question_uid = ?",
+        (orphan_uid,),
+    )
+    o_raw_q = orphan_row["raw_question"]
+    o_cas_imgs = json.loads(orphan_row["cas_images_json"] or "[]")
+    o_captions = json.loads(orphan_row["image_captions_json"] or "[]")
+    o_tags = json.loads(orphan_row["legacy_tags_json"] or "{}")
+
+    o_norm_res = normalize_text(o_raw_q, num_images=len(o_cas_imgs))
+    o_norm_q = o_norm_res.normalized_text
+    if not o_captions:
+        o_captions = o_norm_res.image_captions
+    o_is_choice, o_opt_dict = detect_and_extract_choice_options(o_norm_q)
+    o_raw_fmt = o_tags.get("format", "解答题") if isinstance(o_tags, dict) else "解答题"
+    if o_raw_fmt == "操作构造题":
+        o_raw_fmt = "作图操作题"
+
+    if o_is_choice:
+        o_fmt = "选择题"
+        o_opts_j = json.dumps(o_opt_dict, ensure_ascii=False)
+    else:
+        if o_raw_fmt in (
+            "选择题",
+            "填空题",
+            "判断题",
+            "计算题",
+            "解答题",
+            "证明题",
+            "作图操作题",
+            "实验探究题",
+        ):
+            o_fmt = o_raw_fmt
+        else:
+            o_fmt = "解答题"
+        o_opts_j = "{}"
+
+    o_has_imgs = 1 if o_cas_imgs else 0
+
+    conn.execute(
+        """
+        INSERT INTO questions(
+            question_uid, grade_subject, cas_images_json,
+            image_captions_json, has_images, is_retired,
+            m_question_text, m_options_json, m_format
+        ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+        ON CONFLICT(question_uid) DO UPDATE SET
+            cas_images_json = excluded.cas_images_json,
+            image_captions_json = excluded.image_captions_json,
+            has_images = excluded.has_images,
+            m_question_text = excluded.m_question_text,
+            m_options_json = excluded.m_options_json,
+            m_format = excluded.m_format,
+            is_retired = CASE WHEN questions.retired_reason IN ('DUPLICATE', 'MERGED_NEAR_DUPLICATE', 'MISSING_FROM_SOURCE') THEN 0 ELSE questions.is_retired END,
+            retired_reason = CASE WHEN questions.retired_reason IN ('DUPLICATE', 'MERGED_NEAR_DUPLICATE', 'MISSING_FROM_SOURCE') THEN '' ELSE questions.retired_reason END,
+            updated_at = datetime('now')
+        """,
+        (
+            orphan_uid,
+            grade_subject,
+            orphan_row["cas_images_json"],
+            json.dumps(o_captions, ensure_ascii=False),
+            o_has_imgs,
+            o_norm_q,
+            o_opts_j,
+            o_fmt,
+        ),
+    )
+    for stg in ("S1", "S2", "S3C", "S3D", "S4"):
+        conn.execute(
+            """
+            INSERT INTO compile_state(question_uid, stage, status, updated_at)
+            VALUES (?, ?, 'PENDING', datetime('now'))
+            ON CONFLICT(question_uid, stage) DO UPDATE SET
+                status = 'PENDING',
+                updated_at = datetime('now')
+            """,
+            (orphan_uid, stg),
+        )
+    effective.recompute(conn, orphan_uid)
 
 
 def _question_has_refs(conn: sqlite3.Connection, question_uid: str) -> bool:
@@ -177,7 +303,16 @@ def run_stage0_ingest(
     for pf in problems_files:
         try:
             rel = pf.parent.relative_to(root_path).as_posix()
-            source_col = rel if rel != "." else pf.parent.name
+            if rel != ".":
+                source_col = rel
+            else:
+                col_found = None
+                curr_p = pf.parent.resolve()
+                for ancestor in [curr_p, *curr_p.parents]:
+                    if ancestor.name == "题库":
+                        col_found = curr_p.relative_to(ancestor).as_posix()
+                        break
+                source_col = col_found if col_found and col_found != "." else pf.parent.name
         except Exception:
             source_col = pf.parent.name
         file_collections.append((pf, source_col))
@@ -210,8 +345,7 @@ def run_stage0_ingest(
     actual_lock_path = Path(lock_path) if lock_path else db_p.parent / ".compile.lock"
     compile_lock = CompileLock(actual_lock_path)
 
-    with compile_lock:
-        conn = get_connection(db_path)
+    with compile_lock, closing(get_connection(db_path)) as conn:
         writer = SingleWriterExecutor()
 
         # 确保 DB DDL 初始化完成
@@ -235,9 +369,76 @@ def run_stage0_ingest(
             slug_map[gs] = row["slug"]
 
         scanned_collections_by_gs: dict[str, set[str]] = {}
+        present_uids_by_col: dict[tuple[str, str], set[str]] = {}
+
+        for pf, source_collection, grade_subject in mapped_files:
+            slug = slug_map[grade_subject]
+            scanned_collections_by_gs.setdefault(grade_subject, set()).add(source_collection)
+            key = (grade_subject, source_collection)
+            present_uids_by_col.setdefault(key, set())
+            try:
+                with open(pf, encoding="utf-8") as f:
+                    for line in f:
+                        line_str = line.strip()
+                        if not line_str:
+                            continue
+                        try:
+                            it = json.loads(line_str)
+                            if isinstance(it, dict) and it.get("id"):
+                                sid = str(it.get("id")).strip()
+                                present_uids_by_col[key].add(f"{slug}:{source_collection}:{sid}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         # 4. 逐集合逐题解析处理
         with writer.transaction(conn):
+            # 4.0 前置标记本轮源端缺失题并处理其下属活跃副本孤儿认领/晋升（防题号重编吞题 6B）
+            for (gs, col), present_uids in present_uids_by_col.items():
+                existing_in_col = conn.execute(
+                    "SELECT question_uid FROM raw_questions WHERE grade_subject = ? AND source_collection = ?",
+                    (gs, col),
+                ).fetchall()
+                for erow in existing_in_col:
+                    e_uid = erow["question_uid"]
+                    if e_uid not in present_uids:
+                        conn.execute(
+                            "UPDATE raw_questions SET is_missing_from_source = 1, updated_at = datetime('now') WHERE question_uid = ?",
+                            (e_uid,),
+                        )
+                        # 若该缺失题曾是活跃题的主题，处理其活跃子副本
+                        active_kids = conn.execute(
+                            """
+                            SELECT question_uid, grade_subject, raw_question, cas_images_json,
+                                   image_captions_json, legacy_tags_json, content_hash
+                            FROM raw_questions
+                            WHERE duplicate_of_uid = ? AND is_missing_from_source = 0
+                            ORDER BY ingested_at ASC, question_uid ASC
+                            """,
+                            (e_uid,),
+                        ).fetchall()
+                        for akid in active_kids:
+                            ak_uid = akid["question_uid"]
+                            ak_hash = akid["content_hash"]
+                            new_m = conn.execute(
+                                """
+                                SELECT question_uid
+                                FROM raw_questions
+                                WHERE grade_subject = ? AND content_hash = ? AND duplicate_of_uid IS NULL
+                                  AND is_missing_from_source = 0 AND question_uid != ?
+                                ORDER BY ingested_at ASC, question_uid ASC LIMIT 1
+                                """,
+                                (gs, ak_hash, ak_uid),
+                            ).fetchone()
+                            if new_m:
+                                conn.execute(
+                                    "UPDATE raw_questions SET duplicate_of_uid = ?, updated_at = datetime('now') WHERE question_uid = ?",
+                                    (new_m["question_uid"], ak_uid),
+                                )
+                            else:
+                                _promote_orphan(conn, akid, gs)
+
             for pf, source_collection, grade_subject in mapped_files:
                 slug = slug_map[grade_subject]
                 scanned_collections_by_gs.setdefault(grade_subject, set()).add(source_collection)
@@ -316,7 +517,10 @@ def run_stage0_ingest(
                         raw_chapter = str(item.get("chapter", "")) if item.get("chapter") is not None else ""
 
                         report.total_scanned += 1
-                        source_file_rel = pf.as_posix()
+                        try:
+                            source_file_rel = pf.resolve().relative_to(Path.cwd().resolve()).as_posix()
+                        except Exception:
+                            source_file_rel = pf.as_posix()
                         question_uid = f"{slug}:{source_collection}:{source_id}"
 
                         # 图片校验与 CAS 归档
@@ -414,6 +618,19 @@ def run_stage0_ingest(
                         legacy_tags_json = json.dumps(legacy_tags, ensure_ascii=False)
 
                         if existing:
+                            # 6C: 源题回归自动解冻 MISSING_FROM_SOURCE
+                            was_unretired = False
+                            unretire_res = conn.execute(
+                                """
+                                UPDATE questions
+                                SET is_retired = 0, retired_reason = '', updated_at = datetime('now')
+                                WHERE question_uid = ? AND is_retired = 1 AND retired_reason = 'MISSING_FROM_SOURCE'
+                                """,
+                                (existing["question_uid"],),
+                            )
+                            if unretire_res.rowcount > 0:
+                                was_unretired = True
+
                             # 存在同源题记录
                             if existing["content_hash"] == content_hash:
                                 # 内容未变，幂等跳过
@@ -425,17 +642,26 @@ def run_stage0_ingest(
                                     """,
                                     (scan_id, existing["question_uid"]),
                                 )
+                                if was_unretired:
+                                    effective.recompute(conn, existing["question_uid"])
                                 report.skipped_unchanged.append(existing["question_uid"])
                             else:
                                 # 内容变更：重新核对是否还为副本
+                                old_hash = existing["content_hash"]
                                 new_dup = conn.execute(
                                     """
                                     SELECT question_uid, duplicate_of_uid
                                     FROM raw_questions
                                     WHERE grade_subject = ? AND content_hash = ? AND question_uid != ?
+                                      AND COALESCE(duplicate_of_uid, '') != ? AND is_missing_from_source = 0
                                     ORDER BY ingested_at ASC LIMIT 1
                                     """,
-                                    (grade_subject, content_hash, existing["question_uid"]),
+                                    (
+                                        grade_subject,
+                                        content_hash,
+                                        existing["question_uid"],
+                                        existing["question_uid"],
+                                    ),
                                 ).fetchone()
 
                                 target_dup_uid = (
@@ -443,11 +669,15 @@ def run_stage0_ingest(
                                     if new_dup
                                     else None
                                 )
+                                if target_dup_uid == existing["question_uid"]:
+                                    target_dup_uid = None
 
                                 conn.execute(
                                     """
                                     UPDATE raw_questions
                                     SET
+                                        raw_chapter = ?,
+                                        source_file = ?,
                                         raw_question = ?,
                                         raw_images_json = ?,
                                         cas_images_json = ?,
@@ -462,6 +692,8 @@ def run_stage0_ingest(
                                     WHERE question_uid = ?
                                     """,
                                     (
+                                        raw_chapter,
+                                        source_file_rel,
                                         raw_question,
                                         raw_images_json,
                                         cas_images_json,
@@ -510,6 +742,40 @@ def run_stage0_ingest(
                                                 (existing["question_uid"],),
                                             )
                                             effective.recompute(conn, existing["question_uid"])
+
+                                    # 6A: 杜绝 duplicate_of_uid 二级断链
+                                    children = conn.execute(
+                                        """
+                                        SELECT question_uid, grade_subject, raw_question, cas_images_json,
+                                               image_captions_json, legacy_tags_json, content_hash, plain_fingerprint
+                                        FROM raw_questions
+                                        WHERE duplicate_of_uid = ?
+                                        ORDER BY ingested_at ASC, question_uid ASC
+                                        """,
+                                        (existing["question_uid"],),
+                                    ).fetchall()
+                                    for ch in children:
+                                        ch_uid = ch["question_uid"]
+                                        ch_hash = ch["content_hash"]
+                                        is_match = (ch_hash == content_hash)
+                                        if not is_match and dedup_near:
+                                            if ch["plain_fingerprint"] == plain_fingerprint:
+                                                ch_cas = json.loads(ch["cas_images_json"] or "[]")
+                                                if len(ch_cas) == 0 and len(cas_images) == 0:
+                                                    is_match = True
+                                                elif len(ch_cas) > 0 and len(ch_cas) == len(cas_images):
+                                                    ch_dh = [compute_dhash(assets_path / x) for x in ch_cas if (assets_path / x).exists()]
+                                                    if len(ch_dh) == len(dhashes):
+                                                        dists = [hamming_distance(h1, h2) for h1, h2 in zip(dhashes, ch_dh)]
+                                                        if dists and max(dists) <= 4:
+                                                            is_match = True
+                                        if is_match:
+                                            conn.execute(
+                                                "UPDATE raw_questions SET duplicate_of_uid = ?, updated_at = datetime('now') WHERE question_uid = ?",
+                                                (target_dup_uid, ch_uid),
+                                            )
+                                        else:
+                                            _promote_orphan(conn, ch, grade_subject)
                                 else:
                                     # 不是副本：更新或补建 questions / compile_state
                                     if q_row:
@@ -523,8 +789,8 @@ def run_stage0_ingest(
                                                 cas_images_json = ?,
                                                 image_captions_json = ?,
                                                 has_images = ?,
-                                                is_retired = CASE WHEN retired_reason IN ('DUPLICATE', 'MERGED_NEAR_DUPLICATE') THEN 0 ELSE is_retired END,
-                                                retired_reason = CASE WHEN retired_reason IN ('DUPLICATE', 'MERGED_NEAR_DUPLICATE') THEN '' ELSE retired_reason END,
+                                                is_retired = CASE WHEN retired_reason IN ('DUPLICATE', 'MERGED_NEAR_DUPLICATE', 'MISSING_FROM_SOURCE') THEN 0 ELSE is_retired END,
+                                                retired_reason = CASE WHEN retired_reason IN ('DUPLICATE', 'MERGED_NEAR_DUPLICATE', 'MISSING_FROM_SOURCE') THEN '' ELSE retired_reason END,
                                                 updated_at = datetime('now')
                                             WHERE question_uid = ?
                                             """,
@@ -586,117 +852,57 @@ def run_stage0_ingest(
                                             )
                                         effective.recompute(conn, existing["question_uid"])
 
-                                # 孤儿副本重定向或自立为新主题 (修复 #16 与 #20：仅在 plain_fingerprint 真正失配时判定为孤儿)
-                                orphans = conn.execute(
-                                    """
-                                    SELECT question_uid, raw_question, raw_images_json, cas_images_json,
-                                           image_captions_json, legacy_tags_json, content_hash
-                                    FROM raw_questions
-                                    WHERE duplicate_of_uid = ? AND plain_fingerprint != ?
-                                    ORDER BY ingested_at ASC, question_uid ASC
-                                    """,
-                                    (existing["question_uid"], plain_fingerprint),
-                                ).fetchall()
-
-                                for orphan in orphans:
-                                    orphan_uid = orphan["question_uid"]
-                                    orphan_hash = orphan["content_hash"]
-                                    new_master = conn.execute(
+                                    # 6D: 精确区分精确副本与近重副本的孤儿判据（修复 6D 且完美保留 #20）
+                                    children = conn.execute(
                                         """
-                                        SELECT question_uid
+                                        SELECT question_uid, grade_subject, raw_question, cas_images_json,
+                                               image_captions_json, legacy_tags_json, content_hash, plain_fingerprint
                                         FROM raw_questions
-                                        WHERE grade_subject = ? AND content_hash = ? AND duplicate_of_uid IS NULL AND question_uid != ?
-                                        ORDER BY ingested_at ASC, question_uid ASC LIMIT 1
+                                        WHERE duplicate_of_uid = ?
+                                        ORDER BY ingested_at ASC, question_uid ASC
                                         """,
-                                        (grade_subject, orphan_hash, orphan_uid),
-                                    ).fetchone()
+                                        (existing["question_uid"],),
+                                    ).fetchall()
+                                    for ch in children:
+                                        ch_uid = ch["question_uid"]
+                                        ch_hash = ch["content_hash"]
+                                        near_matched = False
+                                        if ch["plain_fingerprint"] == plain_fingerprint:
+                                            ch_cas = json.loads(ch["cas_images_json"] or "[]")
+                                            if len(ch_cas) == 0 and len(cas_images) == 0:
+                                                near_matched = True
+                                            elif len(ch_cas) > 0 and len(ch_cas) == len(cas_images):
+                                                ch_dh = [compute_dhash(assets_path / x) for x in ch_cas if (assets_path / x).exists()]
+                                                if len(ch_dh) == len(dhashes):
+                                                    dists = [hamming_distance(h1, h2) for h1, h2 in zip(dhashes, ch_dh)]
+                                                    if dists and max(dists) <= 4:
+                                                        near_matched = True
 
-                                    if new_master:
-                                        conn.execute(
-                                            "UPDATE raw_questions SET duplicate_of_uid = ?, updated_at = datetime('now') WHERE question_uid = ?",
-                                            (new_master["question_uid"], orphan_uid),
-                                        )
-                                    else:
-                                        conn.execute(
-                                            "UPDATE raw_questions SET duplicate_of_uid = NULL, updated_at = datetime('now') WHERE question_uid = ?",
-                                            (orphan_uid,),
-                                        )
-                                        o_raw_q = orphan["raw_question"]
-                                        o_cas_imgs = json.loads(orphan["cas_images_json"] or "[]")
-                                        o_captions = json.loads(orphan["image_captions_json"] or "[]")
-                                        o_tags = json.loads(orphan["legacy_tags_json"] or "{}")
-
-                                        o_norm_res = normalize_text(o_raw_q, num_images=len(o_cas_imgs))
-                                        o_norm_q = o_norm_res.normalized_text
-                                        if not o_captions:
-                                            o_captions = o_norm_res.image_captions
-                                        o_is_choice, o_opt_dict = detect_and_extract_choice_options(o_norm_q)
-                                        o_raw_fmt = o_tags.get("format", "解答题") if isinstance(o_tags, dict) else "解答题"
-                                        if o_raw_fmt == "操作构造题":
-                                            o_raw_fmt = "作图操作题"
-
-                                        if o_is_choice:
-                                            o_fmt = "选择题"
-                                            o_opts_j = json.dumps(o_opt_dict, ensure_ascii=False)
+                                        if ch_hash == old_hash:
+                                            # 原本是精确副本：仅当 dedup_near=True 且满足近重条件时保持归并，否则为孤儿
+                                            is_still_merged = bool(dedup_near and near_matched)
                                         else:
-                                            if o_raw_fmt in (
-                                                "选择题",
-                                                "填空题",
-                                                "判断题",
-                                                "计算题",
-                                                "解答题",
-                                                "证明题",
-                                                "作图操作题",
-                                                "实验探究题",
-                                            ):
-                                                o_fmt = o_raw_fmt
-                                            else:
-                                                o_fmt = "解答题"
-                                            o_opts_j = "{}"
+                                            # 原本是近重副本（如 #20）：只要满足近重条件就继续保持归并
+                                            is_still_merged = near_matched
 
-                                        o_has_imgs = 1 if o_cas_imgs else 0
-
-                                        conn.execute(
-                                            """
-                                            INSERT INTO questions(
-                                                question_uid, grade_subject, cas_images_json,
-                                                image_captions_json, has_images, is_retired,
-                                                m_question_text, m_options_json, m_format
-                                            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-                                            ON CONFLICT(question_uid) DO UPDATE SET
-                                                cas_images_json = excluded.cas_images_json,
-                                                image_captions_json = excluded.image_captions_json,
-                                                has_images = excluded.has_images,
-                                                m_question_text = excluded.m_question_text,
-                                                m_options_json = excluded.m_options_json,
-                                                m_format = excluded.m_format,
-                                                is_retired = CASE WHEN questions.retired_reason IN ('DUPLICATE', 'MERGED_NEAR_DUPLICATE') THEN 0 ELSE questions.is_retired END,
-                                                retired_reason = CASE WHEN questions.retired_reason IN ('DUPLICATE', 'MERGED_NEAR_DUPLICATE') THEN '' ELSE questions.retired_reason END,
-                                                updated_at = datetime('now')
-                                            """,
-                                            (
-                                                orphan_uid,
-                                                grade_subject,
-                                                orphan["cas_images_json"],
-                                                json.dumps(o_captions, ensure_ascii=False),
-                                                o_has_imgs,
-                                                o_norm_q,
-                                                o_opts_j,
-                                                o_fmt,
-                                            ),
-                                        )
-                                        for stg in ("S1", "S2", "S3C", "S3D", "S4"):
-                                            conn.execute(
+                                        if not is_still_merged:
+                                            new_master = conn.execute(
                                                 """
-                                                INSERT INTO compile_state(question_uid, stage, status, updated_at)
-                                                VALUES (?, ?, 'PENDING', datetime('now'))
-                                                ON CONFLICT(question_uid, stage) DO UPDATE SET
-                                                    status = 'PENDING',
-                                                    updated_at = datetime('now')
+                                                SELECT question_uid
+                                                FROM raw_questions
+                                                WHERE grade_subject = ? AND content_hash = ? AND duplicate_of_uid IS NULL
+                                                  AND is_missing_from_source = 0 AND question_uid != ?
+                                                ORDER BY ingested_at ASC, question_uid ASC LIMIT 1
                                                 """,
-                                                (orphan_uid, stg),
-                                            )
-                                        effective.recompute(conn, orphan_uid)
+                                                (grade_subject, ch_hash, ch_uid),
+                                            ).fetchone()
+                                            if new_master:
+                                                conn.execute(
+                                                    "UPDATE raw_questions SET duplicate_of_uid = ?, updated_at = datetime('now') WHERE question_uid = ?",
+                                                    (new_master["question_uid"], ch_uid),
+                                                )
+                                            else:
+                                                _promote_orphan(conn, ch, grade_subject)
 
                                 report.updated_source_changed.append(existing["question_uid"])
                             continue
@@ -706,7 +912,7 @@ def run_stage0_ingest(
                             """
                             SELECT question_uid, duplicate_of_uid
                             FROM raw_questions
-                            WHERE grade_subject = ? AND content_hash = ?
+                            WHERE grade_subject = ? AND content_hash = ? AND is_missing_from_source = 0
                             ORDER BY ingested_at ASC LIMIT 1
                             """,
                             (grade_subject, content_hash),
@@ -758,6 +964,7 @@ def run_stage0_ingest(
                             SELECT question_uid, cas_images_json
                             FROM raw_questions
                             WHERE grade_subject = ? AND plain_fingerprint = ? AND duplicate_of_uid IS NULL
+                              AND is_missing_from_source = 0
                             ORDER BY ingested_at ASC
                             """,
                             (grade_subject, plain_fingerprint),
@@ -916,6 +1123,8 @@ def run_stage0_ingest(
                         AND r1.question_uid < r2.question_uid
                         AND r1.duplicate_of_uid IS NULL
                         AND r2.duplicate_of_uid IS NULL
+                        AND r1.is_missing_from_source = 0
+                        AND r2.is_missing_from_source = 0
                     WHERE r1.grade_subject = ?
                     """,
                     (gs,),
@@ -1089,6 +1298,13 @@ def run_stage0_ingest(
     if report.unmapped_collections:
         for u in report.unmapped_collections:
             md_content += f"- `{u}`\n"
+    else:
+        md_content += "无\n"
+
+    md_content += "\n## 4. 图片尺寸与 EXIF 告警清单\n"
+    if report.image_warnings:
+        for iw in report.image_warnings:
+            md_content += f"- {iw}\n"
     else:
         md_content += "无\n"
 

@@ -47,15 +47,18 @@ def normalize_text(raw_text: str, num_images: int = 0) -> NormalizeResult:
         "stray_letters_stripped": False,
     }
 
-    # 0. 抽取并保护 $...$ 内联 LaTeX 片段（DESIGN §4.2-3①）
+    # 0. 抽取并保护 $$...$$ 块级 LaTeX 与 $...$ 内联 LaTeX 片段（DESIGN §4.2-3①）
     latex_spans: list[str] = []
 
     def _save_latex(m: re.Match[str]) -> str:
         latex_spans.append(m.group(0))
         return f"__SHUATI_LATEX_{len(latex_spans) - 1}__"
 
-    latex_pattern = re.compile(r"(?<!\\)\$(?:\\\$|[^$\r\n])+?(?<!\\)\$")
-    text = latex_pattern.sub(_save_latex, raw_text)
+    block_latex_pattern = re.compile(r"(?<!\\)\$\$(?:\\\$|[\s\S])+?(?<!\\)\$\$")
+    text = block_latex_pattern.sub(_save_latex, raw_text)
+
+    inline_latex_pattern = re.compile(r"(?<!\\)\$(?:\\\$|[^$\r\n])+?(?<!\\)\$")
+    text = inline_latex_pattern.sub(_save_latex, text)
 
     # 1. 全角字母与数字转半角
     text = text.translate(_FULLWIDTH_TO_HALFWIDTH)
@@ -138,7 +141,7 @@ def detect_and_extract_choice_options(text: str) -> tuple[bool, dict[str, str]]:
     1. 存在行首匹配的选项 A：^[ \t]*[AＡ][.、．)）]\s*\S+
     2. 在其后存在行首匹配的选项 B：^[ \t]*[BＢ][.、．)）]\s*\S+
     3. 选项行内容非纯几何顶点声明（不含“如图”“点 A. ”等句式）。
-    同时支持单行内以 2 个及以上空格分隔的横向选项。
+    同时支持单行内或多行网格（如 2x2）以 2 个及以上空格分隔的横向连续选项完整提取。
     """
     line_opt_re = re.compile(r"^[ \t]*([A-EＡ-Ｅ])[.、．)）]\s*(\S.*?)$")
     horizontal_re = re.compile(
@@ -155,6 +158,31 @@ def detect_and_extract_choice_options(text: str) -> tuple[bool, dict[str, str]]:
     for line in lines:
         if not line:
             continue
+
+        # 1. 尝试匹配横向多个选项（>= 2 个）
+        h_matches = horizontal_re.findall(line)
+        if len(h_matches) >= 2:
+            row_candidates: list[tuple[str, str]] = []
+            valid_row = True
+            for raw_k, raw_v in h_matches:
+                k = norm_letter_map.get(raw_k.upper(), raw_k.upper())
+                v = raw_v.strip()
+                if any(sub in v for sub in _GEOMETRIC_NON_OPTION_SUBSTRINGS) or _GEOMETRIC_NON_OPTION_RE.search(v):
+                    valid_row = False
+                    break
+                row_candidates.append((k, v))
+
+            if valid_row and len(row_candidates) >= 2:
+                for k, v in row_candidates:
+                    if k == "A" and not found_keys:
+                        found_keys.append(k)
+                        temp_opts[k] = v
+                    elif found_keys and ord(k) == ord(found_keys[-1]) + 1:
+                        found_keys.append(k)
+                        temp_opts[k] = v
+                continue
+
+        # 2. 单行选项匹配
         m = line_opt_re.match(line)
         if m:
             k = m.group(1).upper()
@@ -170,33 +198,8 @@ def detect_and_extract_choice_options(text: str) -> tuple[bool, dict[str, str]]:
                 found_keys.append(k)
                 temp_opts[k] = val
 
-    if len(found_keys) >= 2 and "A" in found_keys and "B" in found_keys:
+    if len(found_keys) >= 2 and found_keys[:2] == ["A", "B"]:
         return True, temp_opts
-
-    # 检查横向选项
-    for line in lines:
-        line_clean = line.strip()
-        if not line_clean:
-            continue
-        matches = horizontal_re.findall(line_clean)
-        if matches:
-            keys = [m[0].upper() for m in matches]
-            norm_keys = [norm_letter_map.get(k, k) for k in keys]
-            if len(norm_keys) >= 2 and norm_keys[:2] == ["A", "B"]:
-                # 检查连续性
-                is_seq = True
-                for i in range(1, len(norm_keys)):
-                    if ord(norm_keys[i]) != ord(norm_keys[i - 1]) + 1:
-                        is_seq = False
-                        break
-                if is_seq:
-                    opts = {k: v.strip() for k, v in zip(norm_keys, [m[1] for m in matches])}
-                    if any(
-                        any(sub in v for sub in _GEOMETRIC_NON_OPTION_SUBSTRINGS) or _GEOMETRIC_NON_OPTION_RE.search(v)
-                        for v in opts.values()
-                    ):
-                        continue
-                    return True, opts
 
     return False, {}
 

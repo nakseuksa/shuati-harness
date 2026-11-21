@@ -11,10 +11,13 @@ from typing import Any
 
 import typer
 
+from shuati.config import load_settings
 from shuati.core import effective
 from shuati.db import human_mirror, repository
 from shuati.db.connection import (
+    CompileLock,
     PreconditionError,
+    SingleWriterExecutor,
     get_connection,
 )
 from shuati.db.schema import init_db
@@ -179,6 +182,7 @@ def grade_subject_add(
 ) -> None:
     """注册新的学段学科。"""
     t0 = time.time()
+    conn = None
     try:
         conn = get_connection(db)
         _ensure_db_initialized(conn, config_dir)
@@ -216,6 +220,9 @@ def grade_subject_add(
             as_json=json,
             exit_code=EXIT_INTERNAL,
         )
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @grade_subject_app.command(name="list")
@@ -226,6 +233,7 @@ def grade_subject_list(
 ) -> None:
     """列出全部已注册学段学科。"""
     t0 = time.time()
+    conn = None
     try:
         conn = get_connection(db)
         _ensure_db_initialized(conn, config_dir)
@@ -249,36 +257,68 @@ def grade_subject_list(
             as_json=json,
             exit_code=EXIT_INTERNAL,
         )
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @human_app.command(name="restore")
 def human_restore(
-    from_dir: Path = typer.Option(Path("human"), "--from", help="人工资产镜像源目录"),
+    from_dir: Path | None = typer.Option(None, "--from", help="人工资产镜像源目录"),
     dry_run: bool = typer.Option(False, "--dry-run", help="仅预览恢复行数，不写数据库"),
-    backups_dir: Path = typer.Option(Path("data/backups"), "--backups-dir", help="备份目录"),
+    backups_dir: Path | None = typer.Option(None, "--backups-dir", help="备份目录"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
     json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
 ) -> None:
     """从 human/*.jsonl 恢复人工资产（UPSERT 幂等恢复）。"""
     t0 = time.time()
+    settings = load_settings(config_dir / "settings.yaml")
+    actual_from_dir = from_dir if from_dir is not None else Path(settings.human_mirror.dir)
+    actual_backups_dir = backups_dir if backups_dir is not None else Path("data/backups")
+
+    def _execute_restore():
+        conn = None
+        try:
+            conn = get_connection(db)
+            _ensure_db_initialized(conn, config_dir)
+            effective.install_eff_write_guard(conn)
+            counts = human_mirror.restore_snapshot(
+                conn,
+                human_dir=actual_from_dir,
+                backups_dir=actual_backups_dir,
+                dry_run=dry_run,
+                backups_keep=settings.human_mirror.backups_keep,
+            )
+            duration_ms = int((time.time() - t0) * 1000)
+            output_envelope(
+                "human.restore",
+                data={"counts": counts, "dry_run": dry_run},
+                meta={"duration_ms": duration_ms},
+                as_json=json,
+                exit_code=EXIT_OK,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+
     try:
-        conn = get_connection(db)
-        _ensure_db_initialized(conn, config_dir)
-        effective.install_eff_write_guard(conn)
-        counts = human_mirror.restore_snapshot(
-            conn, human_dir=from_dir, backups_dir=backups_dir, dry_run=dry_run
-        )
+        if not dry_run:
+            with CompileLock(db.parent / ".compile.lock"):
+                _execute_restore()
+        else:
+            _execute_restore()
+    except typer.Exit:
+        raise
+    except PreconditionError as e:
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
             "human.restore",
-            data={"counts": counts, "dry_run": dry_run},
+            error=ErrorDetail(code="PRECONDITION_FAILED", message=str(e)),
             meta={"duration_ms": duration_ms},
             as_json=json,
-            exit_code=EXIT_OK,
+            exit_code=EXIT_PRECONDITION,
         )
-    except typer.Exit:
-        raise
     except Exception as e:
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
@@ -292,26 +332,43 @@ def human_restore(
 
 @human_app.command(name="verify")
 def human_verify(
-    from_dir: Path = typer.Option(Path("human"), "--from", help="人工资产镜像源目录"),
+    from_dir: Path | None = typer.Option(None, "--from", help="人工资产镜像源目录"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
     json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
 ) -> None:
     """验证数据库内人工资产与磁盘 human/*.jsonl 的 SHA-256 一致性。"""
     t0 = time.time()
+    conn = None
+    settings = load_settings(config_dir / "settings.yaml")
+    actual_from_dir = from_dir if from_dir is not None else Path(settings.human_mirror.dir)
     try:
         conn = get_connection(db)
         _ensure_db_initialized(conn, config_dir)
-        results = human_mirror.verify_snapshot(conn, human_dir=from_dir)
+        results = human_mirror.verify_snapshot(
+            conn,
+            human_dir=actual_from_dir,
+            include_practice_log=settings.human_mirror.include_practice_log,
+        )
         duration_ms = int((time.time() - t0) * 1000)
         is_consistent = results.get("is_consistent", False)
-        output_envelope(
-            "human.verify",
-            data=results,
-            meta={"duration_ms": duration_ms},
-            as_json=json,
-            exit_code=EXIT_OK if is_consistent else EXIT_PRECONDITION,
-        )
+        if is_consistent:
+            output_envelope(
+                "human.verify",
+                data=results,
+                meta={"duration_ms": duration_ms},
+                as_json=json,
+                exit_code=EXIT_OK,
+            )
+        else:
+            output_envelope(
+                "human.verify",
+                data=results,
+                error=ErrorDetail(code="PRECONDITION_FAILED", message="人工资产快照与数据库不一致"),
+                meta={"duration_ms": duration_ms},
+                as_json=json,
+                exit_code=EXIT_PRECONDITION,
+            )
     except typer.Exit:
         raise
     except Exception as e:
@@ -323,6 +380,9 @@ def human_verify(
             as_json=json,
             exit_code=EXIT_INTERNAL,
         )
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.command()
@@ -335,36 +395,51 @@ def reindex(
 ) -> None:
     """全量重建全文检索索引或重算生效层字段。"""
     t0 = time.time()
+    conn = None
     try:
-        conn = get_connection(db)
-        _ensure_db_initialized(conn, config_dir)
-        effective.install_eff_write_guard(conn)
+        lock = CompileLock(db.parent / ".compile.lock")
+        with lock:
+            conn = get_connection(db)
+            _ensure_db_initialized(conn, config_dir)
+            effective.install_eff_write_guard(conn)
 
-        do_fts = fts
-        do_eff = effective_flag
-        if not do_fts and not do_eff:
-            do_fts = True
-            do_eff = True
+            do_fts = fts
+            do_eff = effective_flag
+            if not do_fts and not do_eff:
+                do_fts = True
+                do_eff = True
 
-        res_data: dict[str, Any] = {}
-        if do_eff:
-            count_eff = effective.recompute_all(conn)
-            res_data["effective_recomputed"] = count_eff
+            res_data: dict[str, Any] = {}
+            writer = SingleWriterExecutor()
+            with writer.transaction(conn):
+                if do_eff:
+                    ver = effective.verify_effective_consistency(conn)
+                    res_data["effective_recomputed"] = ver["total_checked"]
+                    res_data["diff_count"] = ver["diff_count"]
 
-        if do_fts:
-            count_fts = repository.rebuild_fts(conn)
-            res_data["fts_rebuilt"] = count_fts
+                if do_fts:
+                    count_fts = repository.rebuild_fts(conn)
+                    res_data["fts_rebuilt"] = count_fts
 
+            duration_ms = int((time.time() - t0) * 1000)
+            output_envelope(
+                "reindex",
+                data=res_data,
+                meta={"duration_ms": duration_ms},
+                as_json=json,
+                exit_code=EXIT_OK,
+            )
+    except typer.Exit:
+        raise
+    except PreconditionError as e:
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
             "reindex",
-            data=res_data,
+            error=ErrorDetail(code="PRECONDITION_FAILED", message=str(e)),
             meta={"duration_ms": duration_ms},
             as_json=json,
-            exit_code=EXIT_OK,
+            exit_code=EXIT_PRECONDITION,
         )
-    except typer.Exit:
-        raise
     except Exception as e:
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
@@ -374,6 +449,9 @@ def reindex(
             as_json=json,
             exit_code=EXIT_INTERNAL,
         )
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == "__main__":

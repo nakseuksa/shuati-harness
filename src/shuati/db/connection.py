@@ -8,8 +8,8 @@ import sqlite3
 import sys
 import threading
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +45,10 @@ def get_connection(db_path: Path | str, readonly: bool = False) -> sqlite3.Conne
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA busy_timeout = 5000;")
+    if not readonly:
+        from shuati.core.effective import install_eff_write_guard
+
+        install_eff_write_guard(conn)
     return conn
 
 
@@ -160,14 +164,22 @@ class SingleWriterExecutor:
             try:
                 yield conn
                 conn.commit()
-            except Exception:
+            except BaseException:
                 conn.rollback()
                 raise
 
-    async def async_transaction(self, conn: sqlite3.Connection):
+    @asynccontextmanager
+    async def async_transaction(self, conn: sqlite3.Connection) -> AsyncIterator[sqlite3.Connection]:
         """异步协程上下文写事务。"""
         async with self._async_lock:
-            # 在同步线程中执行事务
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, conn.execute, "BEGIN IMMEDIATE;")
-            return conn
+            self._sync_lock.acquire()
+            try:
+                conn.execute("BEGIN IMMEDIATE;")
+                try:
+                    yield conn
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
+            finally:
+                self._sync_lock.release()

@@ -90,20 +90,29 @@ def install_eff_write_guard(conn: sqlite3.Connection) -> None:
         """)
 
 
-def _resolve_canonical_node_id(conn: sqlite3.Connection, node_id: str) -> str:
-    """通过 redirect_to_id 并查集追踪活跃主节点 ID。"""
+def _resolve_canonical_node_id(conn: sqlite3.Connection, node_id: str) -> str | None:
+    """通过 redirect_to_id 并查集追踪活跃主节点 ID，核验其在 knowledge_nodes 中存在且为 L3 节点。"""
     curr = node_id
     visited = set()
     while curr and curr not in visited:
         visited.add(curr)
         row = conn.execute(
-            "SELECT redirect_to_id FROM knowledge_nodes WHERE node_id = ?",
+            "SELECT redirect_to_id, node_level FROM knowledge_nodes WHERE node_id = ?",
             (curr,),
         ).fetchone()
-        if not row or not row["redirect_to_id"]:
-            return curr
+        if not row:
+            return None
+        if not row["redirect_to_id"]:
+            return curr if row["node_level"] == "L3" else None
         curr = row["redirect_to_id"]
-    return curr
+    if curr:
+        row = conn.execute(
+            "SELECT node_level FROM knowledge_nodes WHERE node_id = ?",
+            (curr,),
+        ).fetchone()
+        if row and row["node_level"] == "L3":
+            return curr
+    return None
 
 
 def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
@@ -231,9 +240,9 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
 
     # (2) 选项表：若为选择题则从生效题干提取
     if eff_format == "选择题":
-        if "question_text" in active_overrides:
-            _, extracted_opts = detect_and_extract_choice_options(eff_question_text)
-            eff_options_json = json.dumps(extracted_opts, ensure_ascii=False)
+        if "question_text" in active_overrides or not q_row["m_options_json"] or q_row["m_options_json"] == "{}":
+            is_ch, extracted_opts = detect_and_extract_choice_options(eff_question_text)
+            eff_options_json = json.dumps(extracted_opts, ensure_ascii=False) if (is_ch and extracted_opts) else "{}"
         else:
             eff_options_json = q_row["m_options_json"] or "{}"
     else:
@@ -379,8 +388,12 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
     else:
         active_nodes = step_node_ids
 
-    # 并查集 find() 归一
-    canonical_nodes = sorted({_resolve_canonical_node_id(conn, nid) for nid in active_nodes if nid})
+    # 并查集 find() 归一与 L3 节点过滤
+    canonical_nodes = sorted({
+        c
+        for nid in active_nodes
+        if nid and (c := _resolve_canonical_node_id(conn, nid)) is not None
+    })
     eff_node_ids_json = json.dumps(canonical_nodes, ensure_ascii=False)
 
     # (11) 当前生效覆写字段列表

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -83,8 +84,30 @@ class AnswerPart(BaseModel):
                 f"answer_type '{self.answer_type}' 与 verify_mode '{self.verify_mode}' 不匹配，"
                 f"允许的 verify_mode 为: {allowed}"
             )
-        if self.answer_type == "CHOICE" and not self.choice_label and not self.answer:
-            raise ValueError("CHOICE 类型的 AnswerPart 必须提供 choice_label 或 answer")
+        # 拒绝模型自造子小问标签
+        if re.match(r"^\(\d+\)\s*[-._]", self.label):
+            raise ValueError(f"不合法的子小问标签 '{self.label}'：严禁自造连接符后缀")
+
+        # collection_mode != "SINGLE" 时 items 必须为非空列表
+        if self.collection_mode != "SINGLE":
+            if not isinstance(self.items, list) or len(self.items) == 0:
+                raise ValueError(f"当 collection_mode 为 '{self.collection_mode}' 时，items 必须为非空列表")
+
+        # collection_mode == "SINGLE" 且 verify_mode == "SYMBOLIC" 时 sympy_expr 必须非空字符串
+        if self.collection_mode == "SINGLE" and self.verify_mode == "SYMBOLIC":
+            if not self.sympy_expr or not self.sympy_expr.strip():
+                raise ValueError("当 collection_mode 为 'SINGLE' 且 verify_mode 为 'SYMBOLIC' 时，sympy_expr 必须为非空字符串")
+
+        # answer_type == "CHOICE" 时 choice_label 必须非空字符串
+        if self.answer_type == "CHOICE":
+            if not self.choice_label or not self.choice_label.strip():
+                raise ValueError("CHOICE 类型的 AnswerPart 必须提供非空的 choice_label")
+
+        # collection_mode == "SINGLE" 且 answer_type == "SYMBOL_FILL" 时 canonical 必须非空字符串
+        if self.collection_mode == "SINGLE" and self.answer_type == "SYMBOL_FILL":
+            if not self.canonical or not self.canonical.strip():
+                raise ValueError("SYMBOL_FILL 类型的 AnswerPart 在 collection_mode 为 'SINGLE' 时 canonical 必须为非空字符串")
+
         return self
 
 

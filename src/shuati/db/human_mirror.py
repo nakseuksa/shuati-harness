@@ -115,6 +115,7 @@ def restore_snapshot(
     human_dir: Path | str = "human",
     backups_dir: Path | str | None = "data/backups",
     dry_run: bool = False,
+    backups_keep: int = 10,
 ) -> dict[str, int]:
     """从 human/*.jsonl 恢复人工资产。
 
@@ -145,9 +146,13 @@ def restore_snapshot(
     # 若库内已有数据且提供了 backups_dir，恢复前先备份
     has_data = conn.execute("SELECT 1 FROM learners LIMIT 1;").fetchone() is not None
     if has_data and backups_dir:
-        vacuum_backup(conn, backups_dir, "human_restore")
+        vacuum_backup(conn, backups_dir, "human_restore", keep=backups_keep)
 
     affected_question_uids: set[str] = set()
+    seen_learner_ids: set[str] = set()
+    seen_override_ids: set[int] = set()
+    seen_rel_ids: set[int] = set()
+    seen_log_ids: set[int] = set()
 
     with conn:
         # 1. 恢复 learners
@@ -161,6 +166,7 @@ def restore_snapshot(
                     if not line:
                         continue
                     item = json.loads(line)
+                    seen_learner_ids.add(str(item["learner_id"]))
                     if item.get("is_current") == 1:
                         conn.execute(
                             "UPDATE learners SET is_current = 0 WHERE is_current = 1 AND learner_id != :learner_id;",
@@ -190,6 +196,7 @@ def restore_snapshot(
                     if not line:
                         continue
                     item = json.loads(line)
+                    seen_override_ids.add(int(item["override_id"]))
                     # 若本条为活跃覆写，先将同 (question_uid, field_name) 的其他活跃行置 0，杜绝撞 uq_overrides_active
                     if item.get("is_active") == 1:
                         conn.execute(
@@ -244,6 +251,7 @@ def restore_snapshot(
                     if not line:
                         continue
                     item = json.loads(line)
+                    seen_rel_ids.add(int(item["override_id"]))
                     # 若本条为活跃关系覆写，先将同 (source, target, type) 的其他活跃行置 0，杜绝撞 uq_rel_overrides_active
                     if item.get("is_active") == 1:
                         conn.execute(
@@ -295,6 +303,28 @@ def restore_snapshot(
                     if not line:
                         continue
                     item = json.loads(line)
+                    seen_log_ids.add(int(item["log_id"]))
+                    # 消除二级唯一约束冲突
+                    if item.get("client_request_id"):
+                        conn.execute(
+                            """
+                            UPDATE practice_log
+                            SET client_request_id = NULL
+                            WHERE learner_id = :learner_id
+                              AND client_request_id = :client_request_id
+                              AND log_id != :log_id;
+                            """,
+                            item,
+                        )
+                    if item.get("voids_log_id"):
+                        conn.execute(
+                            """
+                            DELETE FROM practice_log
+                            WHERE voids_log_id = :voids_log_id
+                              AND log_id != :log_id;
+                            """,
+                            item,
+                        )
                     conn.execute(
                         """
                         INSERT INTO practice_log(
@@ -328,6 +358,73 @@ def restore_snapshot(
                         item,
                     )
                     counts["practice_log"] += 1
+
+        # 5. 清理快照外多余行（按逆外键依赖顺序，确保 restore 后与磁盘 snapshot 100% 一致）
+        # (1) practice_log
+        if pl_file.exists():
+            if seen_log_ids:
+                ph = ",".join("?" for _ in seen_log_ids)
+                conn.execute(
+                    f"DELETE FROM practice_log WHERE voids_log_id IS NOT NULL AND log_id NOT IN ({ph});",
+                    list(seen_log_ids),
+                )
+                conn.execute(
+                    f"DELETE FROM practice_log WHERE log_id NOT IN ({ph});",
+                    list(seen_log_ids),
+                )
+            else:
+                conn.execute("DELETE FROM practice_log WHERE voids_log_id IS NOT NULL;")
+                conn.execute("DELETE FROM practice_log;")
+
+        # (2) relation_overrides
+        if rel_file.exists():
+            if seen_rel_ids:
+                ph = ",".join("?" for _ in seen_rel_ids)
+                conn.execute(
+                    f"DELETE FROM relation_overrides WHERE override_id NOT IN ({ph});",
+                    list(seen_rel_ids),
+                )
+            else:
+                conn.execute("DELETE FROM relation_overrides;")
+
+        # (3) human_overrides
+        if overrides_file.exists():
+            if seen_override_ids:
+                ph = ",".join("?" for _ in seen_override_ids)
+                del_ovs = conn.execute(
+                    f"SELECT DISTINCT question_uid FROM human_overrides WHERE override_id NOT IN ({ph});",
+                    list(seen_override_ids),
+                ).fetchall()
+                for r in del_ovs:
+                    affected_question_uids.add(r["question_uid"])
+                conn.execute(
+                    f"DELETE FROM human_overrides WHERE override_id NOT IN ({ph});",
+                    list(seen_override_ids),
+                )
+            else:
+                del_ovs = conn.execute("SELECT DISTINCT question_uid FROM human_overrides;").fetchall()
+                for r in del_ovs:
+                    affected_question_uids.add(r["question_uid"])
+                conn.execute("DELETE FROM human_overrides;")
+
+        # (4) learners
+        if learners_file.exists():
+            if seen_learner_ids:
+                ph = ",".join("?" for _ in seen_learner_ids)
+                excess_learners = conn.execute(
+                    f"SELECT learner_id FROM learners WHERE learner_id NOT IN ({ph});",
+                    list(seen_learner_ids),
+                ).fetchall()
+            else:
+                excess_learners = conn.execute("SELECT learner_id FROM learners;").fetchall()
+
+            for er in excess_learners:
+                lid = er["learner_id"]
+                has_pl = conn.execute("SELECT 1 FROM practice_log WHERE learner_id = ? LIMIT 1;", (lid,)).fetchone()
+                if has_pl:
+                    continue
+                conn.execute("DELETE FROM quiz_batches WHERE learner_id = ?;", (lid,))
+                conn.execute("DELETE FROM learners WHERE learner_id = ?;", (lid,))
 
     # 恢复后对涉及题目调用 effective.recompute
     for uid in affected_question_uids:

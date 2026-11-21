@@ -19,6 +19,22 @@ class NotFoundError(Exception):
     pass
 
 
+def _follow_duplicates(conn: sqlite3.Connection, initial_uid: str) -> str:
+    """循环追踪 duplicate_of_uid 至最终主题（带 visited 防环保护）。"""
+    curr = initial_uid
+    visited = set()
+    while curr and curr not in visited:
+        visited.add(curr)
+        row = conn.execute(
+            "SELECT duplicate_of_uid FROM raw_questions WHERE question_uid = ?",
+            (curr,),
+        ).fetchone()
+        if not row or not row["duplicate_of_uid"]:
+            return curr
+        curr = row["duplicate_of_uid"]
+    return curr
+
+
 def resolve_question_uid(conn: sqlite3.Connection, id_or_uid: str) -> str:
     """支持完整 question_uid 与 source_id 简写解析。
 
@@ -32,38 +48,31 @@ def resolve_question_uid(conn: sqlite3.Connection, id_or_uid: str) -> str:
     # 1. 完整 UID 精确匹配
     if ":" in id_or_uid:
         row = conn.execute(
-            "SELECT question_uid, duplicate_of_uid FROM raw_questions WHERE question_uid = ?",
+            "SELECT question_uid FROM raw_questions WHERE question_uid = ?",
             (id_or_uid,),
         ).fetchone()
         if row:
-            if row["duplicate_of_uid"]:
-                return row["duplicate_of_uid"]
-            return row["question_uid"]
+            return _follow_duplicates(conn, row["question_uid"])
 
     # 2. source_id 简写匹配
     rows = conn.execute(
-        "SELECT question_uid, duplicate_of_uid FROM raw_questions WHERE source_id = ?",
+        "SELECT question_uid FROM raw_questions WHERE source_id = ?",
         (id_or_uid,),
     ).fetchall()
 
     if len(rows) == 1:
-        row = rows[0]
-        if row["duplicate_of_uid"]:
-            return row["duplicate_of_uid"]
-        return row["question_uid"]
+        return _follow_duplicates(conn, rows[0]["question_uid"])
     elif len(rows) > 1:
         candidates = [r["question_uid"] for r in rows]
         raise AmbiguousUidError(candidates)
 
     # 3. 兜底检查（如传入的不带冒号但等于 question_uid）
     row = conn.execute(
-        "SELECT question_uid, duplicate_of_uid FROM raw_questions WHERE question_uid = ?",
+        "SELECT question_uid FROM raw_questions WHERE question_uid = ?",
         (id_or_uid,),
     ).fetchone()
     if row:
-        if row["duplicate_of_uid"]:
-            return row["duplicate_of_uid"]
-        return row["question_uid"]
+        return _follow_duplicates(conn, row["question_uid"])
 
     raise NotFoundError(f"题目 '{id_or_uid}' 未找到")
 
@@ -131,6 +140,9 @@ def search_fts(
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     """全文检索（FTS5 trigram + <3字短词 LIKE 回退，DESIGN.md §3.2-13）。"""
+    from shuati.core.text_norm import _FULLWIDTH_TO_HALFWIDTH
+
+    query_text = query_text.translate(_FULLWIDTH_TO_HALFWIDTH)
     tokens = [t.strip() for t in query_text.split() if t.strip()]
     if not tokens:
         return []
@@ -166,7 +178,7 @@ def search_fts(
 
     # 拼接短词 LIKE
     for lt in like_tokens:
-        escaped_lt = lt.replace("%", "\\%").replace("_", "\\_")
+        escaped_lt = lt.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         where_clauses.append(
             "(q.eff_question_text LIKE ? ESCAPE '\\' OR q.eff_visual_facts LIKE ? ESCAPE '\\' OR q.eff_abstract_skeleton LIKE ? ESCAPE '\\')"
         )

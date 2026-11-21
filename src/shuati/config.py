@@ -34,7 +34,11 @@ def _load_env_file(env_path: Path) -> None:
                 continue
             k, v = line.split("=", 1)
             k = k.strip()
-            v = v.strip().strip("'\"")
+            v = v.strip()
+            if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                v = v[1:-1]
+            else:
+                v = re.split(r"[ \t]+#", v, maxsplit=1)[0].strip()
             if k not in os.environ:
                 os.environ[k] = v
 
