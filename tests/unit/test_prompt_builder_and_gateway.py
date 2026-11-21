@@ -113,6 +113,8 @@ def test_stage1_input_schema_and_prompt_zero_leakage(tmp_path: Path) -> None:
 
 
 def test_other_prompt_builders() -> None:
+    assert STAGE1_PROMPT_VERSION == "s1_v2"
+
     q_msgs = build_qualitative_judge_messages("(2)", "连接对角线", "作对角线", "求作法")
     assert len(q_msgs) == 2 and "连接对角线" in q_msgs[1]["content"]
 
@@ -121,6 +123,58 @@ def test_other_prompt_builders() -> None:
 
     r_msgs = build_review_resolve_messages("求面积", "正方形边长为4", "小学奥数")
     assert len(r_msgs) == 2 and "正方形边长为4" in r_msgs[1]["content"]
+    r_sys = r_msgs[0]["content"]
+    for key in ("method_summary", "solution_markdown", "final_answers", "sympy_code", "sympy_expr", "ORDERED_TUPLE"):
+        assert key in r_sys
+
+
+def test_stage1_prompt_json_schema_templates(tmp_path: Path) -> None:
+    assets_dir = tmp_path / "assets"
+    assets_dir.mkdir(parents=True)
+    inp = Stage1Input(
+        question_uid="primary_olympiad:ch01:ch01_001",
+        grade_subject="小学奥数",
+        question_text="求 1+1。",
+        has_images=False,
+    )
+
+    p_sys = build_stage1_messages(inp, role="PRIMARY", assets_dir=assets_dir)[0]["content"]
+    for token in (
+        "visual_facts",
+        "visual_ambiguity_flag",
+        "visual_ambiguity_note",
+        "method_summary",
+        "solution_markdown",
+        "final_answers",
+        "sympy_code",
+        "sympy_expr",
+        "ORDERED_TUPLE",
+        "UNORDERED_MULTISET",
+        "LABELED_MAP",
+        "choice_label",
+        "canonical",
+        "QUALITATIVE",
+    ):
+        assert token in p_sys
+
+    s_sys = build_stage1_messages(inp, role="SECONDARY", assets_dir=assets_dir)[0]["content"]
+    for token in (
+        "visual_facts",
+        "visual_ambiguity_flag",
+        "visual_ambiguity_note",
+        "method_summary",
+        "solution_markdown",
+        "final_answers",
+        "sympy_expr",
+        "ORDERED_TUPLE",
+        "UNORDERED_MULTISET",
+        "LABELED_MAP",
+        "choice_label",
+        "canonical",
+        "QUALITATIVE",
+    ):
+        assert token in s_sys
+    assert "不含 `sympy_code`" in s_sys
 
 
 @pytest.mark.asyncio
@@ -283,8 +337,11 @@ async def test_gateway_http_retries_and_schema_self_repair(
         assert res.completion_tokens == 20
         assert sleeps == [1.0]
         assert len(call_log) == 3
-        # 自愈消息中包含了上次报错信息
-        assert "JSON" in call_log[2]["messages"][-1]["content"]
+        # 自愈消息中包含了上次报错信息与完整目标 JSON Schema
+        repair_content = call_log[2]["messages"][-1]["content"]
+        assert "JSON" in repair_content
+        expected_schema_json = json.dumps(ReviewResolveOutput.model_json_schema(), ensure_ascii=False)
+        assert expected_schema_json in repair_content
 
         row = conn.execute("SELECT status, raw_response_path FROM llm_calls WHERE call_id = ?", (res.call_id,)).fetchone()
         assert row["status"] == "SCHEMA_RETRY_OK"

@@ -311,8 +311,13 @@ class LLMGateway:
         return content, p_tok, c_tok, raw_text
 
     def _build_repair_messages(
-        self, messages: list[dict[str, Any]], raw_content: str, exc: Exception
+        self,
+        messages: list[dict[str, Any]],
+        raw_content: str,
+        exc: Exception,
+        schema: type[BaseModel],
     ) -> list[dict[str, Any]]:
+        schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
         return [
             *messages,
             {"role": "assistant", "content": raw_content},
@@ -321,7 +326,9 @@ class LLMGateway:
                 "content": (
                     "你上一次的输出未通过 JSON 解析或 Pydantic Schema 校验。具体错误信息如下：\n"
                     f"{exc}\n"
-                    "请严格按原 JSON Schema 修复并仅输出合法的完整 JSON 对象，不要包含任何解释或 Markdown 代码块。"
+                    "目标完整 JSON Schema 定义如下：\n"
+                    f"{schema_json}\n"
+                    "请严格按上述 JSON Schema 修复并仅输出合法的完整 JSON 对象，不要包含任何解释或 Markdown 代码块。"
                 ),
             },
         ]
@@ -433,7 +440,7 @@ class LLMGateway:
             except (ValueError, ValidationError) as first_exc:
                 repair_body = {
                     **body,
-                    "messages": self._build_repair_messages(messages, content, first_exc),
+                    "messages": self._build_repair_messages(messages, content, first_exc, schema),
                 }
                 repaired_content, rp_tok, rc_tok, _ = await self._post_with_retries(
                     slot=slot, slot_cfg=slot_cfg, stage=stage, body=repair_body

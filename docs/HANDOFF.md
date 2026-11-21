@@ -1,17 +1,21 @@
 # 项目交接备忘录（HANDOFF — v2 重头启动）
 
-**更新**: 2026-11-20
-**用途**: 新会话记忆入口。开始工作前先读本文件与 [docs/REQUIREMENTS.md](REQUIREMENTS.md)、[docs/DESIGN.md](DESIGN.md)。
+**更新**: 2026-11-21 20:40 (Asia/Shanghai)
+**用途**: 新会话记忆入口。开始工作前先读本文件与 [docs/REQUIREMENTS.md](REQUIREMENTS.md)、[docs/DESIGN.md](DESIGN.md)、[docs/records/INDEX.md](records/INDEX.md)。
 
 ---
 
 ## 一、 当前阶段与现状
 
-- **项目转型**: 仓库已清理并决定在 `shuati-harness` 内**重头开始构建 v2**：纯理科离线题库知识编译器 + 严密知识网 + 面向 `pi` 终端客户端的检索/组卷/刷题工具。
-- **目录归档完成**: 原 v1（在线自适应刷题 Web 系统）的全部源码、测试与文档已通过 `git mv` 无损归档至 `backup/v1/`（**尚未 `git commit`**，留待确认后统一提交）。
-- **需求已定稿**: 完整需求规格书已落盘于 [docs/REQUIREMENTS.md](REQUIREMENTS.md)（v2.0 定稿，FR-1 ~ FR-11 + NFR-1 ~ NFR-5）。
-- **理论底座已保留**: [docs/理论基础.md](理论基础.md)（原根目录复制保留）。
-- **架构设计 v2.4 已完成实证修订**: [docs/DESIGN.md](DESIGN.md)（合入用户决策 D1～D6，以及第四轮结合本地 122 道实题与配图的修正、补充与瘦身裁剪；按用户裁决保留 `S3C/S3D` 分阶段与 `meta.json` 冻结 2 万对分位表），**暂不启动代码实施，待终审确认**。
+- **已完成里程碑**（详细验收报告见 [docs/records/INDEX.md](records/INDEX.md)）：
+  - **M0 & M0.1 (`PASSED`)**：工程基座、SQLite 20 表 + FTS5 DDL、122 题 Stage 0 入库与配图 CAS 体检全部落盘至 `data/shuati.db`。
+  - **M1 工程交付与终审 (`PASSED`)**：Stage 1 双盲双 VLM 验真闭环、跨平台 SymPy 沙盒（含 `sympy.external.gmpy` 内部放行与 `IfExp` 兜底热修）、本地键盘复核页（`src/shuati/review/`）及全量自动化测试（123 passed、`ruff`/`mypy` 0 错）。
+- **刚完成：M1 25 题真机几何压测 & 人工复核裁决落盘**：
+  - 报告详见 [20261121_154820_M1_stress_test_25_report.md](records/20261121_154820_M1_stress_test_25_report.md)；
+  - 当前 `.env` 实测阵容：`vlm_primary=anthropic/claude-sonnet-5.5`、`vlm_secondary=openai/gpt-6.1-terra`、`text_llm/judge_llm=openai/gpt-6.2-sol`、`embedding=google/gemini-embedding-2`；
+  - 本轮实测结果：**25/25 零失败（4.8 分钟）**，严格自动共识 **17/25（68.0%；有效题 22 题中占 77.3%）**、实际答案一致 **21/25（84.0%）**、一题多解 **6 题**、SymPy `SYMBOLIC` 通过率 **26/30（86.7%，达标）**、25 题总花费约 **$1.38（¥10.0，单题 ¥0.40）**；
+  - **人工复核已完成**：8 题 `NEEDS_REVIEW` 中 **5 题转 `HUMAN_VERIFIED`**（`ch01_010`、`ch01_012`、`ch01_013`、`ch28_009` 采纳主路，`ch28_010` 采纳辅路）、**3 题坏题剔除**（`ch28_025`、`ch28_031`、`ch28_091`，`is_excluded=1`, `eff_is_servable=0`）；17 题 `VERIFIED_CONSENSUS` 保持无驳回；`human_overrides` 共 23 条活跃记录并已同步导出至 `human/overrides.jsonl`；
+  - 全部数据已持久化在 `data/shuati.db` 与 `data/llm_raw/`，**`backup/v1/` 与 `题库/` 严格只读零修改**，已按用户要求阶段 `git commit` 存档暂停。
 
 ---
 
@@ -60,8 +64,12 @@
 
 ---
 
-## 四、 下一步工作起点（供新会话直接接力）
+## 四、 下一步工作起点（供重启/新会话直接接力）
 
-1. **终审锁定 [docs/DESIGN.md](DESIGN.md)（v2.4）**（确认后可统一处理归档与设计文档的首次 `git commit`）；
-2. **确认模型网关配置**：确定 Stage 1 主/辅跨家族 VLM、Stage 2~3 纯文本模型与 Embedding 模型的端点配置；
-3. **按 `DESIGN.md` 第七章里程碑启动实施**：先完成 **M0**（工程基座、20 表 + FTS5 DDL、122 题 Stage 0 入库体检）与 **M1**（Stage 1 验真、复核页、**25 题几何压力测试通过 5 项准出标准**），验证达标后再推进 M2~M4。
+1. **确认 M1 最终准出并决定 M2 推进节奏**：
+   - 复核页裁决已全部落盘（`HUMAN_VERIFIED`: 5、`is_excluded`: 3、`VERIFIED_CONSENSUS`: 17、`human/overrides.jsonl`: 23 条）；
+   - 向用户确认 17 题共识集抽检结论（假共识率与 `visual_facts` 可还原度）以正式签出 M1 `PASSED`；
+   - 选择推进路线：① 先补跑其余 **97 题** Stage 1（凑齐 122 题有效真相后再建 M2），或 ② 先基于当前 22 题有效样本开发并跑通 **M2**（Stage 1.5 锚点 ~ Stage 4 五边拓扑与知识网），再全库补齐 122 题。
+2. **Windows 环境操作备忘**：
+   - 避免沙盒内直接跑 `uv run`（`OS error 5`），统一用 `.venv\Scripts\python.exe`、`.venv\Scripts\ruff.exe check --no-cache`、`.venv\Scripts\mypy.exe --cache-dir "$env:TEMP\shuati_mypy_cache"`；
+   - 含 `asyncio` / `pytest-asyncio` / 外网 LLM / 本地浏览器可访问 HTTP 服务必须用 `BypassSandbox: true`（Windows 禁网沙盒会阻塞 `ProactorEventLoop` 的 `socketpair()`）。

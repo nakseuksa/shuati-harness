@@ -26,6 +26,9 @@ def test_ast_probe_blocks_dangerous_apis_and_allows_safe_math() -> None:
         ("FORBIDDEN_CALL", "def verify():\n    open('x', 'w')\n    return {'主问': str(1+2)}\n"),
         ("FORBIDDEN_CALL", "def verify():\n    return {'主问': str(__import__('os'))}\n"),
         ("FORBIDDEN_ATTR", "def verify():\n    return {'主问': str((1).__class__)}\n"),
+        ("FORBIDDEN_IMPORT", "import sympy.external.gmpy\ndef verify():\n    return {'主问': str(1+2)}\n"),
+        ("FORBIDDEN_IMPORT", "from sympy.external.pythonmpq import PythonMPQ\ndef verify():\n    return {'主问': str(PythonMPQ(1, 2))}\n"),
+        ("FORBIDDEN_IMPORT", "from sympy.external.importtools import import_module\ndef verify():\n    return {'主问': str(import_module('os').getpid())}\n"),
     ]
     for expected_reason, script in forbidden_scripts:
         res = validate_script_ast(script)
@@ -71,6 +74,13 @@ def test_ast_anti_tautology_rejects_vacuous_and_allows_computed() -> None:
         'def verify():\n    return {"主问": str(42)}\n',
         'def verify():\n    return {"主问": ["12", "24"]}\n',
         'def verify():\n    return {"(1)": str(3 + 4), "(2)": "10"}\n',  # 其中一项为空壳常量
+        "AB = 300\ndef verify():\n    return {'主问': str(AB)}\n",
+        "from sympy import Symbol\ndef verify():\n    x = Symbol('x')\n    return {'主问': 42 if True else x + 1}\n",
+        "from sympy import Symbol\ndef verify():\n    x = Symbol('x')\n    return {'主问': 42 if x > 0 else x + 1}\n",
+        "from sympy import Symbol\ndef verify():\n    x = Symbol('x')\n    return {'主问': '42' if x > 0 else str(x + 1)}\n",
+        "from sympy import Symbol\ndef verify():\n    x = Symbol('x')\n    return {'主问': '119/2' if x > 0 else str(x + 1)}\n",
+        "from sympy import Symbol\ndef verify():\n    x = Symbol('x')\n    return {'主问': str(x + 1) if 1 < 2 else '无解'}\n",
+        "from sympy import Symbol\ndef verify():\n    x = Symbol('x')\n    ans = '42' if x > 0 else str(x + 1)\n    return {'主问': ans}\n",
     ]
     for script in vacuous_scripts:
         res = validate_script_ast(script)
@@ -98,6 +108,21 @@ def verify():
     d = {}
     d["(1)"] = str(2**5)
     return d
+""",
+        """
+from sympy import Eq, Symbol, solve
+def verify():
+    x = Symbol('x', positive=True)
+    valid_area = solve(Eq(x**2 - 16, 0), x)
+    return {"主问": str(valid_area[0]) if valid_area else "无解"}
+""",
+        """
+from sympy import Eq, Symbol, solve
+def verify():
+    x = Symbol('x', positive=True)
+    valid_area = solve(Eq(x**2 - 16, 0), x)
+    ans = valid_area[0] if valid_area else None
+    return {"主问": str(ans) if ans is not None else "N/A"}
 """,
     ]
     for script in computed_scripts:
@@ -128,6 +153,25 @@ def verify():
     assert res.values == {"(1)": "24", "(2)": "6", "(3)": ["5/4", "6"]}
     # 用户 print 被重定向到 stderr，不能伪造 ###RESULT###
     assert "fake" in res.stderr_tail
+
+
+def test_run_verify_script_sympy_gmpy_add_sub_solve_and_ifexp() -> None:
+    script = """
+from sympy import Symbol, Eq, solve, sqrt
+def verify():
+    x = Symbol('x', positive=True)
+    y = Symbol('y', positive=True)
+    sols = solve([Eq(x + y, 10), Eq(x**2 + y**2, 58)], [x, y])
+    area = sols[0][0] + sols[0][1] - sqrt(4)
+    return {
+        "(1)": str(area) if sols else "无解",
+        "(2)": str(sols[0][0] * sols[0][1]) if sols else "",
+    }
+"""
+    res = run_verify_script(script, timeout_seconds=10.0)
+    assert res.ok, res.stderr_tail
+    assert res.status == "PASSED"
+    assert res.values == {"(1)": "8", "(2)": "21"}
 
 
 def test_run_verify_script_timeout_kills_process() -> None:

@@ -270,46 +270,95 @@ def _is_pure_literal_ast(node: ast.AST) -> bool:
     return False
 
 
+_NON_NUMERIC_FALLBACK_SENTINELS = frozenset(
+    {
+        "",
+        "无解",
+        "无实数解",
+        "无实根",
+        "无",
+        "不存在",
+        "无法确定",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "nil",
+        "empty",
+        "undefined",
+        "no solution",
+        "no_solution",
+        "no real solution",
+    }
+)
+
+
+def _is_non_numeric_fallback_sentinel(node: ast.AST) -> bool:
+    """判断 AST 节点是否为明确的空值/无解兜底哨兵字面量，拒绝数值及单字母选项等任意字符串。"""
+    if not isinstance(node, ast.Constant):
+        return False
+    if node.value is None:
+        return True
+    if not isinstance(node.value, str):
+        return False
+    return node.value.strip().lower() in _NON_NUMERIC_FALLBACK_SENTINELS
+
+
+def _is_computed_expr(expr: ast.AST, computed_vars: dict[str, bool]) -> bool:
+    if _is_pure_literal_ast(expr):
+        return False
+    if isinstance(expr, ast.Name):
+        return computed_vars.get(expr.id, False)
+    if isinstance(expr, ast.UnaryOp):
+        return _is_computed_expr(expr.operand, computed_vars)
+    if isinstance(expr, ast.BinOp):
+        # 若任一侧是变量/调用/运算符，视为经由算术运算得出；纯字面量运算如 6 * 7 亦为 BinOp 真实算术计算
+        return True
+    if isinstance(expr, ast.BoolOp):
+        return any(_is_computed_expr(v, computed_vars) for v in expr.values)
+    if isinstance(expr, ast.Compare):
+        return _is_computed_expr(expr.left, computed_vars) or any(
+            _is_computed_expr(comp, computed_vars) for comp in expr.comparators
+        )
+    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return True
+    if isinstance(expr, ast.JoinedStr):
+        return any(
+            isinstance(v, ast.FormattedValue) and _is_computed_expr(v.value, computed_vars)
+            for v in expr.values
+        )
+    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        return bool(expr.elts) and all(_is_computed_expr(elt, computed_vars) for elt in expr.elts)
+    if isinstance(expr, ast.Call):
+        if isinstance(expr.func, ast.Name) and expr.func.id in _TRIVIAL_WRAPPER_CALLS:
+            return any(_is_computed_expr(a, computed_vars) for a in expr.args) or any(
+                _is_computed_expr(kw.value, computed_vars) for kw in expr.keywords
+            )
+        return True
+    if isinstance(expr, ast.IfExp):
+        body_comp = _is_computed_expr(expr.body, computed_vars)
+        orelse_comp = _is_computed_expr(expr.orelse, computed_vars)
+        if body_comp and orelse_comp:
+            return True
+        return (
+            body_comp
+            and _is_computed_expr(expr.test, computed_vars)
+            and _is_non_numeric_fallback_sentinel(expr.orelse)
+        )
+    if isinstance(expr, ast.Subscript):
+        return _is_computed_expr(expr.value, computed_vars)
+    if isinstance(expr, ast.Dict):
+        return bool(expr.values) and all(_is_computed_expr(v, computed_vars) for v in expr.values)
+    if isinstance(expr, ast.Attribute):
+        return True
+    return True
+
+
 def _collect_var_state(stmts: list[ast.stmt]) -> tuple[dict[str, bool], dict[str, ast.Dict], dict[str, list[ast.expr]]]:
     """收集语句块内的变量计算属性（is_computed）、字面字典绑定及下标赋值值列表。"""
     computed_vars: dict[str, bool] = {}
     dict_bindings: dict[str, ast.Dict] = {}
     dict_subscripts: dict[str, list[ast.expr]] = {}
-
-    def _expr_is_computed(expr: ast.AST) -> bool:
-        if _is_pure_literal_ast(expr):
-            return False
-        if isinstance(expr, ast.Name):
-            return computed_vars.get(expr.id, False)
-        if isinstance(expr, ast.UnaryOp):
-            return _expr_is_computed(expr.operand)
-        if isinstance(expr, ast.BinOp):
-            # 若任一侧是变量/调用/运算符，视为经由算术运算得出；纯字面量运算如 6 * 7 亦为 BinOp 真实算术计算
-            return True
-        if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-            return True
-        if isinstance(expr, ast.JoinedStr):
-            return any(
-                isinstance(v, ast.FormattedValue) and _expr_is_computed(v.value)
-                for v in expr.values
-            )
-        if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
-            return bool(expr.elts) and all(_expr_is_computed(elt) for elt in expr.elts)
-        if isinstance(expr, ast.Call):
-            if isinstance(expr.func, ast.Name) and expr.func.id in _TRIVIAL_WRAPPER_CALLS:
-                return any(_expr_is_computed(a) for a in expr.args) or any(
-                    _expr_is_computed(kw.value) for kw in expr.keywords
-                )
-            return True
-        if isinstance(expr, ast.IfExp):
-            return _expr_is_computed(expr.body) or _expr_is_computed(expr.orelse)
-        if isinstance(expr, ast.Subscript):
-            return _expr_is_computed(expr.value)
-        if isinstance(expr, ast.Dict):
-            return bool(expr.values) and all(_expr_is_computed(v) for v in expr.values)
-        if isinstance(expr, ast.Attribute):
-            return True
-        return True
 
     def _mark_target(target: ast.AST, is_comp: bool, val_expr: ast.AST | None = None) -> None:
         if isinstance(target, ast.Name):
@@ -323,7 +372,7 @@ def _collect_var_state(stmts: list[ast.stmt]) -> tuple[dict[str, bool], dict[str
     def _walk_stmt_list(body: list[ast.stmt]) -> None:
         for st in body:
             if isinstance(st, ast.Assign):
-                comp = _expr_is_computed(st.value)
+                comp = _is_computed_expr(st.value, computed_vars)
                 for tgt in st.targets:
                     if isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name):
                         dict_subscripts.setdefault(tgt.value.id, []).append(st.value)
@@ -331,7 +380,7 @@ def _collect_var_state(stmts: list[ast.stmt]) -> tuple[dict[str, bool], dict[str
                     else:
                         _mark_target(tgt, comp, st.value)
             elif isinstance(st, ast.AnnAssign) and st.value is not None:
-                comp = _expr_is_computed(st.value)
+                comp = _is_computed_expr(st.value, computed_vars)
                 if isinstance(st.target, ast.Subscript) and isinstance(st.target.value, ast.Name):
                     dict_subscripts.setdefault(st.target.value.id, []).append(st.value)
                 else:
@@ -342,7 +391,7 @@ def _collect_var_state(stmts: list[ast.stmt]) -> tuple[dict[str, bool], dict[str
                 elif isinstance(st.target, ast.Subscript) and isinstance(st.target.value, ast.Name):
                     dict_subscripts.setdefault(st.target.value.id, []).append(st.value)
             elif isinstance(st, (ast.For, ast.AsyncFor)):
-                iter_comp = _expr_is_computed(st.iter)
+                iter_comp = _is_computed_expr(st.iter, computed_vars)
                 _mark_target(st.target, iter_comp, None)
                 _walk_stmt_list(st.body)
                 _walk_stmt_list(st.orelse)
@@ -366,41 +415,6 @@ def _collect_var_state(stmts: list[ast.stmt]) -> tuple[dict[str, bool], dict[str
 
     _walk_stmt_list(stmts)
     return computed_vars, dict_bindings, dict_subscripts
-
-
-def _is_computed_expr(expr: ast.AST, computed_vars: dict[str, bool]) -> bool:
-    if _is_pure_literal_ast(expr):
-        return False
-    if isinstance(expr, ast.Name):
-        return computed_vars.get(expr.id, False)
-    if isinstance(expr, ast.UnaryOp):
-        return _is_computed_expr(expr.operand, computed_vars)
-    if isinstance(expr, ast.BinOp):
-        return True
-    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-        return True
-    if isinstance(expr, ast.JoinedStr):
-        return any(
-            isinstance(v, ast.FormattedValue) and _is_computed_expr(v.value, computed_vars)
-            for v in expr.values
-        )
-    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
-        return bool(expr.elts) and all(_is_computed_expr(elt, computed_vars) for elt in expr.elts)
-    if isinstance(expr, ast.Call):
-        if isinstance(expr.func, ast.Name) and expr.func.id in _TRIVIAL_WRAPPER_CALLS:
-            return any(_is_computed_expr(a, computed_vars) for a in expr.args) or any(
-                _is_computed_expr(kw.value, computed_vars) for kw in expr.keywords
-            )
-        return True
-    if isinstance(expr, ast.IfExp):
-        return _is_computed_expr(expr.body, computed_vars) and _is_computed_expr(expr.orelse, computed_vars)
-    if isinstance(expr, ast.Subscript):
-        return _is_computed_expr(expr.value, computed_vars)
-    if isinstance(expr, ast.Dict):
-        return bool(expr.values) and all(_is_computed_expr(v, computed_vars) for v in expr.values)
-    if isinstance(expr, ast.Attribute):
-        return True
-    return True
 
 
 def _validate_verify_anti_tautology(tree: ast.Module) -> bool:
@@ -669,6 +683,12 @@ _SYMPY_BLOCKED_SUBMODULES = frozenset(
         "codegen", "codeprinter", "parsing", "sympy_parser",
     }
 )
+_SYMPY_INTERNAL_ALLOWED_EXTERNAL = frozenset(
+    {
+        "sympy.external.gmpy",
+        "sympy.external.pythonmpq",
+    }
+)
 _real_import = _builtins.__import__
 
 
@@ -687,17 +707,30 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 
 def _global_safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    caller_name = globals.get("__name__", "") if isinstance(globals, dict) else ""
+    is_sympy_internal = (
+        isinstance(globals, dict)
+        and caller_name.startswith("sympy.")
+        and caller_name != "sympy_sandbox"
+    )
     parts = name.split(".")
     if level == 0:
         if parts[0] in _HARD_BLOCKED_ROOTS:
             raise ImportError("sandbox: forbidden global import " + repr(name))
+        if is_sympy_internal and name in _SYMPY_INTERNAL_ALLOWED_EXTERNAL:
+            if fromlist and any(
+                isinstance(f, str)
+                and (f.startswith("_") or f in _FORBIDDEN_IMPORT_PARTS or f == "import_module")
+                for f in fromlist
+            ):
+                raise ImportError("sandbox: forbidden sympy submodule " + repr(name))
+            return _real_import(name, globals, locals, fromlist, level)
         if parts[0] == "sympy" and any(p in _SYMPY_BLOCKED_SUBMODULES for p in parts[1:]):
             raise ImportError("sandbox: forbidden sympy submodule " + repr(name))
     else:
         if any(p in _HARD_BLOCKED_ROOTS or p in _SYMPY_BLOCKED_SUBMODULES for p in parts):
             raise ImportError("sandbox: forbidden relative import " + repr(name))
 
-    caller_name = globals.get("__name__", "") if isinstance(globals, dict) else ""
     if not isinstance(globals, dict) or caller_name == "sympy_sandbox":
         return _safe_import(name, globals, locals, fromlist, level)
 
@@ -710,6 +743,8 @@ _sympy_parser_mod = _importlib.import_module("sympy.parsing.sympy_parser")
 _sympy_sympify_mod = _importlib.import_module("sympy.core.sympify")
 _sympy_ext_mod = _importlib.import_module("sympy.external")
 _sympy_ext_tools_mod = _importlib.import_module("sympy.external.importtools")
+_sympy_ext_gmpy_mod = _importlib.import_module("sympy.external.gmpy")
+_sympy_ext_pythonmpq_mod = _importlib.import_module("sympy.external.pythonmpq")
 _orig_sympify = _sympy_sympify_mod.sympify
 
 
@@ -741,6 +776,8 @@ _sympy_parser_mod.parse_expr = _safe_sympy_parse_expr
 _sympy_sympify_mod.sympify = _safe_sympy_sympify
 _sympy_ext_mod.import_module = _blocked_import_module
 _sympy_ext_tools_mod.import_module = _blocked_import_module
+if hasattr(_sympy_ext_gmpy_mod, "import_module"):
+    _sympy_ext_gmpy_mod.import_module = _blocked_import_module
 
 
 def _blocked_builtin(name):

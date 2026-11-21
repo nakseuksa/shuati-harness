@@ -12,7 +12,33 @@ from PIL import Image, ImageOps
 
 from shuati.models.schemas import Stage1Input
 
-STAGE1_PROMPT_VERSION = "s1_v1"
+STAGE1_PROMPT_VERSION = "s1_v2"
+
+_ANSWER_PART_SPEC_TEXT = """`final_answers` 为 `AnswerPart` 非空数组（**严禁改名为 `questions`、`answers` 或其他键**）。每个 `AnswerPart` 必须包含以下字段：
+- `label`: 小问标签，仅允许 `"主问"` 或 `"(1)"`, `"(2)"`...；严禁自造 `"(1)-1"`、`"(1)-k"` 等子标签。
+- `answer_type` 与 `verify_mode` 严格映射：
+  - `NUMERIC` / `EXPRESSION` / `RATIO` / `SET_OR_INTERVAL` -> `verify_mode`: `"SYMBOLIC"`
+  - `CHOICE` / `SYMBOL_FILL` -> `verify_mode`: `"EXACT"`
+  - `TEXT` / `PROOF` -> `verify_mode`: `"QUALITATIVE"`
+- `collection_mode`: `"SINGLE"` | `"ORDERED_TUPLE"` | `"UNORDERED_MULTISET"` | `"LABELED_MAP"`
+- **关键约束（必读）**：
+  1. 当 `collection_mode == "SINGLE"` 且 `verify_mode == "SYMBOLIC"` 时，`sympy_expr` **必须放在 `AnswerPart` 顶层**且为非空字符串，`items` 必须为 `null`——**严禁把 `sympy_expr` 放进 `items`**！
+  2. 当 `collection_mode != "SINGLE"`（即 `ORDERED_TUPLE` / `UNORDERED_MULTISET` / `LABELED_MAP`）时，`items` **必须为非空数组**，`sympy_expr` 置 `null`。
+  3. `CHOICE` 类型（`verify_mode="EXACT"`）时，`choice_label` **必填**非空选项字母（如 `"A"`）。
+  4. `SYMBOL_FILL` 类型（`verify_mode="EXACT"`）在 `collection_mode == "SINGLE"` 时，`canonical` **必填**非空标准符号（如 `"＞"`、`"＝"`）。
+  5. `TEXT` / `PROOF` 类型（`verify_mode="QUALITATIVE"`）在 `answer` 填写核心结论文本，`sympy_expr`、`items`、`choice_label`、`canonical` 均置 `null`。
+
+`AnswerPart` 典型示例：
+- 示例 A（`SINGLE` + `SYMBOLIC`）：
+  `{"label": "主问", "answer_type": "NUMERIC", "verify_mode": "SYMBOLIC", "collection_mode": "SINGLE", "answer": "12", "unit": "平方厘米", "sympy_expr": "12", "items": null, "choice_label": null, "canonical": null}`
+- 示例 B（多空/多值 `ORDERED_TUPLE` / `UNORDERED_MULTISET` / `LABELED_MAP`）：
+  - `ORDERED_TUPLE`：`{"label": "(1)", "answer_type": "EXPRESSION", "verify_mode": "SYMBOLIC", "collection_mode": "ORDERED_TUPLE", "answer": "20, -, 5", "unit": null, "sympy_expr": null, "items": [{"item_type": "NUMERIC", "expr": "20"}, {"item_type": "SYMBOL_FILL", "canonical": "－"}, {"item_type": "NUMERIC", "expr": "5"}], "choice_label": null, "canonical": null}`
+  - `UNORDERED_MULTISET`：`items` 如 `[{"expr": "3"}, {"expr": "5"}, {"expr": "5"}]`
+  - `LABELED_MAP`：`items` 如 `[{"label": "鸡", "expr": "12"}, {"label": "兔", "expr": "8"}]`
+- 示例 C（`CHOICE` / `SYMBOL_FILL` / `QUALITATIVE`）：
+  - `CHOICE`：`{"label": "主问", "answer_type": "CHOICE", "verify_mode": "EXACT", "collection_mode": "SINGLE", "answer": "B", "unit": null, "sympy_expr": null, "items": null, "choice_label": "B", "canonical": null}`
+  - `SYMBOL_FILL`：`{"label": "(2)", "answer_type": "SYMBOL_FILL", "verify_mode": "EXACT", "collection_mode": "SINGLE", "answer": "＞", "unit": null, "sympy_expr": null, "items": null, "choice_label": null, "canonical": "＞"}`
+  - `TEXT`/`PROOF`：`{"label": "(2)", "answer_type": "PROOF", "verify_mode": "QUALITATIVE", "collection_mode": "SINGLE", "answer": "由全等三角形判定 SAS 可得结论成立", "unit": null, "sympy_expr": null, "items": null, "choice_label": null, "canonical": null}`"""
 
 _MIME_BY_FORMAT: dict[str, str] = {
     "JPEG": "image/jpeg",
@@ -63,27 +89,68 @@ def build_stage1_messages(
     )
 
     sympy_rule = (
-        "\n7. sympy_code 规范（存在 SYMBOLIC 小问时必填）："
+        "\n7. `sympy_code` 规范（存在 `verify_mode == \"SYMBOLIC\"` 小问时必填非空字符串，否则置 `null`）："
         "仅允许导入 sympy / math / fractions；严禁调用 sympify / parse_expr / lambdify / S(<字符串>) / eval / exec / open；"
         "必须定义 def verify(): 返回字典，键为归一后的小问标签（如 '主问' 或 '(1)'），值必须经由真实数学运算得出（禁止硬编码常量返回）。"
         if role == "PRIMARY"
         else ""
     )
 
+    if role == "PRIMARY":
+        json_schema_template = (
+            "{\n"
+            '  "visual_facts": "客观视觉事实描述（必须排在首位，无图题置空字符串 \\"\\"）",\n'
+            '  "visual_ambiguity_flag": false,\n'
+            '  "visual_ambiguity_note": "",\n'
+            '  "method_summary": "一句话解法路线",\n'
+            '  "solution_markdown": "完整推导过程（Markdown/LaTeX）",\n'
+            '  "final_answers": [ ... ],\n'
+            '  "sympy_code": "存在 SYMBOLIC 小问时必填 Python 验算脚本，否则为 null"\n'
+            "}"
+        )
+        top_keys_desc = (
+            "顶层必填键（PRIMARY）：`visual_facts`（必须排首位，str）、`visual_ambiguity_flag`（bool）、"
+            "`visual_ambiguity_note`（str）、`method_summary`（str，一句话解法路线）、"
+            "`solution_markdown`（str，完整推导过程）、`final_answers`（AnswerPart 非空数组，严禁改名为 `questions` 或其他键）、"
+            "`sympy_code`（str | null，存在 SYMBOLIC 小问时必填，否则为 null）。"
+        )
+    else:
+        json_schema_template = (
+            "{\n"
+            '  "visual_facts": "客观视觉事实描述（必须排在首位，无图题置空字符串 \\"\\"）",\n'
+            '  "visual_ambiguity_flag": false,\n'
+            '  "visual_ambiguity_note": "",\n'
+            '  "method_summary": "一句话解法路线",\n'
+            '  "solution_markdown": "完整推导过程（Markdown/LaTeX）",\n'
+            '  "final_answers": [ ... ]\n'
+            "}"
+        )
+        top_keys_desc = (
+            "顶层必填键（SECONDARY，不含 `sympy_code` 字段）：`visual_facts`（必须排首位，str）、"
+            "`visual_ambiguity_flag`（bool）、`visual_ambiguity_note`（str）、`method_summary`（str，一句话解法路线）、"
+            "`solution_markdown`（str，完整推导过程）、`final_answers`（AnswerPart 非空数组，严禁改名为 `questions` 或其他键）。"
+        )
+
     system_text = (
         f"你是一位严谨的{inp.grade_subject}学科解题专家。{role_desc}\n"
-        "请严格输出一个合法的 JSON 对象，并遵守以下硬性规则：\n"
-        "1. JSON 字段顺序中 visual_facts 必须排在首位！若存在配图，visual_facts 须客观描述图中全部可见元素"
+        "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下硬性规则：\n"
+        "1. JSON 字段顺序中 `visual_facts` 必须排在首位！若存在配图，`visual_facts` 须客观描述图中全部可见元素"
         "（顶点字母、线面位置关系、垂直/平行/等长/角度标注、阴影区域封闭边界与包含关系）；"
-        "visual_facts 严禁写入原图未画出的辅助线、未标注的几何性质或任何推导结论。无图题 visual_facts 置空字符串 \"\"。\n"
-        "2. 若图片模糊、标注缺失或阴影边界有歧义，必须将 visual_ambiguity_flag 设为 true 并在 visual_ambiguity_note 说明。\n"
+        "`visual_facts` 严禁写入原图未画出的辅助线、未标注的几何性质或任何推导结论。无图题 `visual_facts` 置空字符串 \"\"。\n"
+        "2. 若图片模糊、标注缺失或阴影边界有歧义，必须将 `visual_ambiguity_flag` 设为 true 并在 `visual_ambiguity_note` 说明。\n"
         "3. 小问标签归一规范：题干有显式编号时统一使用 \"(1)\", \"(2)\"...；单问使用 \"主问\"；"
         "无编号“计算+说理”复合问拆为 \"(1)\" 与 \"(2)\"；严禁自造 \"(1)-1\"、\"(1)-k\" 等子小问标签！\n"
-        "4. 同一小问多空或多值使用 collection_mode（SINGLE / ORDERED_TUPLE / UNORDERED_MULTISET / LABELED_MAP）装入 items。\n"
-        "5. answer_type 与 verify_mode 必须严格匹配："
+        "4. 单值小问使用 `collection_mode: \"SINGLE\"`（此时 `items` 为 `null`，且若为 `SYMBOLIC` 则 `sympy_expr` 必须放在 `AnswerPart` 顶层）；"
+        "同一小问多空或多值使用 `ORDERED_TUPLE` / `UNORDERED_MULTISET` / `LABELED_MAP` 并装入非空 `items` 数组。\n"
+        "5. `answer_type` 与 `verify_mode` 必须严格匹配："
         "NUMERIC/EXPRESSION/RATIO/SET_OR_INTERVAL -> SYMBOLIC；CHOICE/SYMBOL_FILL -> EXACT；TEXT/PROOF -> QUALITATIVE。\n"
-        "6. 数值约定：题干未明确指定 π 近似值（如“π 取 3.14”）时，sympy_expr 必须保留精确符号 pi、sqrt(...) 或分数。"
-        f"{sympy_rule}"
+        "6. 数值约定：题干未明确指定 π 近似值（如“π 取 3.14”）时，`sympy_expr` 必须保留精确符号 pi、sqrt(...) 或分数。"
+        f"{sympy_rule}\n\n"
+        "【输出 JSON 结构模板】\n"
+        f"{top_keys_desc}\n"
+        f"{json_schema_template}\n\n"
+        "【`final_answers` 元素 `AnswerPart` 规范】\n"
+        f"{_ANSWER_PART_SPEC_TEXT}"
     )
 
     user_parts: list[dict[str, Any]] = []
@@ -167,7 +234,22 @@ def build_review_resolve_messages(
     system_text = (
         f"你是{grade_subject}学科解答重算助手。人工复核员已核定该题的题干与客观视觉事实（visual_facts），"
         "请严格依据提供的题干与 visual_facts 重新推导完整参考解答、各小问结构化答案（final_answers）与 SymPy 验算脚本（sympy_code）。\n"
-        "小问标签仅允许 '主问' 或 '(1)', '(2)'...，禁止自造 '(1)-1' 子标签；sympy_code 必须定义 def verify(): 并通过真实运算得出结果。"
+        "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），遵守以下要求：\n"
+        "1. 小问标签仅允许 \"主问\" 或 \"(1)\", \"(2)\"...，禁止自造 \"(1)-1\" 子标签。\n"
+        "2. `sympy_code`（存在 `SYMBOLIC` 小问时必填，否则置 `null`）：仅允许导入 sympy / math / fractions，"
+        "必须定义 def verify(): 返回 dict[str, str | list[str]]，并通过真实运算得出结果（禁止硬编码常量返回）。\n\n"
+        "【输出 JSON 结构模板】\n"
+        "顶层必填键：`method_summary`（str，一句话解法路线）、`solution_markdown`（str，完整推导过程）、"
+        "`final_answers`（AnswerPart 非空数组，严禁改名为 `questions` 或其他键）、"
+        "`sympy_code`（str | null）。\n"
+        "{\n"
+        '  "method_summary": "一句话解法路线",\n'
+        '  "solution_markdown": "完整推导过程（Markdown/LaTeX）",\n'
+        '  "final_answers": [ ... ],\n'
+        '  "sympy_code": "存在 SYMBOLIC 小问时必填 Python 验算脚本，否则为 null"\n'
+        "}\n\n"
+        "【`final_answers` 元素 `AnswerPart` 规范】\n"
+        f"{_ANSWER_PART_SPEC_TEXT}"
     )
     user_text = f"【学段学科】{grade_subject}\n\n【题干】\n{question_text}\n\n【已核定视觉事实 visual_facts】\n{visual_facts or '（无配图）'}"
     return [
