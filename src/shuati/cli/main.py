@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import sqlite3
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -20,15 +22,21 @@ from shuati.db.connection import (
     SingleWriterExecutor,
     get_connection,
 )
+from shuati.db.repository import AmbiguousUidError, NotFoundError
 from shuati.db.schema import init_db
+from shuati.llm.gateway import LLMGatewayError
 from shuati.models.domain import (
     EXIT_INTERNAL,
+    EXIT_LLM_ERROR,
+    EXIT_NOT_FOUND,
     EXIT_OK,
     EXIT_PRECONDITION,
     Envelope,
     ErrorDetail,
 )
 from shuati.pipeline.stage0_ingest import run_stage0_ingest
+from shuati.pipeline.stage1_solve import run_stage1_compile
+from shuati.review.server import serve_review
 
 # Windows 管道 UTF-8 编码重设（DESIGN.md §5.4-3）
 if isinstance(sys.stdout, io.TextIOWrapper) and sys.stdout.encoding.lower() != "utf-8":
@@ -452,6 +460,145 @@ def reindex(
     finally:
         if conn is not None:
             conn.close()
+
+
+@app.command(name="compile")
+def compile_stage(
+    stage: str = typer.Option(..., "--stage", help="编译阶段（M1 支持: 1 / S1）"),
+    grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科"),
+    only_uids: list[str] | None = typer.Option(
+        None, "--only-uids", help="限定题目 UID 或 source_id（可重复传参或逗号分隔）"
+    ),
+    stress_test_25: bool = typer.Option(False, "--stress-test-25", help="仅编译 25 题压力测试清单"),
+    force: bool = typer.Option(False, "--force", help="强制重跑已 OK 题目"),
+    include_human_verified: bool = typer.Option(
+        False, "--include-human-verified", help="包含已人工定稿题目重跑"
+    ),
+    mock: bool | None = typer.Option(None, "--mock/--no-mock", help="启用离线 Mock LLM"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    assets_dir: Path | None = typer.Option(None, "--assets-dir", help="CAS 图片归档目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """离线知识编译流水线（断点续跑）。"""
+    t0 = time.time()
+    norm_stage = stage.strip().upper()
+    if norm_stage not in ("1", "S1"):
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "compile",
+            error=ErrorDetail(
+                code="PRECONDITION_FAILED",
+                message=f"当前版本仅支持 Stage 1（--stage 1），不支持 '{stage}'",
+            ),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_PRECONDITION,
+        )
+        return
+
+    parsed_uids: list[str] | None = None
+    if only_uids:
+        parsed_uids = []
+        for raw_entry in only_uids:
+            for part in raw_entry.split(","):
+                cleaned = part.strip()
+                if cleaned:
+                    parsed_uids.append(cleaned)
+
+    try:
+        res = asyncio.run(
+            run_stage1_compile(
+                db_path=db,
+                config_dir=config_dir,
+                assets_dir=assets_dir,
+                grade_subject=grade_subject,
+                only_uids=parsed_uids,
+                stress_test_25=stress_test_25,
+                force=force,
+                include_human_verified=include_human_verified,
+                use_mock=mock,
+            )
+        )
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "compile",
+            data=asdict(res),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_OK,
+        )
+    except typer.Exit:
+        raise
+    except AmbiguousUidError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "compile",
+            error=ErrorDetail(
+                code="AMBIGUOUS_UID",
+                message=str(e),
+                details={"candidates": e.candidates},
+            ),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_PRECONDITION,
+        )
+    except PreconditionError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "compile",
+            error=ErrorDetail(code="PRECONDITION_FAILED", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_PRECONDITION,
+        )
+    except NotFoundError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "compile",
+            error=ErrorDetail(code="NOT_FOUND", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_NOT_FOUND,
+        )
+    except LLMGatewayError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "compile",
+            error=ErrorDetail(code="LLM_ERROR", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_LLM_ERROR,
+        )
+    except Exception as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "compile",
+            error=ErrorDetail(code="INTERNAL_ERROR", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_INTERNAL,
+        )
+
+
+@app.command()
+def review(
+    grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科"),
+    port: int = typer.Option(8765, "--port", help="本地服务端口（强制绑定 127.0.0.1）"),
+    audit: bool = typer.Option(False, "--audit", help="假共识抽检模式"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    assets_dir: Path | None = typer.Option(None, "--assets-dir", help="CAS 图片归档目录"),
+) -> None:
+    """启动极简本地键盘复核页（http://127.0.0.1:<port>/）。"""
+    serve_review(
+        db_path=db,
+        config_dir=config_dir,
+        assets_dir=assets_dir,
+        grade_subject=grade_subject,
+        audit_mode=audit,
+        port=port,
+    )
 
 
 if __name__ == "__main__":

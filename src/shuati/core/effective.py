@@ -281,10 +281,17 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
     # (5) 验真状态与复核原因
     machine_status = q_row["m_verification_status"]
     machine_reason = q_row["review_reason"] or ""
+    machine_reasons = [r.strip() for r in machine_reason.split(",") if r.strip()]
 
     if has_suspended_verification_override:
         eff_verification_status = "NEEDS_REVIEW"
         eff_review_reason = (machine_reason + ",OVERRIDE_STALE").strip(",")
+    elif (
+        "ANSWER_SOLUTION_CONFLICT" in machine_reasons
+        and "solutions_override_json" not in active_overrides
+    ):
+        eff_verification_status = "NEEDS_REVIEW"
+        eff_review_reason = machine_reason
     elif "visual_facts" in active_overrides and "final_answers_json" not in active_overrides:
         eff_verification_status = "NEEDS_REVIEW"
         eff_review_reason = (machine_reason + ",VISUAL_FACTS_EDITED_PENDING_CONFIRM").strip(",")
