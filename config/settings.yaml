@@ -1,0 +1,85 @@
+llm:
+  vlm_primary:
+    base_url: "${VLM_PRIMARY_BASE_URL:-https://api.openai.com/v1}"
+    api_key: "${VLM_PRIMARY_API_KEY:-}"
+    model: "${VLM_PRIMARY_MODEL:-gemini-2.5-pro}"
+    temperature: 0.1
+    timeout_seconds: 180
+    max_concurrency: 4
+    rpm_limit: 30
+    max_retries: 3
+  vlm_secondary:
+    base_url: "${VLM_SECONDARY_BASE_URL:-https://api.openai.com/v1}"
+    api_key: "${VLM_SECONDARY_API_KEY:-}"
+    model: "${VLM_SECONDARY_MODEL:-claude-3-7-sonnet}"
+    temperature: 0.1
+    timeout_seconds: 180
+    max_concurrency: 4
+    rpm_limit: 30
+    max_retries: 3
+  text_llm:
+    base_url: "${TEXT_LLM_BASE_URL:-https://api.openai.com/v1}"
+    api_key: "${TEXT_LLM_API_KEY:-}"
+    model: "${TEXT_LLM_MODEL:-deepseek-chat}"
+    temperature: 0.1
+    timeout_seconds: 120
+    max_concurrency: 12
+    rpm_limit: 120
+    max_retries: 3
+  judge_llm:
+    base_url: "${JUDGE_LLM_BASE_URL:-}"
+    api_key: "${JUDGE_LLM_API_KEY:-}"
+    model: "${JUDGE_LLM_MODEL:-}"
+    temperature: 0.0
+    timeout_seconds: 60
+    max_concurrency: 8
+    rpm_limit: 120
+    max_retries: 3
+  embedding:
+    provider: "openai_compatible"
+    base_url: "${EMBEDDING_BASE_URL:-https://api.openai.com/v1}"
+    api_key: "${EMBEDDING_API_KEY:-}"
+    model: "${EMBEDDING_MODEL:-text-embedding-3-large}"
+    batch_size: 32
+
+pipeline:
+  dual_vlm_policy: "always"
+  sympy_timeout_seconds: 5.0
+  enable_stage4_llm_refine: true
+  use_mock_llm: false
+  max_stage_attempts: 3
+  sympy_memory_limit_mb: 512
+  consensus_audit_ratio: 0.05
+  max_external_image_px: 2048
+  allow_pi_314_subjects:
+    - 小学奥数
+
+timezone: "Asia/Shanghai"
+
+learner_elo:
+  initial: 1300
+  k_provisional: 48
+  k_stable: 24
+  provisional_attempts: 10
+  hint_score: 0.5
+  repeat_within_days: 7
+  secondary_l1_weight: 0.5
+
+composer:
+  exclude_solved_days: 60
+  exclude_clone_days: 14
+  exclude_recent_quiz_batches: 3
+
+topology:
+  rule_version: "2.4-init"
+  expected_degree:
+    CLONE: [0, 1]
+    ISOMORPHIC: [1, 5]
+    SCAFFOLD: [1, 6]
+    CONTRASTIVE: [0, 2]
+    SHARED_TRAP: [0, 5]
+
+human_mirror:
+  dir: "human/"
+  include_practice_log: true
+  backups_keep: 10

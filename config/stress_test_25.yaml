@@ -1,0 +1,53 @@
+# 25 题几何压力测试与 Stage 4 阈值校准集配置（NFR-5）
+grade_subject: 小学奥数
+version: "1.0"
+
+groups:
+  - name: 阴影面积与曲线/直线组合图
+    count: 7
+    question_uids:
+      - primary_olympiad:ch01_计算基础:ch01_011
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_004
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_005
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_008
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_009
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_013
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_017
+
+  - name: 弦图/勾股/割补/极值与比值/多值题
+    count: 7
+    question_uids:
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_001
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_006
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_007
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_010
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_011
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_020
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_025
+
+  - name: 多图与跨模块综合题
+    count: 4
+    question_uids:
+      - primary_olympiad:ch01_计算基础:ch01_012
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_002
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_083
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_091
+
+  - name: 脏格式、混型多空、作图与非符号边界题
+    count: 7
+    question_uids:
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_003
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_016
+      - primary_olympiad:ch01_计算基础:ch01_006
+      - primary_olympiad:ch01_计算基础:ch01_010
+      - primary_olympiad:ch01_计算基础:ch01_013
+      - primary_olympiad:ch01_计算基础:ch01_015
+      - primary_olympiad:ch28_平面直线图形高年级卷:ch28_031
+
+calibration_pairs:
+  # 人工标注题对校准集（开发期模板，含重扫对示例）
+  - source_uid: primary_olympiad:ch28_平面直线图形高年级卷:ch28_015
+    target_uid: primary_olympiad:ch28_平面直线图形高年级卷:ch28_057
+    expected_relation: CLONE
+    label: POSITIVE
+    note: 同卷重扫完全同题对

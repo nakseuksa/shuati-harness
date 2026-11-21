@@ -1,0 +1,5 @@
+rules:
+  - match: "ch*"
+    grade_subject: 小学奥数
+  - match: "初中物理/**"
+    grade_subject: 初中物理
