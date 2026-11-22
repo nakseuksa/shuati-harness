@@ -73,3 +73,66 @@ class ReviewResolveOutput(BaseModel):
     solution_markdown: str = ""
     final_answers: list[AnswerPart] = Field(min_length=1)
     sympy_code: str | None = None
+
+
+class DifficultyDimension(BaseModel):
+    """四维难度单项打分（evidence 必须置于 score 之前，CoT 优先）。"""
+
+    evidence: str = Field(min_length=2)
+    score: int = Field(ge=1, le=4)
+
+
+class DifficultyScoresOutput(BaseModel):
+    """Stage 2 四维难度打分结构化输出。"""
+
+    C_concept_count: DifficultyDimension
+    S_chain_length: DifficultyDimension
+    T_trickiness: DifficultyDimension
+    L_computation_load: DifficultyDimension
+
+
+class Stage2StepOutput(BaseModel):
+    """Stage 2 单步逻辑拆解输出。"""
+
+    step_index: int = Field(ge=1)
+    sub_goal: str = Field(min_length=2)
+    core_formula: str = ""
+    hint: str = Field(min_length=2)
+    raw_l1: str = Field(min_length=1)
+    raw_l2: str = Field(min_length=1)
+    raw_l3: str = Field(min_length=1)
+
+
+class Stage2OnlyOutput(BaseModel):
+    """已过 Stage 1 验真题目的 Stage 2 增量输出（STAGE2_ONLY）。"""
+
+    task_id: str = Field(min_length=1)
+    steps: list[Stage2StepOutput] = Field(min_length=1)
+    abstract_skeleton: str = Field(min_length=5)
+    primary_l1_module: str = Field(min_length=1)
+    secondary_l1_modules: list[str] = Field(default_factory=list)
+    thinking_methods: list[str] = Field(default_factory=list)
+    classic_motifs: list[str] = Field(default_factory=list)
+    trap_tags: list[str] = Field(default_factory=list)
+    difficulty: DifficultyScoresOutput
+
+
+class UnifiedS1S2Output(BaseModel):
+    """合一初始化编译器输出（UNIFIED_S1_S2，visual_facts 必须排在首位）。"""
+
+    task_id: str = Field(min_length=1)
+    visual_facts: str = ""
+    visual_ambiguity_flag: bool = False
+    visual_ambiguity_note: str = ""
+    method_summary: str = Field(min_length=2)
+    solution_markdown: str = Field(min_length=5)
+    final_answers: list[AnswerPart] = Field(min_length=1)
+    sympy_code: str | None = None
+    steps: list[Stage2StepOutput] = Field(min_length=1)
+    abstract_skeleton: str = Field(min_length=5)
+    primary_l1_module: str = Field(min_length=1)
+    secondary_l1_modules: list[str] = Field(default_factory=list)
+    thinking_methods: list[str] = Field(default_factory=list)
+    classic_motifs: list[str] = Field(default_factory=list)
+    trap_tags: list[str] = Field(default_factory=list)
+    difficulty: DifficultyScoresOutput

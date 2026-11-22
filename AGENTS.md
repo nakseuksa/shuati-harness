@@ -20,3 +20,4 @@
      2. `*_execution.md`（执行记录）：记录客观时间线、实际变更文件清单、实测命令及真实退出码/输出切片、过程产物链接；不掺杂主观总结。
      3. `*_report.md`（汇报/验收报告）：面向用户 Review 的高密度结论视图（交付概览、验收矩阵 PASS/FAIL、非阻断建议与待拍板项），细节通过链接指向同批 `decisions` 与 `execution`。
    - **与内部协作目录衔接**: `.agents/teamwork/<role>/` 继续承载多智能体内部协作契约、Handoff 与 Repro 审查过程稿（多轮审查只增不删历史轮次），最终通过三件套汇总向用户交付。
+6. **批处理编排与 Windows 工程经验沉淀**: 详见 [.agents/rules/shuati_ops_lessons.md](.agents/rules/shuati_ops_lessons.md)（每次批编译、数据源扩充与测试环境排障均须遵守）。

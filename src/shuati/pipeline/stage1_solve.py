@@ -495,8 +495,11 @@ async def run_stage1_compile(
                 q.question_uid, q.grade_subject, q.cas_images_json, q.image_captions_json,
                 q.has_images, q.eff_question_text, q.eff_options_json, q.eff_format,
                 q.eff_verification_status, q.m_verification_status, q.review_reason,
-                cs.status AS cs_status, cs.input_hash AS cs_input_hash, cs.attempts AS cs_attempts
+                rq.content_hash AS rq_content_hash,
+                cs.status AS cs_status, cs.input_hash AS cs_input_hash,
+                cs.model_name AS cs_model_name, cs.attempts AS cs_attempts
             FROM questions q
+            JOIN raw_questions rq ON rq.question_uid = q.question_uid
             LEFT JOIN compile_state cs
                 ON q.question_uid = cs.question_uid AND cs.stage = 'S1'
             WHERE {' AND '.join(where_clauses)}
@@ -542,9 +545,14 @@ async def run_stage1_compile(
 
             cs_status = row["cs_status"] or "PENDING"
             cs_hash = row["cs_input_hash"] or ""
+            cs_model = row["cs_model_name"] or ""
+            rq_hash = row["rq_content_hash"] or ""
             prev_attempts = int(row["cs_attempts"] or 0)
 
-            if not force and cs_status == "OK" and cs_hash == input_hash:
+            is_unified_locked = (
+                cs_status == "OK" and cs_model == "subagent-unified" and cs_hash == rq_hash
+            )
+            if not force and cs_status == "OK" and (is_unified_locked or cs_hash == input_hash):
                 result.skipped_ok += 1
                 continue
 

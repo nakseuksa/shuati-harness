@@ -601,5 +601,184 @@ def review(
     )
 
 
+unified_app = typer.Typer(help="主会话 Subagent 合一初始化编译器（Stage 1.5 + Stage 1+2）。")
+app.add_typer(unified_app, name="unified")
+
+
+@unified_app.command(name="calibrate-anchors")
+def unified_calibrate_anchors(
+    grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="学段学科"),
+    anchors_file: Path | None = typer.Option(None, "--anchors-file", help="指定黄金锚点 YAML"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """加载 Stage 1.5 黄金锚点并置 anchors_ready=1。"""
+    from shuati.pipeline.unified_import import register_anchors_from_yaml
+
+    t0 = time.time()
+    try:
+        res = register_anchors_from_yaml(
+            db_path=db,
+            config_dir=config_dir,
+            grade_subject=grade_subject,
+            anchors_file=anchors_file,
+        )
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.calibrate-anchors",
+            data=asdict(res),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_OK,
+        )
+    except typer.Exit:
+        raise
+    except PreconditionError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.calibrate-anchors",
+            error=ErrorDetail(code="PRECONDITION_FAILED", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_PRECONDITION,
+        )
+    except Exception as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.calibrate-anchors",
+            error=ErrorDetail(code="INTERNAL_ERROR", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_INTERNAL,
+        )
+
+
+@unified_app.command(name="export")
+def unified_export(
+    grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="学段学科"),
+    out_dir: Path = typer.Option(Path("data/unified"), "--out-dir", help="脱敏任务包输出目录"),
+    only_uids: list[str] | None = typer.Option(None, "--only-uids", help="限定题目 UID 或 source_id"),
+    limit: int | None = typer.Option(None, "--limit", help="最大导出题数"),
+    batch_size: int = typer.Option(10, "--batch-size", help="每批任务卡数量"),
+    force: bool = typer.Option(False, "--force", help="忽略锁定状态强制导出"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """导出脱敏任务 JSONL（UNIFIED_S1_S2 / STAGE2_ONLY）与隔离 task_map.json。"""
+    from shuati.pipeline.unified_import import export_unified_tasks
+
+    t0 = time.time()
+    parsed_uids: list[str] | None = None
+    if only_uids:
+        parsed_uids = [p.strip() for raw in only_uids for p in raw.split(",") if p.strip()]
+    try:
+        res = export_unified_tasks(
+            db_path=db,
+            out_dir=out_dir,
+            config_dir=config_dir,
+            grade_subject=grade_subject,
+            only_uids=parsed_uids,
+            limit=limit,
+            batch_size=batch_size,
+            force=force,
+        )
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.export",
+            data=asdict(res),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_OK,
+        )
+    except typer.Exit:
+        raise
+    except (PreconditionError, AmbiguousUidError) as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.export",
+            error=ErrorDetail(code="PRECONDITION_FAILED", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_PRECONDITION,
+        )
+    except NotFoundError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.export",
+            error=ErrorDetail(code="NOT_FOUND", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_NOT_FOUND,
+        )
+    except Exception as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.export",
+            error=ErrorDetail(code="INTERNAL_ERROR", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_INTERNAL,
+        )
+
+
+@unified_app.command(name="import")
+def unified_import(
+    results: Path = typer.Option(..., "--results", help="Subagent 输出 JSONL 路径"),
+    task_map: Path = typer.Option(Path("data/unified/task_map.json"), "--task-map", help="task_map.json 路径"),
+    retry_out: Path | None = typer.Option(None, "--retry-out", help="失败任务重试输出路径"),
+    final_round: bool = typer.Option(False, "--final", help="终轮回灌：SymPy 仍败者降级 NEEDS_REVIEW 保留 Stage 2"),
+    force: bool = typer.Option(False, "--force", help="强制覆盖已锁定条目"),
+    worker_tag: str = typer.Option("main-session", "--worker-tag", help="记录来源标识"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """确定性校验并事务回灌主会话 Subagent 结果。"""
+    from shuati.pipeline.unified_import import import_unified_results
+
+    t0 = time.time()
+    try:
+        res = import_unified_results(
+            db_path=db,
+            results_file=results,
+            task_map_file=task_map,
+            config_dir=config_dir,
+            retry_out=retry_out,
+            final_round=final_round,
+            force=force,
+            worker_tag=worker_tag,
+        )
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.import",
+            data=asdict(res),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_OK,
+        )
+    except typer.Exit:
+        raise
+    except PreconditionError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.import",
+            error=ErrorDetail(code="PRECONDITION_FAILED", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_PRECONDITION,
+        )
+    except Exception as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "unified.import",
+            error=ErrorDetail(code="INTERNAL_ERROR", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_INTERNAL,
+        )
+
+
 if __name__ == "__main__":
     app()

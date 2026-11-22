@@ -1,0 +1,52 @@
+grade_subject: 小学奥数
+version: "1.0"
+anchors:
+  - question_uid: "primary_olympiad:ch01_计算基础:ch01_006"
+    target_tier: "L1_基础直达"
+    scores:
+      C: 1
+      S: 1
+      T: 1
+      L: 1
+    base_elo: 1120
+    rationale: "纯三位数整数加减法直接计算，单一概念、单步直达、无技巧转化、基础算术量。"
+
+  - question_uid: "primary_olympiad:ch28_平面直线图形高年级卷:ch28_004"
+    target_tier: "L3_综合中档"
+    scores:
+      C: 2
+      S: 2
+      T: 2
+      L: 1
+    base_elo: 1510
+    rationale: "正方形外围一线三直角全等 + 勾股平方和转化（2个核心概念、2步推演、需识别等量代换技巧、计算极简）。"
+
+  - question_uid: "primary_olympiad:ch28_平面直线图形高年级卷:ch28_002"
+    target_tier: "L4-A_进阶拔高(繁)"
+    scores:
+      C: 2
+      S: 3
+      T: 2
+      L: 3
+    base_elo: 1745
+    rationale: "等腰三角形与梯形比例几何结合分段追及行程（典型高步骤连锁推理与高计算繁琐度 L=3，单维复杂度受控于 C=2）。"
+
+  - question_uid: "primary_olympiad:ch28_平面直线图形高年级卷:ch28_008"
+    target_tier: "L4-B_进阶拔高(巧)"
+    scores:
+      C: 3
+      S: 2
+      T: 3
+      L: 2
+    base_elo: 2030
+    rationale: "正六边形内双正方形与不等腰梯形拼合（需巧妙构造直角斜边方程与面积恒等消元，技巧转化度 T=3 且运算简洁）。"
+
+  - question_uid: "primary_olympiad:ch28_平面直线图形高年级卷:ch28_011"
+    target_tier: "L5-2_竞赛超难"
+    scores:
+      C: 4
+      S: 2
+      T: 2
+      L: 1
+    base_elo: 2530
+    rationale: "缺角十字形内嵌旋转最大正方形极值问题（融合对称性建模、旋转边界不等式约束与可行性双边界验算，四概念综合 C=4）。"
