@@ -60,6 +60,10 @@ class EmbeddingConfig(BaseModel):
     api_key: str = ""
     model: str = "text-embedding-3-large"
     batch_size: int = 32
+    timeout_seconds: float = 60.0
+    max_concurrency: int = 8
+    rpm_limit: int = 120
+    max_retries: int = 3
 
 
 class LLMConfig(BaseModel):
@@ -98,6 +102,61 @@ class ComposerConfig(BaseModel):
     exclude_recent_quiz_batches: int = 3
 
 
+class CloneThresholdsConfig(BaseModel):
+    knn_k: int = 3
+    surface_pct: float = 0.995
+    surface_sim_min: float = 0.85
+    skeleton_pct: float = 0.995
+    skeleton_sim_min: float = 0.88
+    max_elo_diff: int = 120
+    degree_cap: int = 5
+
+
+class IsomorphicThresholdsConfig(BaseModel):
+    knn_k: int = 10
+    skeleton_pct: float = 0.98
+    skeleton_sim_min: float = 0.76
+    surface_pct_max: float = 0.60
+    k_jaccard_min: float = 0.45
+    max_elo_diff: int = 180
+    boundary_band: float = 0.10
+    degree_cap: int = 8
+
+
+class ScaffoldThresholdsConfig(BaseModel):
+    min_k_size: int = 2
+    containment_min: float = 0.80
+    reverse_containment_max: float = 0.60
+    min_elo_diff: int = 200
+    skeleton_pct_min: float = 0.90
+    boundary_band: float = 0.10
+    in_degree_cap: int = 5
+    out_degree_cap: int = 5
+
+
+class ContrastiveThresholdsConfig(BaseModel):
+    knn_k: int = 10
+    surface_pct_min: float = 0.98
+    k_jaccard_max: float = 0.35
+    degree_cap: int = 5
+
+
+class SharedTrapThresholdsConfig(BaseModel):
+    min_shared: int = 1
+    idf_overlap_min: float = 0.65
+    skeleton_pct_max: float = 0.60
+    cross_l1_bonus: float = 1.3
+    degree_cap: int = 5
+
+
+class TopologyThresholdsConfig(BaseModel):
+    clone: CloneThresholdsConfig = Field(default_factory=CloneThresholdsConfig)
+    isomorphic: IsomorphicThresholdsConfig = Field(default_factory=IsomorphicThresholdsConfig)
+    scaffold: ScaffoldThresholdsConfig = Field(default_factory=ScaffoldThresholdsConfig)
+    contrastive: ContrastiveThresholdsConfig = Field(default_factory=ContrastiveThresholdsConfig)
+    shared_trap: SharedTrapThresholdsConfig = Field(default_factory=SharedTrapThresholdsConfig)
+
+
 class TopologyConfig(BaseModel):
     rule_version: str = "2.4-init"
     expected_degree: dict[str, list[int]] = Field(
@@ -109,6 +168,7 @@ class TopologyConfig(BaseModel):
             "SHARED_TRAP": [0, 5],
         }
     )
+    thresholds: TopologyThresholdsConfig = Field(default_factory=TopologyThresholdsConfig)
 
 
 class HumanMirrorConfig(BaseModel):
@@ -138,6 +198,8 @@ def load_settings(config_path: Path | str | None = None, env_path: Path | str | 
         config_path = root_dir / "config" / "settings.yaml"
     else:
         config_path = Path(config_path)
+        if config_path.is_dir():
+            config_path = config_path / "settings.yaml"
 
     raw_dict: dict[str, Any] = {}
     if config_path.exists():

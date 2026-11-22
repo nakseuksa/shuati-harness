@@ -8,11 +8,16 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from shuati.models.schemas import (
+    MergeJudgeBatchOutput,
     MultiSolutionJudgeOutput,
+    PrerequisiteDagOutput,
     QualitativeJudgeOutput,
     ReviewResolveOutput,
     Stage1PrimaryOutput,
     Stage1SecondaryOutput,
+    Stage3cBatchMappingOutput,
+    Stage4RefineBatchOutput,
+    TaxonomyProposeOutput,
 )
 
 # 可由测试按需 monkeypatch 覆盖或追加；键可以是 mock_key、"{question_uid}:{slot}" 或 "{stage}:{slot}"
@@ -78,6 +83,52 @@ def _default_payload_for_schema(schema: type[BaseModel], slot: str) -> dict[str,
             ],
             "sympy_code": "def verify():\n    ans = 6 * 8 // 2\n    return {'主问': str(ans)}\n",
         }
+    if schema is TaxonomyProposeOutput:
+        return {
+            "grade_subject": "小学奥数",
+            "modules": [
+                {
+                    "name": "平面几何",
+                    "aliases": ["几何图形", "直线型几何"],
+                    "l2_entities": [
+                        {"name": "三角形面积与等高模型", "aliases": ["等高模型", "面积比例"]},
+                        {"name": "圆与扇形周长面积", "aliases": ["圆与扇形"]},
+                    ],
+                },
+                {
+                    "name": "数论基础",
+                    "aliases": ["整数问题", "数论"],
+                    "l2_entities": [
+                        {"name": "整除与同余", "aliases": ["整除问题", "余数问题"]},
+                        {"name": "质因数分解", "aliases": ["分解质因数"]},
+                    ],
+                },
+                {
+                    "name": "行程问题",
+                    "aliases": ["行程"],
+                    "l2_entities": [
+                        {"name": "相遇与追及", "aliases": ["相遇问题", "追及问题"]},
+                    ],
+                },
+                {
+                    "name": "组合与计数",
+                    "aliases": ["计数问题", "组合"],
+                    "l2_entities": [
+                        {"name": "排列组合基础", "aliases": ["乘法原理", "加法原理"]},
+                        {"name": "抽屉原理与容斥", "aliases": ["抽屉原理", "容斥原理"]},
+                    ],
+                },
+            ],
+            "rationale": "Mock Stage 3a 标准词表提案",
+        }
+    if schema is Stage3cBatchMappingOutput:
+        return {"items": []}
+    if schema is MergeJudgeBatchOutput:
+        return {"decisions": []}
+    if schema is PrerequisiteDagOutput:
+        return {"edges": []}
+    if schema is Stage4RefineBatchOutput:
+        return {"decisions": []}
     return None
 
 

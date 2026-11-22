@@ -53,9 +53,13 @@ if isinstance(sys.stderr, io.TextIOWrapper) and sys.stderr.encoding.lower() != "
 app = typer.Typer(help="刷题 Harness v2 命令行工具")
 grade_subject_app = typer.Typer(name="grade-subject", help="学段学科管理")
 human_app = typer.Typer(name="human", help="人工资产管理与恢复")
+taxonomy_app = typer.Typer(name="taxonomy", help="知识词表治理（DRAFT / LOCKED / 迁移）")
+graph_app = typer.Typer(name="graph", help="知识网归并、DAG 检查与五边拓扑校准")
 
 app.add_typer(grade_subject_app)
 app.add_typer(human_app)
+app.add_typer(taxonomy_app)
+app.add_typer(graph_app)
 
 
 def output_envelope(
@@ -397,11 +401,17 @@ def human_verify(
 def reindex(
     fts: bool = typer.Option(False, "--fts", help="全量重建 FTS5 全文索引"),
     effective_flag: bool = typer.Option(False, "--effective", help="全量重算生效层 eff_* 列"),
+    vectors: bool = typer.Option(False, "--vectors", help="增量/全量同步 5 类向量 .npz 矩阵"),
+    quantiles: bool = typer.Option(False, "--quantiles", help="重算并冻结经验分位表 meta.json"),
+    grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科"),
+    force: bool = typer.Option(False, "--force", help="强制清空旧模型绑定并全量重算向量"),
+    mock: bool | None = typer.Option(None, "--mock/--no-mock", help="使用离线确定性 Mock 向量"),
+    vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
     json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
 ) -> None:
-    """全量重建全文检索索引或重算生效层字段。"""
+    """全量重建全文检索索引、生效层字段、本地向量矩阵或冻结分位表。"""
     t0 = time.time()
     conn = None
     try:
@@ -413,21 +423,41 @@ def reindex(
 
             do_fts = fts
             do_eff = effective_flag
-            if not do_fts and not do_eff:
+            if not do_fts and not do_eff and not vectors and not quantiles:
                 do_fts = True
                 do_eff = True
 
             res_data: dict[str, Any] = {}
             writer = SingleWriterExecutor()
-            with writer.transaction(conn):
-                if do_eff:
-                    ver = effective.verify_effective_consistency(conn)
-                    res_data["effective_recomputed"] = ver["total_checked"]
-                    res_data["diff_count"] = ver["diff_count"]
+            if do_eff or do_fts:
+                with writer.transaction(conn):
+                    if do_eff:
+                        ver = effective.verify_effective_consistency(conn)
+                        res_data["effective_recomputed"] = ver["total_checked"]
+                        res_data["diff_count"] = ver["diff_count"]
 
-                if do_fts:
-                    count_fts = repository.rebuild_fts(conn)
-                    res_data["fts_rebuilt"] = count_fts
+                    if do_fts:
+                        count_fts = repository.rebuild_fts(conn)
+                        res_data["fts_rebuilt"] = count_fts
+
+            if vectors or quantiles:
+                from shuati.pipeline.stage4_weave import reindex_vectors_and_quantiles_async
+
+                settings = load_settings(config_dir / "settings.yaml")
+                use_mock_flag = bool(mock) if mock is not None else settings.pipeline.use_mock_llm
+                vec_res = asyncio.run(
+                    reindex_vectors_and_quantiles_async(
+                        conn,
+                        settings,
+                        grade_subject=grade_subject,
+                        rebuild_vectors=vectors,
+                        rebuild_quantiles=quantiles,
+                        force_rebuild=force,
+                        use_mock=use_mock_flag,
+                        vectors_dir=vectors_dir,
+                    )
+                )
+                res_data["vectors"] = vec_res
 
             duration_ms = int((time.time() - t0) * 1000)
             output_envelope(
@@ -464,8 +494,8 @@ def reindex(
 
 @app.command(name="compile")
 def compile_stage(
-    stage: str = typer.Option(..., "--stage", help="编译阶段（M1 支持: 1 / S1）"),
-    grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科"),
+    stage: str = typer.Option(..., "--stage", help="编译阶段（支持: 1|3c|3d|3e|4|all）"),
+    grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科（Stage 3/4 默认小学奥数）"),
     only_uids: list[str] | None = typer.Option(
         None, "--only-uids", help="限定题目 UID 或 source_id（可重复传参或逗号分隔）"
     ),
@@ -474,6 +504,12 @@ def compile_stage(
     include_human_verified: bool = typer.Option(
         False, "--include-human-verified", help="包含已人工定稿题目重跑"
     ),
+    mode: str = typer.Option("api", "--mode", help="执行通道：api / export / import"),
+    tasks_dir: Path | None = typer.Option(None, "--tasks-dir", help="Subagent 脱敏批任务包目录"),
+    results: Path | None = typer.Option(None, "--results", help="Subagent 回传结果 JSONL 路径"),
+    batch_size: int | None = typer.Option(None, "--batch-size", help="覆盖默认批大小"),
+    include_unservable: bool = typer.Option(False, "--include-unservable", help="Stage 4 包含 NEEDS_REVIEW 题目"),
+    vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
     mock: bool | None = typer.Option(None, "--mock/--no-mock", help="启用离线 Mock LLM"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
@@ -483,13 +519,26 @@ def compile_stage(
     """离线知识编译流水线（断点续跑）。"""
     t0 = time.time()
     norm_stage = stage.strip().upper()
-    if norm_stage not in ("1", "S1"):
+    norm_mode = mode.strip().lower()
+    if norm_mode not in ("api", "export", "import"):
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            "compile",
+            error=ErrorDetail(code="PRECONDITION_FAILED", message=f"不支持的 --mode: {mode!r}"),
+            meta={"duration_ms": duration_ms},
+            as_json=json,
+            exit_code=EXIT_PRECONDITION,
+        )
+        return
+
+    allowed_stages = ("1", "S1", "3C", "S3C", "3D", "S3D", "3E", "S3E", "4", "S4", "ALL")
+    if norm_stage not in allowed_stages:
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
             "compile",
             error=ErrorDetail(
                 code="PRECONDITION_FAILED",
-                message=f"当前版本仅支持 Stage 1（--stage 1），不支持 '{stage}'",
+                message=f"不支持编译阶段 '{stage}'（支持: 1, 3c, 3d, 3e, 4, all）",
             ),
             meta={"duration_ms": duration_ms},
             as_json=json,
@@ -507,23 +556,152 @@ def compile_stage(
                     parsed_uids.append(cleaned)
 
     try:
-        res = asyncio.run(
-            run_stage1_compile(
-                db_path=db,
-                config_dir=config_dir,
-                assets_dir=assets_dir,
-                grade_subject=grade_subject,
-                only_uids=parsed_uids,
-                stress_test_25=stress_test_25,
-                force=force,
-                include_human_verified=include_human_verified,
-                use_mock=mock,
+        if norm_stage in ("1", "S1"):
+            res = asyncio.run(
+                run_stage1_compile(
+                    db_path=db,
+                    config_dir=config_dir,
+                    assets_dir=assets_dir,
+                    grade_subject=grade_subject,
+                    only_uids=parsed_uids,
+                    stress_test_25=stress_test_25,
+                    force=force,
+                    include_human_verified=include_human_verified,
+                    use_mock=mock,
+                )
             )
-        )
+            data_out: dict[str, Any] = asdict(res)
+        else:
+            from shuati.pipeline.stage3_taxonomy import (
+                run_compaction_async,
+                run_stage3c_async,
+                run_stage3d_mount,
+                run_stage3e_async,
+            )
+            from shuati.pipeline.stage4_weave import run_stage4_weave_async
+            from shuati.vectors.store import VectorStore
+
+            gs = grade_subject or "小学奥数"
+            settings = load_settings(config_dir / "settings.yaml")
+            if mock is not None:
+                settings.pipeline.use_mock_llm = bool(mock)
+            use_mock_flag = bool(mock) if mock is not None else settings.pipeline.use_mock_llm
+
+            conn = get_connection(db)
+            try:
+                _ensure_db_initialized(conn, config_dir)
+                effective.install_eff_write_guard(conn)
+                if norm_stage in ("3C", "S3C"):
+                    data_out = asyncio.run(
+                        run_stage3c_async(
+                            conn,
+                            settings,
+                            grade_subject=gs,
+                            mode=norm_mode,  # type: ignore[arg-type]
+                            batch_size=batch_size or 20,
+                            tasks_dir=tasks_dir or Path("data/unified/stage3_4/3c"),
+                            results_path=results,
+                            lock_path=db.parent / ".compile.lock",
+                        )
+                    )
+                elif norm_stage in ("3D", "S3D"):
+                    data_out = run_stage3d_mount(
+                        conn,
+                        grade_subject=gs,
+                        lock_path=db.parent / ".compile.lock",
+                    )
+                elif norm_stage in ("3E", "S3E"):
+                    data_out = asyncio.run(
+                        run_stage3e_async(
+                            conn,
+                            settings,
+                            grade_subject=gs,
+                            mode=norm_mode,  # type: ignore[arg-type]
+                            tasks_dir=tasks_dir or Path("data/unified/stage3_4/3e"),
+                            results_path=results,
+                            lock_path=db.parent / ".compile.lock",
+                        )
+                    )
+                elif norm_stage in ("4", "S4"):
+                    data_out = asyncio.run(
+                        run_stage4_weave_async(
+                            conn,
+                            settings,
+                            grade_subject=gs,
+                            mode=norm_mode,  # type: ignore[arg-type]
+                            batch_size=batch_size or 25,
+                            include_unservable=include_unservable,
+                            tasks_dir=tasks_dir or Path("data/unified/stage3_4/stage4"),
+                            results_path=results,
+                            vectors_dir=vectors_dir,
+                            use_mock=use_mock_flag,
+                            lock_path=db.parent / ".compile.lock",
+                        )
+                    )
+                else:  # ALL
+                    if norm_mode != "api":
+                        raise PreconditionError("--stage all 仅支持 --mode api；双通道请分阶段 export/import")
+                    s3c_res = asyncio.run(
+                        run_stage3c_async(
+                            conn,
+                            settings,
+                            grade_subject=gs,
+                            mode="api",
+                            batch_size=batch_size or 20,
+                            lock_path=db.parent / ".compile.lock",
+                        )
+                    )
+                    s3d_res = run_stage3d_mount(
+                        conn,
+                        grade_subject=gs,
+                        lock_path=db.parent / ".compile.lock",
+                    )
+                    cmp_res = asyncio.run(
+                        run_compaction_async(
+                            conn,
+                            settings,
+                            VectorStore(vectors_dir),
+                            grade_subject=gs,
+                            mode="api",
+                            use_mock=use_mock_flag,
+                            lock_path=db.parent / ".compile.lock",
+                        )
+                    )
+                    s3e_res = asyncio.run(
+                        run_stage3e_async(
+                            conn,
+                            settings,
+                            grade_subject=gs,
+                            mode="api",
+                            lock_path=db.parent / ".compile.lock",
+                        )
+                    )
+                    s4_res = asyncio.run(
+                        run_stage4_weave_async(
+                            conn,
+                            settings,
+                            grade_subject=gs,
+                            mode="api",
+                            include_unservable=include_unservable,
+                            vectors_dir=vectors_dir,
+                            use_mock=use_mock_flag,
+                            lock_path=db.parent / ".compile.lock",
+                        )
+                    )
+                    data_out = {
+                        "stage3c": s3c_res,
+                        "stage3d": s3d_res,
+                        "compact": cmp_res,
+                        "stage3e": s3e_res,
+                        "stage4": s4_res,
+                    }
+            finally:
+                conn.close()
+
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
             "compile",
-            data=asdict(res),
+            data=data_out,
             meta={"duration_ms": duration_ms},
             as_json=json,
             exit_code=EXIT_OK,
@@ -778,6 +956,441 @@ def unified_import(
             as_json=json,
             exit_code=EXIT_INTERNAL,
         )
+
+
+def _run_cli_action(cmd_name: str, as_json: bool, fn: Any) -> None:
+    t0 = time.time()
+    try:
+        res = fn()
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            cmd_name,
+            data=res,
+            meta={"duration_ms": duration_ms},
+            as_json=as_json,
+            exit_code=EXIT_OK,
+        )
+    except typer.Exit:
+        raise
+    except AmbiguousUidError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            cmd_name,
+            error=ErrorDetail(code="AMBIGUOUS_UID", message=str(e), details={"candidates": e.candidates}),
+            meta={"duration_ms": duration_ms},
+            as_json=as_json,
+            exit_code=EXIT_PRECONDITION,
+        )
+    except PreconditionError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            cmd_name,
+            error=ErrorDetail(code="PRECONDITION_FAILED", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=as_json,
+            exit_code=EXIT_PRECONDITION,
+        )
+    except NotFoundError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            cmd_name,
+            error=ErrorDetail(code="NOT_FOUND", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=as_json,
+            exit_code=EXIT_NOT_FOUND,
+        )
+    except LLMGatewayError as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            cmd_name,
+            error=ErrorDetail(code="LLM_ERROR", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=as_json,
+            exit_code=EXIT_LLM_ERROR,
+        )
+    except Exception as e:
+        duration_ms = int((time.time() - t0) * 1000)
+        output_envelope(
+            cmd_name,
+            error=ErrorDetail(code="INTERNAL_ERROR", message=str(e)),
+            meta={"duration_ms": duration_ms},
+            as_json=as_json,
+            exit_code=EXIT_INTERNAL,
+        )
+
+
+@taxonomy_app.command(name="propose")
+def taxonomy_propose(
+    grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="目标学段学科"),
+    mode: str = typer.Option("api", "--mode", help="执行模式：api / export / import"),
+    tasks_dir: Path = typer.Option(Path("data/unified/stage3_4/propose"), "--tasks-dir", help="Subagent 任务包目录"),
+    results: Path | None = typer.Option(None, "--results", help="Subagent 回传结果 JSONL 路径"),
+    n_clusters: int | None = typer.Option(None, "--n-clusters", help="覆盖聚类簇数（默认 60~100）"),
+    mock: bool | None = typer.Option(None, "--mock/--no-mock", help="使用离线 Mock Embedding/LLM"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """Stage 3a：对全库 S2 有效题原始步骤标签聚类并涌现标准词表草案。"""
+    from shuati.pipeline.stage3_taxonomy import propose_taxonomy_async
+
+    def _work() -> dict[str, Any]:
+        settings = load_settings(config_dir / "settings.yaml")
+        if mock is not None:
+            settings.pipeline.use_mock_llm = bool(mock)
+        use_mock_flag = bool(mock) if mock is not None else settings.pipeline.use_mock_llm
+        conn = get_connection(db)
+        try:
+            _ensure_db_initialized(conn, config_dir)
+            effective.install_eff_write_guard(conn)
+            return asyncio.run(
+                propose_taxonomy_async(
+                    conn,
+                    settings,
+                    grade_subject=grade_subject,
+                    mode=mode.strip().lower(),  # type: ignore[arg-type]
+                    tasks_dir=tasks_dir,
+                    results_path=results,
+                    config_dir=config_dir,
+                    use_mock=use_mock_flag,
+                    n_clusters=n_clusters,
+                )
+            )
+        finally:
+            conn.close()
+
+    _run_cli_action("taxonomy.propose", json, _work)
+
+
+@taxonomy_app.command(name="lock")
+def taxonomy_lock(
+    grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="目标学段学科"),
+    file: Path | None = typer.Option(None, "--file", help="指定 YAML 文件（默认读取学段当前 DRAFT YAML）"),
+    to_version: str = typer.Option("1.0", "--to-version", help="目标版本号"),
+    status: str = typer.Option("LOCKED", "--status", help="目标状态（LOCKED 或 DRAFT）"),
+    allow_stale_overrides: bool = typer.Option(False, "--allow-stale-overrides", help="无法自动迁移的人工覆写置为 TAXONOMY_UNMAPPED 挂起"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="仅预检人工覆写迁移影响，不写库"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    human_dir: Path = typer.Option(Path("human"), "--human-dir", help="人工覆盖层镜像目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """Stage 3b：四步原子事务执行 DRAFT → LOCKED 1.0 锁表迁移（或 DRAFT 换版）。"""
+    from shuati.core.taxonomy import default_taxonomy_path, transition_taxonomy
+
+    def _work() -> dict[str, Any]:
+        conn = get_connection(db)
+        try:
+            _ensure_db_initialized(conn, config_dir)
+            effective.install_eff_write_guard(conn)
+            gs = conn.execute(
+                "SELECT slug, taxonomy_file FROM grade_subjects WHERE grade_subject = ?;",
+                (grade_subject,),
+            ).fetchone()
+            if gs is None:
+                raise PreconditionError(f"PRECONDITION_FAILED: 学段学科不存在: {grade_subject!r}")
+            src_yaml = file or (Path(gs["taxonomy_file"]) if gs["taxonomy_file"] else default_taxonomy_path(config_dir, str(gs["slug"]), "DRAFT"))
+            norm_status = status.strip().upper()
+            if norm_status not in ("DRAFT", "LOCKED"):
+                raise PreconditionError(f"PRECONDITION_FAILED: 非法 --status: {status!r}")
+            return transition_taxonomy(
+                conn,
+                grade_subject=grade_subject,
+                yaml_path=src_yaml,
+                target_version=to_version,
+                target_status=norm_status,  # type: ignore[arg-type]
+                allow_stale_overrides=allow_stale_overrides,
+                dry_run=dry_run,
+                config_dir=config_dir,
+                backups_dir=db.parent / "backups",
+                human_dir=human_dir,
+                reports_dir=db.parent / "reports",
+                lock_path=db.parent / ".compile.lock",
+            )
+        finally:
+            conn.close()
+
+    _run_cli_action("taxonomy.lock", json, _work)
+
+
+@taxonomy_app.command(name="migrate")
+def taxonomy_migrate(
+    grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="目标学段学科"),
+    file: Path = typer.Option(..., "--file", help="包含 changelog 的新 LOCKED YAML 文件"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="仅预检影响范围，不写库"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    human_dir: Path = typer.Option(Path("human"), "--human-dir", help="人工覆盖层镜像目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """按 LOCKED YAML 中的 changelog（add/rename/merge）精准增量迁移词表版本。"""
+    from shuati.core.taxonomy import migrate_taxonomy_incremental
+
+    def _work() -> dict[str, Any]:
+        conn = get_connection(db)
+        try:
+            _ensure_db_initialized(conn, config_dir)
+            effective.install_eff_write_guard(conn)
+            return migrate_taxonomy_incremental(
+                conn,
+                grade_subject=grade_subject,
+                new_yaml_path=file,
+                dry_run=dry_run,
+                config_dir=config_dir,
+                backups_dir=db.parent / "backups",
+                human_dir=human_dir,
+                lock_path=db.parent / ".compile.lock",
+            )
+        finally:
+            conn.close()
+
+    _run_cli_action("taxonomy.migrate", json, _work)
+
+
+@taxonomy_app.command(name="candidates")
+def taxonomy_candidates(
+    grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="目标学段学科"),
+    status: str = typer.Option("PENDING", "--status", help="筛选候选状态（PENDING/APPROVED/REJECTED/MAPPED/ALL）"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """查看 Stage 3c 运行期间收集的新 L1/L2 词表候选队列。"""
+    import json as json_lib
+
+    def _work() -> dict[str, Any]:
+        conn = get_connection(db, readonly=True)
+        try:
+            norm = status.strip().upper()
+            if norm == "ALL":
+                rows = conn.execute(
+                    "SELECT * FROM taxonomy_candidates WHERE grade_subject = ? ORDER BY candidate_id;",
+                    (grade_subject,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM taxonomy_candidates WHERE grade_subject = ? AND status = ? ORDER BY candidate_id;",
+                    (grade_subject, norm),
+                ).fetchall()
+            items = []
+            for r in rows:
+                d = dict(r)
+                d["example_question_uids"] = json_lib.loads(d.pop("example_question_uids_json", "[]") or "[]")
+                items.append(d)
+            return {"grade_subject": grade_subject, "count": len(items), "candidates": items}
+        finally:
+            conn.close()
+
+    _run_cli_action("taxonomy.candidates", json, _work)
+
+
+@graph_app.command(name="compact")
+def graph_compact(
+    grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="目标学段学科"),
+    target: str = typer.Option("all", "--target", help="归并对象：all / l3 / concepts"),
+    mode: str = typer.Option("api", "--mode", help="执行模式：api / export / import"),
+    batch_size: int = typer.Option(40, "--batch-size", help="批裁判候选对数量"),
+    tasks_dir: Path = typer.Option(Path("data/unified/stage3_4/compact"), "--tasks-dir", help="Subagent 任务包目录"),
+    results: Path | None = typer.Option(None, "--results", help="Subagent 回传结果路径"),
+    vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
+    mock: bool | None = typer.Option(None, "--mock/--no-mock", help="使用离线 Mock 向量与 LLM"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """Stage 3d：全量同域双路召回并执行可逆并查集同义归并。"""
+    from shuati.pipeline.stage3_taxonomy import run_compaction_async
+    from shuati.vectors.store import VectorStore
+
+    def _work() -> dict[str, Any]:
+        settings = load_settings(config_dir / "settings.yaml")
+        if mock is not None:
+            settings.pipeline.use_mock_llm = bool(mock)
+        use_mock_flag = bool(mock) if mock is not None else settings.pipeline.use_mock_llm
+        conn = get_connection(db)
+        try:
+            _ensure_db_initialized(conn, config_dir)
+            effective.install_eff_write_guard(conn)
+            return asyncio.run(
+                run_compaction_async(
+                    conn,
+                    settings,
+                    VectorStore(vectors_dir),
+                    grade_subject=grade_subject,
+                    target=target.strip().lower(),  # type: ignore[arg-type]
+                    mode=mode.strip().lower(),  # type: ignore[arg-type]
+                    batch_size=batch_size,
+                    tasks_dir=tasks_dir,
+                    results_path=results,
+                    use_mock=use_mock_flag,
+                    lock_path=db.parent / ".compile.lock",
+                )
+            )
+        finally:
+            conn.close()
+
+    _run_cli_action("graph.compact", json, _work)
+
+
+@graph_app.command(name="revert-merge")
+def graph_revert_merge(
+    batch_id: str = typer.Option(..., "--batch-id", help="要无损逆序回滚的归并批次 ID"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """按 merge_id 严格逆序无损回滚指定归并批次（拒绝乱序回滚）。"""
+    from shuati.core.knowledge_graph import revert_merge_batch
+
+    def _work() -> dict[str, Any]:
+        conn = get_connection(db)
+        try:
+            _ensure_db_initialized(conn, config_dir)
+            effective.install_eff_write_guard(conn)
+            return revert_merge_batch(
+                conn,
+                batch_id,
+                backups_dir=db.parent / "backups",
+                lock_path=db.parent / ".compile.lock",
+            )
+        finally:
+            conn.close()
+
+    _run_cli_action("graph.revert-merge", json, _work)
+
+
+@graph_app.command(name="check-dag")
+def graph_check_dag(
+    grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="目标学段学科"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """校验当前学段 PREREQUISITE 知识点拓扑边强无环（DAG）特性。"""
+    from shuati.core.knowledge_graph import check_dag_and_break_cycles
+
+    def _work() -> dict[str, Any]:
+        conn = get_connection(db, readonly=True)
+        try:
+            rows = conn.execute(
+                """
+                SELECT source_node_id, target_node_id, weight
+                FROM knowledge_edges
+                WHERE grade_subject = ? AND edge_type = 'PREREQUISITE';
+                """,
+                (grade_subject,),
+            ).fetchall()
+            acyclic, broken = check_dag_and_break_cycles([dict(r) for r in rows])
+            return {
+                "grade_subject": grade_subject,
+                "total_edges": len(rows),
+                "is_acyclic": len(broken) == 0,
+                "acyclic_edges": len(acyclic),
+                "cycle_edges_found": len(broken),
+                "broken_edges": broken,
+            }
+        finally:
+            conn.close()
+
+    _run_cli_action("graph.check-dag", json, _work)
+
+
+@graph_app.command(name="calibrate-eval")
+def graph_calibrate_eval(
+    stress_yaml: Path = typer.Option(Path("config/stress_test_25.yaml"), "--stress-yaml", help="校准配置文件路径"),
+    propose_candidates: bool = typer.Option(False, "--propose-candidates", help="从五边与边界带抽样 ~150 对候选供审定"),
+    per_type_samples: int = typer.Option(30, "--per-type-samples", help="每类边抽样上限"),
+    vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
+    reports_dir: Path = typer.Option(Path("data/reports"), "--reports-dir", help="输出报告目录"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """评估五边校准样本命中率/误报率，或抽样 ~150 对五边候选供阈值校准。"""
+    from shuati.pipeline.stage4_weave import evaluate_calibration_pairs
+
+    def _work() -> dict[str, Any]:
+        settings = load_settings(config_dir / "settings.yaml")
+        conn = get_connection(db, readonly=True)
+        try:
+            return evaluate_calibration_pairs(
+                conn,
+                settings,
+                stress_yaml_path=stress_yaml,
+                propose_candidates=propose_candidates,
+                per_type_samples=per_type_samples,
+                vectors_dir=vectors_dir,
+                reports_dir=reports_dir,
+            )
+        finally:
+            conn.close()
+
+    _run_cli_action("graph.calibrate-eval", json, _work)
+
+
+@app.command(name="audit")
+def audit_cmd(
+    grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科"),
+    prune_runs: bool = typer.Option(False, "--prune-runs", help="清理未被引用的 FAILED stage1_vlm_runs"),
+    human_dir: Path = typer.Option(Path("human"), "--human-dir", help="人工覆盖层镜像目录"),
+    vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
+    reports_dir: Path = typer.Option(Path("data/reports"), "--reports-dir", help="输出报告目录"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """Stage Q 全库自动质量体检，输出 7 大板块报告（Markdown + JSON）。"""
+    from shuati.pipeline.audit import run_stage_q_audit
+
+    def _work() -> dict[str, Any]:
+        settings = load_settings(config_dir / "settings.yaml")
+        # verify_effective_consistency 会临时执行 effective.recompute 并对比 diff；非 --prune-runs 时末尾回滚以保持无副作用只读审计
+        conn = get_connection(db, readonly=False)
+        try:
+            if prune_runs:
+                _ensure_db_initialized(conn, config_dir)
+            report = run_stage_q_audit(
+                conn,
+                settings,
+                grade_subject=grade_subject,
+                human_dir=human_dir,
+                vectors_dir=vectors_dir,
+                reports_dir=reports_dir,
+                prune_runs=prune_runs,
+            )
+            if not prune_runs and conn.in_transaction:
+                conn.rollback()
+            return report
+        finally:
+            conn.close()
+
+    _run_cli_action("audit", json, _work)
+
+
+@app.command(name="export")
+def export_cmd(
+    grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科"),
+    export_dir: Path = typer.Option(Path("data/exports"), "--export-dir", help="标准 JSONL 导出目录"),
+    include_retired: bool = typer.Option(False, "--include-retired", help="是否包含已废题/屏蔽题"),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """导出 4 份脱离 SQLite 的标准 JSONL 资产。"""
+    from shuati.db.exporter import export_all_jsonl
+
+    def _work() -> dict[str, Any]:
+        conn = get_connection(db, readonly=True)
+        try:
+            return export_all_jsonl(
+                conn,
+                export_dir=export_dir,
+                grade_subject=grade_subject,
+                include_retired=include_retired,
+            )
+        finally:
+            conn.close()
+
+    _run_cli_action("export", json, _work)
 
 
 if __name__ == "__main__":

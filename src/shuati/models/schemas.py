@@ -136,3 +136,74 @@ class UnifiedS1S2Output(BaseModel):
     classic_motifs: list[str] = Field(default_factory=list)
     trap_tags: list[str] = Field(default_factory=list)
     difficulty: DifficultyScoresOutput
+
+
+class TaxonomyL2Proposal(BaseModel):
+    name: str
+    aliases: list[str] = Field(default_factory=list)
+    description: str = ""
+
+
+class TaxonomyL1Proposal(BaseModel):
+    name: str
+    aliases: list[str] = Field(default_factory=list)
+    l2_entities: list[TaxonomyL2Proposal] = Field(default_factory=list)
+
+
+class TaxonomyProposeOutput(BaseModel):
+    grade_subject: str = ""
+    modules: list[TaxonomyL1Proposal]
+    rationale: str = ""
+
+
+class Stage3cStepMapping(BaseModel):
+    step_index: int
+    mapped_l1: str
+    mapped_l2: str
+    is_novel_l2: bool = False
+
+
+class Stage3cQuestionMapping(BaseModel):
+    task_item_id: str
+    primary_l1_module: str
+    secondary_l1_modules: list[str] = Field(default_factory=list)
+    steps: list[Stage3cStepMapping] = Field(default_factory=list)
+
+
+class Stage3cBatchMappingOutput(BaseModel):
+    items: list[Stage3cQuestionMapping]
+
+
+class MergeJudgeItem(BaseModel):
+    pair_id: str
+    should_merge: bool
+    canonical_name: str = ""
+    reason: str = ""
+
+
+class MergeJudgeBatchOutput(BaseModel):
+    decisions: list[MergeJudgeItem]
+
+
+class PrerequisiteEdgeCandidate(BaseModel):
+    source_l1: str
+    source_l2: str
+    target_l1: str
+    target_l2: str
+    confidence: float = 0.8
+    reason: str = ""
+
+
+class PrerequisiteDagOutput(BaseModel):
+    edges: list[PrerequisiteEdgeCandidate]
+
+
+class Stage4RefineItem(BaseModel):
+    pair_id: str
+    is_valid: bool
+    pedagogical_note: str = ""
+    reason: str = ""
+
+
+class Stage4RefineBatchOutput(BaseModel):
+    decisions: list[Stage4RefineItem]
