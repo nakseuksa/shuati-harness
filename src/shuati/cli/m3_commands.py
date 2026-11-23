@@ -343,11 +343,14 @@ def register_m3_commands(
     # 7. shuati diagnose
     @app.command(name="diagnose")
     def diagnose_cmd(
-        text: str = typer.Option(..., "--text", help="外部新错题题干文本"),
-        image: list[Path] = typer.Option([], "--image", help="外部错题本地图片路径（可多次传入）"),
+        text: str | None = typer.Option(None, "--text", help="外部新错题题干文本（与 --file 二选一互斥）"),
+        file: Path | None = typer.Option(None, "--file", help="批量诊断题目列表文件（Markdown / 纯文本，与 --text 互斥）"),
+        image: list[Path] = typer.Option([], "--image", help="外部错题本地图片路径（可多次传入，仅单题 --text 模式）"),
         grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="学段学科"),
-        answer: str | None = typer.Option(None, "--answer", help="可选已知标准答案用于一致性比对"),
-        from_json: str | None = typer.Option(None, "--from-json", help="结构化诊断 JSON 或 @文件逃生通道"),
+        answer: str | None = typer.Option(None, "--answer", help="可选已知标准答案用于一致性比对（仅单题模式）"),
+        from_json: str | None = typer.Option(None, "--from-json", help="结构化诊断 JSON 或 @文件逃生通道（仅单题模式）"),
+        concurrency: int = typer.Option(1, "--concurrency", min=1, help="批量诊断并发数（默认 1 逐题执行）"),
+        force: bool = typer.Option(False, "--force", help="批量诊断时忽略已有草稿缓存，强制重跑 VLM"),
         mock: bool | None = typer.Option(None, "--mock/--no-mock", help="使用离线 Mock VLM/Embedding"),
         db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
         config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
@@ -355,13 +358,34 @@ def register_m3_commands(
         drafts_dir: Path = typer.Option(Path("data/drafts"), "--drafts-dir", help="临时草稿目录"),
         json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
     ) -> None:
-        """只读实时诊断外部新错题，输出关联铺垫/同构/排雷推荐并缓存 draft_id。"""
+        """只读实时诊断外部新错题（支持 --text 单题或 --file 批量 Markdown 列表），输出推荐并缓存 draft_id。"""
 
         def _work() -> dict[str, Any]:
+            if (text is None and file is None) or (text is not None and file is not None):
+                raise PreconditionError("必须且仅能提供 --text 或 --file 之一")
             settings = load_settings(config_dir / "settings.yaml")
-            diag_obj = _parse_json_arg(from_json)
             conn = get_connection(db, readonly=True)
             try:
+                if file is not None:
+                    if image or answer is not None or from_json is not None:
+                        raise PreconditionError("--file 批量模式不支持同时传入 --image / --answer / --from-json")
+                    return asyncio.run(
+                        facade.diagnose_external_file_async(
+                            conn,
+                            settings,
+                            file_path=file,
+                            grade_subject=grade_subject,
+                            concurrency=concurrency,
+                            force=force,
+                            config_dir=config_dir,
+                            vectors_dir=vectors_dir,
+                            drafts_dir=drafts_dir,
+                            use_mock=mock,
+                        )
+                    )
+
+                assert text is not None
+                diag_obj = _parse_json_arg(from_json)
                 return asyncio.run(
                     facade.diagnose_external_mistake_async(
                         conn,

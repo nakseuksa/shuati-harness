@@ -173,6 +173,102 @@ def _parse_single_known_answer(raw_answer: str, reference_parts: list[AnswerPart
     return normalize_answer_parts(out)
 
 
+def _hash_file_bytes(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def compute_diagnose_content_hash(
+    grade_subject: str,
+    norm_text: str,
+    image_paths: Sequence[Path],
+) -> str:
+    """基于学段、规范化题干与各原图内容哈希计算稳定的诊断缓存键（不依赖临时文件名）。"""
+    img_hashes = [_hash_file_bytes(p) for p in image_paths]
+    payload = {
+        "grade_subject": grade_subject,
+        "text": norm_text,
+        "img_hashes": img_hashes,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def find_duplicate_candidates(
+    conn: sqlite3.Connection,
+    *,
+    grade_subject: str,
+    norm_text: str,
+    image_count: int,
+    surf_hits: Sequence[tuple[str, float]],
+    servable_map: dict[str, dict[str, Any]],
+    surface_sim_threshold: float = 0.85,
+    max_candidates: int = 3,
+) -> list[dict[str, Any]]:
+    """检索库内与当前外部错题精确重复（plain_fingerprint）或表皮高相似的原题候选。"""
+    candidates: list[dict[str, Any]] = []
+    seen_uids: set[str] = set()
+
+    plain_fp = compute_plain_fingerprint(norm_text, image_count)
+    fp_rows = conn.execute(
+        """
+        SELECT q.question_uid, r.source_id, q.eff_question_text, q.eff_base_elo,
+               q.eff_tier, q.eff_primary_l1_module
+        FROM raw_questions r
+        JOIN questions q ON q.question_uid = r.question_uid
+        WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_excluded = 0
+          AND r.plain_fingerprint = ?
+        LIMIT ?;
+        """,
+        (grade_subject, plain_fp, max_candidates),
+    ).fetchall()
+    for row in fp_rows:
+        uid = str(row["question_uid"])
+        if uid in seen_uids:
+            continue
+        seen_uids.add(uid)
+        q_txt = str(row["eff_question_text"] or "").strip()
+        candidates.append(
+            {
+                "question_uid": uid,
+                "source_id": str(row["source_id"] or ""),
+                "base_elo": int(row["eff_base_elo"] or 1500),
+                "tier": row["eff_tier"],
+                "primary_l1_module": row["eff_primary_l1_module"],
+                "similarity": 1.0,
+                "match_type": "EXACT_FINGERPRINT",
+                "question_preview": q_txt[:120] + ("..." if len(q_txt) > 120 else ""),
+            }
+        )
+
+    for uid, sim in surf_hits:
+        if len(candidates) >= max_candidates:
+            break
+        if uid in seen_uids or float(sim) < surface_sim_threshold:
+            continue
+        meta = servable_map.get(uid)
+        if not meta:
+            continue
+        seen_uids.add(uid)
+        q_txt = str(meta["eff_question_text"] or "").strip()
+        candidates.append(
+            {
+                "question_uid": uid,
+                "source_id": str(meta["source_id"] or ""),
+                "base_elo": int(meta["eff_base_elo"] or 1500),
+                "tier": meta["eff_tier"],
+                "primary_l1_module": meta["eff_primary_l1_module"],
+                "similarity": round(float(sim), 4),
+                "match_type": "HIGH_SURFACE_SIM",
+                "question_preview": q_txt[:120] + ("..." if len(q_txt) > 120 else ""),
+            }
+        )
+
+    return candidates
+
+
 def _build_anchors_prompt_text(
     conn: sqlite3.Connection,
     grade_subject: str,
@@ -234,11 +330,13 @@ async def diagnose_external_mistake_async(
     draft_img_dir = draft_root / "images"
     draft_img_dir.mkdir(parents=True, exist_ok=True)
 
+    raw_img_paths: list[Path] = []
     preprocessed_imgs: list[Path] = []
     for idx, raw_img in enumerate(image_paths or [], start=1):
         src_p = Path(raw_img)
         if not src_p.exists():
             raise PreconditionError(f"找不到传入的错题图片: {src_p}")
+        raw_img_paths.append(src_p)
         dst_p = draft_img_dir / f"{draft_id}_{idx}.jpg"
         prepare_external_image(src_p, dst_p, max_px=settings.pipeline.max_external_image_px)
         preprocessed_imgs.append(dst_p)
@@ -302,8 +400,8 @@ async def diagnose_external_mistake_async(
     # 3. 内存 1 vs N 向量检索（完全只读，绝不修改 .npz）
     servable_rows = conn.execute(
         """
-        SELECT q.question_uid, r.source_id, q.eff_question_text, q.eff_base_elo,
-               q.eff_tier, q.eff_primary_l1_module, q.eff_abstract_skeleton
+        SELECT q.question_uid, r.source_id, q.eff_question_text, q.eff_options_json, q.has_images,
+               q.eff_base_elo, q.eff_tier, q.eff_primary_l1_module, q.eff_abstract_skeleton
         FROM questions q
         JOIN raw_questions r ON r.question_uid = q.question_uid
         WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_excluded = 0 AND q.eff_is_servable = 1;
@@ -338,10 +436,17 @@ async def diagnose_external_mistake_async(
 
     def _card_item(uid: str, sim: float, rel_hint: str) -> dict[str, Any]:
         meta = servable_map[uid]
+        raw_opts = meta.get("eff_options_json") or "{}"
+        try:
+            opts = json.loads(raw_opts) if isinstance(raw_opts, str) else dict(raw_opts)
+        except ValueError:
+            opts = {}
         return {
             "question_uid": uid,
             "source_id": meta["source_id"],
             "question_text": meta["eff_question_text"],
+            "options": opts if isinstance(opts, dict) else {},
+            "has_images": bool(meta.get("has_images")),
             "base_elo": int(meta["eff_base_elo"] or 1500),
             "tier": meta["eff_tier"],
             "primary_l1_module": meta["eff_primary_l1_module"],
@@ -389,9 +494,16 @@ async def diagnose_external_mistake_async(
                 contrastive_traps.append(_card_item(tuid, 0.0, f"共享高危陷阱 {','.join(diag_traps)}"))
                 used_recs.add(tuid)
 
-    content_hash = hashlib.sha256(
-        json.dumps({"text": norm_text, "imgs": [str(p) for p in preprocessed_imgs]}, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    duplicate_candidates = find_duplicate_candidates(
+        conn,
+        grade_subject=grade_subject,
+        norm_text=norm_text,
+        image_count=len(preprocessed_imgs),
+        surf_hits=surf_hits,
+        servable_map=servable_map,
+    )
+
+    content_hash = compute_diagnose_content_hash(grade_subject, norm_text, raw_img_paths)
 
     draft_payload = {
         "draft_id": draft_id,
@@ -405,6 +517,12 @@ async def diagnose_external_mistake_async(
         "base_elo": diff_res.base_elo,
         "tier": diff_res.tier,
         "tier_rank": diff_res.tier_rank,
+        "duplicate_candidates": duplicate_candidates,
+        "recommendations": {
+            "scaffold_foundations": scaffolds,
+            "isomorphic_variants": isomorphics,
+            "contrastive_and_traps": contrastive_traps,
+        },
         "unverified_single_pass": True,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -429,6 +547,7 @@ async def diagnose_external_mistake_async(
         "classic_motifs": diag.classic_motifs,
         "trap_tags": diag.trap_tags,
         "known_answer_match": known_answer_match,
+        "duplicate_candidates": duplicate_candidates,
         "recommendations": {
             "scaffold_foundations": scaffolds,
             "isomorphic_variants": isomorphics,

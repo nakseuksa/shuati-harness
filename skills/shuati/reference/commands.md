@@ -44,6 +44,7 @@ shuati log-void <log_id> [--reason "..."] --json
 ```bash
 shuati render-sheet [--quiz-batch-id <id> | --uids u1,u2] [--out data/sheets/my.html] [--embed-images/--no-embed-images] [--print-answers-at-end/--no-print-answers-at-end] --json
 shuati diagnose --text "题干" [--image a.jpg] --grade-subject 小学奥数 [--answer "已知答案"] [--from-json JSON_or_@path] --json
+shuati diagnose --file questions.md --grade-subject 小学奥数 [--concurrency 1] [--force] --json
 shuati ingest-mistake [--draft-id drf_xxx | --text "题干" --grade-subject 小学奥数] [--answer "已知答案"] [--from-json ...] [--secondary-json ...] [--log-wrong] [--learner <id>] [--dry-run] --json
 shuati override <uid_or_source_id> --field <field_name> [--value "..."] [--revoke] [--reconfirm] [--dry-run] [--reason "..."] --json
 shuati skill install [--target .pi/skills/shuati] [--symlink/--copy] --json

@@ -766,6 +766,10 @@ def resolve_review_draft(
 from shuati.core.composer import compose_quiz  # noqa: E402, F401
 from shuati.core.profiler import compute_learner_profile  # noqa: E402, F401
 from shuati.render.sheet_renderer import render_practice_sheet  # noqa: E402, F401
+from shuati.services.diagnose_batch import (  # noqa: E402, F401
+    diagnose_external_file_async,
+    parse_question_list_markdown,
+)
 from shuati.services.mistake import (  # noqa: E402, F401
     diagnose_external_mistake_async,
     ingest_external_mistake_async,
