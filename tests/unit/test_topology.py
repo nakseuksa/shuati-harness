@@ -35,33 +35,23 @@ def _add_topo_question(
         "INSERT INTO raw_questions(question_uid, grade_subject, source_type, source_collection, source_id, raw_question, content_hash) VALUES (?, '小学奥数', 'BATCH_JSONL', 'c', ?, ?, ?);",
         (uid, uid, text, f"h_{uid}"),
     )
+    # 构造 4 维 C/S/T/L 使 compute_difficulty 精准落在各 ELo 档位
+    if elo >= 1800:
+        c, s, t, l_val = 3, 2, 2, 1  # 1850
+    elif elo <= 1485:
+        c, s, t, l_val = 2, 1, 2, 2  # 1470
+    else:
+        c, s, t, l_val = 2, 2, 2, 1  # 1510
     conn.execute(
         """
         INSERT INTO questions(
             question_uid, grade_subject, m_question_text, m_format,
-            m_verification_status, m_abstract_skeleton, m_primary_l1_module, m_base_elo
+            m_verification_status, m_abstract_skeleton, m_primary_l1_module,
+            m_c_score, m_s_score, m_t_score, m_l_score
         )
-        VALUES (?, '小学奥数', ?, '解答题', 'VERIFIED_CONSENSUS', ?, ?, ?);
+        VALUES (?, '小学奥数', ?, '解答题', 'VERIFIED_CONSENSUS', ?, ?, ?, ?, ?, ?);
         """,
-        (uid, text, skel, primary_l1, elo),
-    ) if False else None
-    conn.execute(
-        """
-        INSERT INTO questions(
-            question_uid, grade_subject, m_question_text, m_format,
-            m_verification_status, m_abstract_skeleton, m_primary_l1_module
-        )
-        VALUES (?, '小学奥数', ?, '解答题', 'VERIFIED_CONSENSUS', ?, ?);
-        """,
-        (uid, text, skel, primary_l1),
-    )
-    # 用 difficulty_override_json? 不，直接由 m_c/s/t/l 或 override 设置 elo，这里使用 ANCHOR_CALIBRATION 覆写 difficulty_override_json 最干净
-    conn.execute(
-        """
-        INSERT INTO human_overrides(question_uid, field_name, override_value, source, base_fingerprint)
-        VALUES (?, 'difficulty_override_json', ?, 'ANCHOR_CALIBRATION', ?);
-        """,
-        (uid, f'{{"base_elo": {elo}, "tier": "L3_综合中档", "tier_rank": 3}}', f"h_{uid}"),
+        (uid, text, skel, primary_l1, c, s, t, l_val),
     )
     for b_idx, (bid, nids) in enumerate(nodes_by_branch.items()):
         conn.execute(
@@ -168,7 +158,7 @@ def test_five_edge_topology_caps_overrides_and_single_weave(tmp_path) -> None:
 
     assert ("q1", "q2", "CLONE") in triples
     assert ("q1", "q4", "ISOMORPHIC") in triples
-    assert ("q5", "q1", "SCAFFOLD") in triples
+    assert ("q1", "q5", "SCAFFOLD") in triples
     assert ("q1", "q3", "CONTRASTIVE") in triples
     assert ("q1", "q6", "SHARED_TRAP") in triples
 
@@ -199,5 +189,5 @@ def test_five_edge_topology_caps_overrides_and_single_weave(tmp_path) -> None:
     # 验证单题增量 weave_single_question 保持图一致
     res_single = weave_single_question(conn, store, question_uid="q5", topology_cfg=settings.topology)
     assert res_single["written"] >= 1
-    assert conn.execute("SELECT 1 FROM question_relations WHERE source_question_uid='q5' AND target_question_uid='q1' AND relation_type='SCAFFOLD';").fetchone() is not None
+    assert conn.execute("SELECT 1 FROM question_relations WHERE source_question_uid='q1' AND target_question_uid='q5' AND relation_type='SCAFFOLD';").fetchone() is not None
     conn.close()

@@ -119,6 +119,9 @@ def load_question_features(
             motif_by_q.setdefault(uid, set()).add(f"M:{cid}")
             motif_names_by_q.setdefault(uid, []).append(str(r["name"]))
         else:
+            # D-Audit-3：纯四则笔误 TRAP_ARITHMETIC_SLIP 不参与跨题 SHARED_TRAP 织网
+            if str(r["name"]) == "TRAP_ARITHMETIC_SLIP" or cid == "TRAP:TRAP_ARITHMETIC_SLIP":
+                continue
             trap_by_q.setdefault(uid, set()).add(f"T:{cid}")
 
     # 加载步骤 L3 节点按分支分组
@@ -208,8 +211,8 @@ def compute_idf_weights(features: dict[str, QuestionFeature]) -> tuple[dict[str,
             df_k[tok] = df_k.get(tok, 0) + 1
         for tr in f.e_traps:
             df_t[tr] = df_t.get(tr, 0) + 1
-    idf_k = {k: math.log((n_docs + 1.0) / (df + 1.0)) + 1e-6 for k, df in df_k.items()}
-    idf_t = {k: math.log((n_docs + 1.0) / (df + 1.0)) + 1e-6 for k, df in df_t.items()}
+    idf_k = {k: math.log((n_docs + 1.0) / (df + 1.0)) + 1.0 for k, df in df_k.items()}
+    idf_t = {k: math.log((n_docs + 1.0) / (df + 1.0)) + 1.0 for k, df in df_t.items()}
     return idf_k, idf_t
 
 
@@ -269,10 +272,9 @@ def _trap_idf_overlap(ea: set[str], eb: set[str], idf_t: dict[str, float]) -> fl
     shared = ea & eb
     if not shared:
         return 0.0
+    union = ea | eb
     sum_shared = sum(idf_t.get(t, 1.0) for t in shared)
-    sum_a = sum(idf_t.get(t, 1.0) for t in ea)
-    sum_b = sum(idf_t.get(t, 1.0) for t in eb)
-    denom = min(sum_a, sum_b)
+    denom = sum(idf_t.get(t, 1.0) for t in union)
     if denom <= 1e-12:
         return 0.0
     return min(1.0, sum_shared / denom)
@@ -530,7 +532,7 @@ def generate_candidate_edges(
                 )
             )
 
-        # (3) SCAFFOLD：有向边 A -> B 表示 B 是 A 的前置/低阶支架（A 难度显著更高，B 知识被 A 包含）
+        # (3) SCAFFOLD：有向边 source(低阶子题) -> target(高阶母题)，D_target - D_source >= min_elo_diff (D-Audit-5)
         for high_f, low_f, low_in_high, high_in_low in (
             (fa, fb, cont_b_in_a, cont_a_in_b),
             (fb, fa, cont_a_in_b, cont_b_in_a),
@@ -543,26 +545,23 @@ def generate_candidate_edges(
             sc_band = th.scaffold.boundary_band
             sc_core = (
                 low_in_high >= th.scaffold.containment_min
-                and (elo_gap >= th.scaffold.min_elo_diff or k_pct >= th.scaffold.skeleton_pct_min)
+                and elo_gap >= th.scaffold.min_elo_diff
             )
             sc_boundary_hit = (
                 not sc_core
                 and sc_band > 0
                 and low_in_high >= th.scaffold.containment_min * (1.0 - sc_band)
-                and (
-                    elo_gap >= th.scaffold.min_elo_diff * (1.0 - sc_band)
-                    or k_pct >= th.scaffold.skeleton_pct_min * (1.0 - sc_band)
-                )
+                and elo_gap >= th.scaffold.min_elo_diff * (1.0 - sc_band)
             )
             if sc_core or sc_boundary_hit:
                 near_b = sc_boundary_hit or (
                     _near_threshold(low_in_high, th.scaffold.containment_min, sc_band)
-                    or (elo_gap > 0 and _near_threshold(float(elo_gap), float(th.scaffold.min_elo_diff), sc_band))
+                    or _near_threshold(float(elo_gap), float(th.scaffold.min_elo_diff), sc_band)
                 )
                 out_edges.append(
                     CandidateEdge(
-                        source_uid=high_f.uid,
-                        target_uid=low_f.uid,
+                        source_uid=low_f.uid,
+                        target_uid=high_f.uid,
                         relation_type="SCAFFOLD",
                         is_directed=1,
                         is_cross_scope=cross_scope,
@@ -738,7 +737,7 @@ def merge_relation_overrides(
             )
             k_jacc, cont_a_b, cont_b_a = _best_branch_metrics(fa, fb, idf_k)
             trap_ov = _trap_idf_overlap(fa.e_traps, fb.e_traps, idf_t)
-            cont_score = cont_b_a if rtype == "SCAFFOLD" else max(cont_a_b, cont_b_a)
+            cont_score = cont_a_b if rtype == "SCAFFOLD" else max(cont_a_b, cont_b_a)
             edge_map[key] = CandidateEdge(
                 source_uid=u,
                 target_uid=v,

@@ -278,12 +278,15 @@ def grade_subject_list(
 def human_restore(
     from_dir: Path | None = typer.Option(None, "--from", help="人工资产镜像源目录"),
     dry_run: bool = typer.Option(False, "--dry-run", help="仅预览恢复行数，不写数据库"),
+    force_wipe_logs: bool = typer.Option(
+        False, "--force-wipe-logs", help="当快照 practice_log.jsonl 为空时强制清空库内做题日志"
+    ),
     backups_dir: Path | None = typer.Option(None, "--backups-dir", help="备份目录"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
     json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
 ) -> None:
-    """从 human/*.jsonl 恢复人工资产（UPSERT 幂等恢复）。"""
+    """从 human/*.jsonl 恢复人工资产与外部错题（UPSERT 幂等恢复）。"""
     t0 = time.time()
     settings = load_settings(config_dir / "settings.yaml")
     actual_from_dir = from_dir if from_dir is not None else Path(settings.human_mirror.dir)
@@ -301,6 +304,8 @@ def human_restore(
                 backups_dir=actual_backups_dir,
                 dry_run=dry_run,
                 backups_keep=settings.human_mirror.backups_keep,
+                include_practice_log=settings.human_mirror.include_practice_log,
+                force_wipe_logs=force_wipe_logs,
             )
             duration_ms = int((time.time() - t0) * 1000)
             output_envelope(
@@ -963,9 +968,13 @@ def _run_cli_action(cmd_name: str, as_json: bool, fn: Any) -> None:
     try:
         res = fn()
         duration_ms = int((time.time() - t0) * 1000)
+        warnings = []
+        if isinstance(res, dict) and isinstance(res.get("warnings"), list):
+            warnings = [str(w) for w in res.get("warnings", [])]
         output_envelope(
             cmd_name,
             data=res,
+            warnings=warnings,
             meta={"duration_ms": duration_ms},
             as_json=as_json,
             exit_code=EXIT_OK,
@@ -1391,6 +1400,11 @@ def export_cmd(
             conn.close()
 
     _run_cli_action("export", json, _work)
+
+
+from shuati.cli.m3_commands import register_m3_commands as _register_m3_commands  # noqa: E402
+
+_register_m3_commands(app, taxonomy_app, _run_cli_action)
 
 
 if __name__ == "__main__":

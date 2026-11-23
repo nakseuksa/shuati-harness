@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from shuati.models.schemas import (
+    ExternalDiagnosisOutput,
     MergeJudgeBatchOutput,
     MultiSolutionJudgeOutput,
     PrerequisiteDagOutput,
@@ -129,6 +130,49 @@ def _default_payload_for_schema(schema: type[BaseModel], slot: str) -> dict[str,
         return {"edges": []}
     if schema is Stage4RefineBatchOutput:
         return {"decisions": []}
+    if schema is ExternalDiagnosisOutput:
+        return {
+            "visual_facts": "",
+            "visual_ambiguity_flag": False,
+            "visual_ambiguity_note": "",
+            "method_summary": "依据面积转化与设元方程求解",
+            "solution_markdown": "由题意可得答案：$24$。",
+            "final_answers": [
+                {
+                    "label": "主问",
+                    "answer_type": "NUMERIC",
+                    "verify_mode": "SYMBOLIC",
+                    "collection_mode": "SINGLE",
+                    "answer": "24",
+                    "sympy_expr": "24",
+                }
+            ],
+            "sympy_code": "def verify():\n    ans = 6 * 8 // 2\n    return {'主问': str(ans)}\n",
+            "steps": [
+                {
+                    "step_index": 1,
+                    "sub_goal": "建立几何量比例转化关系",
+                    "core_formula": "S = a * h / 2",
+                    "hint": "先观察已知底边与高的对应关系",
+                    "raw_l1": "平面几何",
+                    "raw_l2": "三角形面积与等高模型",
+                    "raw_l3": "底乘高除二模型",
+                }
+            ],
+            "abstract_skeleton": "利用平面图形面积比例关系建立方程求解未知量",
+            "primary_l1_module": "平面几何",
+            "secondary_l1_modules": [],
+            "matched_l2": ["三角形面积与等高模型"],
+            "thinking_methods": ["转化思想"],
+            "classic_motifs": ["等高模型"],
+            "trap_tags": [],
+            "difficulty": {
+                "C_concept_count": {"evidence": "单一等高模型直接求解", "score": 2},
+                "S_chain_length": {"evidence": "两步比例换算", "score": 1},
+                "T_trickiness": {"evidence": "条件显式无隐蔽陷阱", "score": 1},
+                "L_computation_load": {"evidence": "常规整数乘法运算", "score": 1},
+            },
+        }
     return None
 
 

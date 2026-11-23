@@ -402,7 +402,7 @@ def build_stage4_refine_messages(
         "判定标准：\n"
         "- CONTRASTIVE：表面情境/句式高度相似但核心解法或考点截然不同，适合做防定势辨析。\n"
         "- ISOMORPHIC：表皮不同或略有差异但核心数学结构与方法高度同构。\n"
-        "- SCAFFOLD：B 为 A 的前置拆解或简化支撑（A 包含 B 的核心技能且难度显著更高）。\n"
+        "- SCAFFOLD：source 为前置低阶铺垫子题 → target 为升维母题（target 包含 source 的核心技能且难度显著更高）。\n"
         "请为每对给出 `is_valid`（true/false）及简明教学说明 `pedagogical_note`，返回 Stage4RefineBatchOutput JSON。"
     )
     sanitized_pairs = [
@@ -427,4 +427,96 @@ def build_stage4_refine_messages(
     return [
         {"role": "system", "content": system_text},
         {"role": "user", "content": json.dumps({"pairs": sanitized_pairs}, ensure_ascii=False)},
+    ]
+
+
+def build_external_diagnose_messages(
+    *,
+    grade_subject: str,
+    question_text: str,
+    taxonomy_enum_text: str,
+    preprocessed_image_paths: list[Path] | None = None,
+    anchors_prompt_text: str = "",
+) -> list[dict[str, Any]]:
+    """外部新错题实时单路诊断消息构造（严格字段白名单，EXIF 矫正图片入 VLM，含 D4 标尺与黄金锚点）。"""
+    system_text = (
+        f"你是严谨的{grade_subject}学科错题诊断专家。请阅读题干与配图，严格输出一个合法 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下全部硬性规则：\n"
+        "1. `visual_facts` 必须排在 JSON 顶层首位（无图题置空字符串 \"\"），仅写客观视觉事实，严禁写入未画出的辅助线或推导结论。\n"
+        "2. 必须输出非空的 `method_summary`（一句话解法路线，≥2字）与 `solution_markdown`（完整推导过程，≥5字），严禁留空。\n"
+        "3. `sympy_code`（存在 `verify_mode == \"SYMBOLIC\"` 小问时必填，否则置 `null`）：仅允许导入 sympy / math / fractions；"
+        "严禁调用 sympify / parse_expr / lambdify / S(<字符串>) / eval / exec / open；"
+        "**必须定义 `def verify():`** 返回字典（键为归一后小问标签如 `'主问'` 或 `'(1)'`，值为通过真实运算得出的字符串或列表，禁止仅用 print(...) 或硬编码常量）。\n"
+        "4. `steps`（1~5 个有教学意义的逻辑推理步，合并纯四则代入计算）：\n"
+        "   - `step_index`: 从 1 开始连续递增整数；\n"
+        "   - `sub_goal`: 该步核心子目标；`core_formula`: 核心关系式/公式；`hint`: 启发提示（严禁直接剧透最终答案数值）；\n"
+        "   - `raw_l1`: 该步所属一级学科大模块名（**必须取自下方标准词表的 L1**，严禁写解说句子）；\n"
+        "   - `raw_l2`: 该步所属二级知识实体名（**优先取自下方标准词表的 L2**，严禁写解说句子）；\n"
+        "   - `raw_l3`: **4~14 字脱壳原子转化算子短语**（如“相遇路程和公式转化”“速度比与时间反比转换”），不含题干具体数字或人名道具，严禁写完整句子。\n"
+        "5. `abstract_skeleton`：抹除人名、道具与题干具体数字，用纯学科元语言概括“已知结构 → 核心转化 → 求解目标”。\n"
+        "6. `primary_l1_module`、`secondary_l1_modules`、`matched_l2` 必须严格从下方标准词表选取；`thinking_methods`（具体可操作技法，禁用“转化与化归/逻辑推理/综合法/分析法”等泛词）、`classic_motifs`（经典母题原型，宁缺毋滥）。\n"
+        "7. `trap_tags` **严禁自造中文自由文本**，仅允许从以下 6 个标准代码中选取（无匹配则置空数组 `[]`）：\n"
+        "   - `TRAP_DOMAIN_BOUNDARY`（边界端点与定义域遗漏）\n"
+        "   - `TRAP_SIGN_DIRECTION`（符号方向与正负/运动方向歧义）\n"
+        "   - `TRAP_EXTRANEOUS_ROOT`（增根虚解与几何不可行）\n"
+        "   - `TRAP_FRAME_SHIFT`（参考系转换与比例/基准量漂移）\n"
+        "   - `TRAP_APPROX_CONDITION`（近似条件滥用与循环论证）\n"
+        "   - `TRAP_ARITHMETIC_SLIP`（纯四则计算与抄写笔误）\n"
+        "8. 四维难度 `difficulty` 必须按学段最优标准解法并严格对照下方黄金锚点打分，每维**先写 `evidence`（可观测解题动作证据）再写整数 `score`**，严禁超界：\n"
+        "   - `C_concept_count`（概念与思维深度，**整数 1~4**）：1=单模型直推；2=单点变形或常规双考点串联；3=跨模块综合或隐式深层建模；4=非标构造或高阶竞赛洞察。\n"
+        "   - `S_chain_length`（逻辑推理链长，不含纯四则算术，**整数 1~3，严禁打 4**）：1=1~2 逻辑步；2=3~4 逻辑步；3=≥5 步或 ≥2 种独立情况分类讨论。\n"
+        "   - `T_trickiness`（信息隐蔽度与陷阱，**整数 1~3，严禁打 4**）：1=显式透明；2=含冗余干扰/隐含条件或常规图文转译；3=强反直觉、极端临界边界或连环陷阱。\n"
+        "   - `L_computation_load`（运算与审题负荷，**整数 1~3，严禁打 4**）：1=心算/短题干；2=常规纸笔多步演算；3=高繁复计算、多变量联立或高密度信息。\n\n"
+        "【输出 JSON 顶层结构模板】\n"
+        "{\n"
+        '  "visual_facts": "",\n'
+        '  "visual_ambiguity_flag": false,\n'
+        '  "visual_ambiguity_note": "",\n'
+        '  "method_summary": "一句话解法路线",\n'
+        '  "solution_markdown": "完整推导过程（Markdown/LaTeX）",\n'
+        '  "final_answers": [ ... ],\n'
+        '  "sympy_code": "def verify():\\n    ...\\n    return {\'主问\': str(ans)}\\n",\n'
+        '  "steps": [{"step_index": 1, "sub_goal": "...", "core_formula": "...", "hint": "...", "raw_l1": "标准L1", "raw_l2": "标准L2", "raw_l3": "4~14字原子算子"}],\n'
+        '  "abstract_skeleton": "去情境抽象骨架（无具体数字）",\n'
+        '  "primary_l1_module": "标准L1",\n'
+        '  "secondary_l1_modules": [],\n'
+        '  "matched_l2": ["标准L2"],\n'
+        '  "thinking_methods": ["具体技法"],\n'
+        '  "classic_motifs": ["经典母题"],\n'
+        '  "trap_tags": ["TRAP_FRAME_SHIFT"],\n'
+        '  "difficulty": {\n'
+        '    "C_concept_count": {"evidence": "...", "score": 2},\n'
+        '    "S_chain_length": {"evidence": "...", "score": 2},\n'
+        '    "T_trickiness": {"evidence": "...", "score": 2},\n'
+        '    "L_computation_load": {"evidence": "...", "score": 1}\n'
+        "  }\n"
+        "}\n\n"
+        "【`final_answers` 元素 `AnswerPart` 规范】\n"
+        f"{_ANSWER_PART_SPEC_TEXT}"
+    )
+    text_sections = [
+        f"【学段学科】{grade_subject}",
+        f"【当前标准词表】\n{taxonomy_enum_text}",
+    ]
+    if anchors_prompt_text.strip():
+        text_sections.append(f"【难度校准黄金锚点与词表约束】\n{anchors_prompt_text.strip()}")
+    text_sections.append(f"【题干】\n{question_text}")
+
+    user_parts: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": "\n\n".join(text_sections),
+        }
+    ]
+    imgs = preprocessed_image_paths or []
+    multi = len(imgs) >= 2
+    for idx, ipath in enumerate(imgs, start=1):
+        if multi:
+            user_parts.append({"type": "text", "text": f"【配图 {idx}】"})
+        user_parts.append(
+            {"type": "image_url", "image_url": {"url": _load_transposed_image_data_url(ipath)}}
+        )
+    user_content: Any = user_parts if imgs else user_parts[0]["text"]
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_content},
     ]

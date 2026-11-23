@@ -10,3 +10,6 @@ data/
 .coverage
 htmlcov/
 .env
+题库/
+.agents/
+.pi/

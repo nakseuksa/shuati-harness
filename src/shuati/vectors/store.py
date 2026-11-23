@@ -357,3 +357,88 @@ class VectorStore:
         fp = np.linspace(0.0, 1.0, len(lut), dtype=np.float64)
         pct = float(np.interp(float(sim), xp, fp))
         return max(0.0, min(1.0, pct))
+
+    def query_top_k(
+        self,
+        namespace: VectorNamespace,
+        query_vec: np.ndarray,
+        *,
+        scope_slug: str | None = None,
+        top_k: int = 20,
+        allowed_uids: set[str] | None = None,
+    ) -> list[tuple[str, float]]:
+        """只读内存 1 vs N 余弦检索（不修改任何 .npz 文件）。"""
+        ids, vecs = self.load_vectors(namespace, scope_slug=scope_slug)
+        if not ids or vecs.size == 0 or vecs.ndim != 2:
+            return []
+        q = np.asarray(query_vec, dtype=np.float32).reshape(-1)
+        if q.shape[0] != vecs.shape[1]:
+            return []
+        q_norm = float(np.linalg.norm(q))
+        if q_norm > 1e-12:
+            q = q / q_norm
+        sims = vecs @ q
+        results: list[tuple[str, float]] = []
+        for idx, uid in enumerate(ids):
+            if allowed_uids is not None and uid not in allowed_uids:
+                continue
+            results.append((uid, float(sims[idx])))
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[: max(1, int(top_k))]
+
+    async def upsert_vector(
+        self,
+        namespace: VectorNamespace,
+        item_id: str,
+        text: str,
+        client: EmbeddingClient,
+        *,
+        scope_slug: str | None = None,
+        stage: str = "INCREMENTAL_EMBED",
+    ) -> dict[str, int]:
+        """增量追加或更新单条向量（保持既有条目与 meta.quantiles 不变）。"""
+        path = self.npz_path(namespace, scope_slug)
+        target_hash = compute_text_hash(text)
+        with self._lock():
+            meta = self.load_meta()
+            recorded_model = str(meta.get("embedding_model") or "")
+            if recorded_model and recorded_model != client.model_name:
+                raise PreconditionError(
+                    f"PRECONDITION_FAILED: Embedding 模型已切换 ({recorded_model!r} -> {client.model_name!r})，"
+                    "请先执行 `shuati reindex --vectors --quantiles`。"
+                )
+            old_ids, old_hashes, old_vecs = self._load_raw_npz(path)
+
+        pos_map = {oid: i for i, oid in enumerate(old_ids)}
+        if item_id in pos_map and old_hashes[pos_map[item_id]] == target_hash:
+            dim = int(old_vecs.shape[1]) if old_vecs.ndim == 2 else 0
+            return {"total": len(old_ids), "reused": 1, "embedded": 0, "dimension": dim}
+
+        emb = await client.embed_texts([text or ""], stage=stage)
+        vec = emb[0]
+        with self._lock():
+            meta = self.load_meta()
+            old_ids, old_hashes, old_vecs = self._load_raw_npz(path)
+            pos_map = {oid: i for i, oid in enumerate(old_ids)}
+            if item_id in pos_map:
+                old_vecs[pos_map[item_id]] = vec
+                old_hashes[pos_map[item_id]] = target_hash
+                new_ids, new_hashes, new_vecs = old_ids, old_hashes, old_vecs
+            elif not old_ids or old_vecs.size == 0:
+                new_ids = [item_id]
+                new_hashes = [target_hash]
+                new_vecs = np.asarray([vec], dtype=np.float32)
+            else:
+                new_ids = [*old_ids, item_id]
+                new_hashes = [*old_hashes, target_hash]
+                new_vecs = np.vstack([old_vecs, vec.reshape(1, -1)]).astype(np.float32)
+            self._save_npz(path, new_ids, new_hashes, new_vecs)
+            meta["embedding_model"] = client.model_name
+            meta["dimension"] = int(new_vecs.shape[1])
+            self._save_meta(meta)
+            return {
+                "total": len(new_ids),
+                "reused": 0,
+                "embedded": 1,
+                "dimension": int(new_vecs.shape[1]),
+            }

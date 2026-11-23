@@ -758,3 +758,51 @@ def resolve_review_draft(
         ),
         "call_id": call_res.call_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# M3 统一业务服务导出契约（cli 与可选 mcp 唯一入口）
+# ---------------------------------------------------------------------------
+from shuati.core.composer import compose_quiz  # noqa: E402, F401
+from shuati.core.profiler import compute_learner_profile  # noqa: E402, F401
+from shuati.render.sheet_renderer import render_practice_sheet  # noqa: E402, F401
+from shuati.services.mistake import (  # noqa: E402, F401
+    diagnose_external_mistake_async,
+    ingest_external_mistake_async,
+)
+from shuati.services.practice import (  # noqa: E402, F401
+    apply_single_override,
+    browse_taxonomy,
+    check_answer_async,
+    create_learner,
+    get_related_questions,
+    hydrate_question_dict,
+    list_learners,
+    log_batch_practice,
+    log_practice,
+    resolve_learner_id,
+    search_questions,
+    use_learner,
+    void_practice_log,
+)
+from shuati.services.reveal import apply_reveal  # noqa: E402, F401
+
+
+def get_question_detail(
+    conn: sqlite3.Connection,
+    uid_or_id: str,
+    *,
+    assets_dir: Path | str = Path("data/assets/images"),
+    reveal: str = "quiz",
+    hint_level: int = 1,
+    include_visual_facts: bool = False,
+) -> dict[str, Any]:
+    """查询单题并执行防剧透裁剪。"""
+    uid = repository.resolve_question_uid(conn, uid_or_id)
+    raw = hydrate_question_dict(conn, uid, assets_dir=assets_dir)
+    return apply_reveal(
+        raw,
+        reveal=reveal,  # type: ignore[arg-type]
+        hint_level=hint_level,
+        include_visual_facts=include_visual_facts,
+    )

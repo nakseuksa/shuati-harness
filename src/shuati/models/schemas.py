@@ -75,20 +75,37 @@ class ReviewResolveOutput(BaseModel):
     sympy_code: str | None = None
 
 
+SeedTrapCode = Literal[
+    "TRAP_DOMAIN_BOUNDARY",
+    "TRAP_SIGN_DIRECTION",
+    "TRAP_EXTRANEOUS_ROOT",
+    "TRAP_FRAME_SHIFT",
+    "TRAP_APPROX_CONDITION",
+    "TRAP_ARITHMETIC_SLIP",
+]
+
+
 class DifficultyDimension(BaseModel):
-    """四维难度单项打分（evidence 必须置于 score 之前，CoT 优先）。"""
+    """四维难度单项打分（evidence 必须置于 score 之前，CoT 优先；C 维范围 [1, 4]）。"""
 
     evidence: str = Field(min_length=2)
     score: int = Field(ge=1, le=4)
 
 
+class DifficultyDimensionBounded3(BaseModel):
+    """四维难度 S/T/L 单项打分（evidence 必须置于 score 之前，CoT 优先；范围严格限定 [1, 3]）。"""
+
+    evidence: str = Field(min_length=2)
+    score: int = Field(ge=1, le=3)
+
+
 class DifficultyScoresOutput(BaseModel):
-    """Stage 2 四维难度打分结构化输出。"""
+    """Stage 2 四维难度打分结构化输出（D4 契约：C ∈ [1, 4]，S/T/L ∈ [1, 3]）。"""
 
     C_concept_count: DifficultyDimension
-    S_chain_length: DifficultyDimension
-    T_trickiness: DifficultyDimension
-    L_computation_load: DifficultyDimension
+    S_chain_length: DifficultyDimensionBounded3
+    T_trickiness: DifficultyDimensionBounded3
+    L_computation_load: DifficultyDimensionBounded3
 
 
 class Stage2StepOutput(BaseModel):
@@ -207,3 +224,34 @@ class Stage4RefineItem(BaseModel):
 
 class Stage4RefineBatchOutput(BaseModel):
     decisions: list[Stage4RefineItem]
+
+
+class ExternalDiagnosisOutput(BaseModel):
+    """外部新错题实时单路诊断输出（visual_facts 必须排首位）。"""
+
+    visual_facts: str = ""
+    visual_ambiguity_flag: bool = False
+    visual_ambiguity_note: str = ""
+    method_summary: str = Field(min_length=2)
+    solution_markdown: str = Field(min_length=5)
+    final_answers: list[AnswerPart] = Field(min_length=1)
+    sympy_code: str | None = None
+    steps: list[Stage2StepOutput] = Field(min_length=1)
+    abstract_skeleton: str = Field(min_length=5)
+    primary_l1_module: str = Field(min_length=1)
+    secondary_l1_modules: list[str] = Field(default_factory=list)
+    matched_l2: list[str] = Field(default_factory=list)
+    thinking_methods: list[str] = Field(default_factory=list)
+    classic_motifs: list[str] = Field(default_factory=list)
+    trap_tags: list[SeedTrapCode] = Field(default_factory=list)
+    difficulty: DifficultyScoresOutput
+
+    @model_validator(mode="after")
+    def validate_sympy_code_for_symbolic_parts(self) -> ExternalDiagnosisOutput:
+        has_symbolic = any(part.verify_mode == "SYMBOLIC" for part in self.final_answers)
+        if has_symbolic:
+            if not isinstance(self.sympy_code, str) or not self.sympy_code.strip():
+                raise ValueError("final_answers 中存在 verify_mode == 'SYMBOLIC' 的小问时，sympy_code 必须为非空字符串")
+            if "def verify(" not in self.sympy_code:
+                raise ValueError("sympy_code 必须定义 def verify(): 函数并返回各小问答案字典")
+        return self
