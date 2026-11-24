@@ -23,6 +23,8 @@ from shuati.config import (
 )
 from shuati.llm.prompt_builder import (
     STAGE1_PROMPT_VERSION,
+    STAGE2_PROMPT_VERSION,
+    UNIFIED_PROMPT_VERSION,
     build_external_diagnose_messages,
     build_merge_judge_messages,
     build_multi_solution_judge_messages,
@@ -134,12 +136,18 @@ def test_repo_prompt_seams_lint_list_and_load() -> None:
     assert lint_res["warnings"] == []
     assert "default.yaml" in lint_res["checked_files"]
     assert "subjects/primary_olympiad.yaml" in lint_res["checked_files"]
-    assert "snippets/primary_olympiad_l3_examples.md" in lint_res["checked_files"]
+    expected_snippets = {
+        "snippets/primary_olympiad_l3_examples.md",
+        "snippets/primary_olympiad_concepts_guide.md",
+        "snippets/primary_olympiad_visual_and_hint_examples.md",
+    }
+    assert expected_snippets.issubset(set(lint_res["checked_files"]))
 
     listing = list_prompt_seams(Path("config"))
     assert listing["default_exists"] is True
     assert any(s["slug"] == "primary_olympiad" for s in listing["subjects"])
-    assert any(sn["path"] == "snippets/primary_olympiad_l3_examples.md" for sn in listing["snippets"])
+    listed_snippet_paths = {sn["path"] for sn in listing["snippets"]}
+    assert expected_snippets.issubset(listed_snippet_paths)
 
     assert resolve_slug_for_subject("小学奥数", Path("config")) == "primary_olympiad"
     bundle = load_prompt_seams(config_dir=Path("config"), grade_subject="小学奥数")
@@ -148,9 +156,35 @@ def test_repo_prompt_seams_lint_list_and_load() -> None:
     assert set(REQUIRED_BLOCKS).issubset(bundle.blocks.keys())
     assert set(REQUIRED_STAGES).issubset(bundle.stages.keys())
     assert set(REQUIRED_PROMPT_VERSIONS).issubset(bundle.prompt_versions.keys())
+    assert bundle.prompt_versions == {
+        "stage1": "s1_v3",
+        "stage2": "s2_v2",
+        "unified": "unified-v2.0",
+        "stage3a": "s3a_v2",
+        "stage3c": "s3c_v2",
+        "stage3d": "s3d_v2",
+        "stage3e": "s3e_v2",
+        "stage4": "s4_v2",
+        "diagnose": "diag_v3",
+    }
     assert len(bundle.prompt_digest) == 16
     assert "等高模型面积比转化" in bundle.blocks["steps_and_socratic_hint"]
+    assert "观察锚点 + 启发反问" in bundle.blocks["steps_and_socratic_hint"]
+    assert "四要素可重构盲读协议" in bundle.blocks["visual_extraction"]
+    assert "八分之一圆" in bundle.blocks["visual_extraction"]
+    assert "鸡兔同笼" in bundle.blocks["abstraction_and_tagging"]
+    assert "TRAP_ARITHMETIC_SLIP" in bundle.blocks["abstraction_and_tagging"]
+    assert "同构核：" in bundle.stages["stage4_refine"]
+    assert "铺垫链：" in bundle.stages["stage4_refine"]
     assert bundle.sources["blocks.steps_and_socratic_hint"] == [
+        "default.yaml",
+        "subjects/primary_olympiad.yaml",
+    ]
+    assert bundle.sources["blocks.visual_extraction"] == [
+        "default.yaml",
+        "subjects/primary_olympiad.yaml",
+    ]
+    assert bundle.sources["blocks.abstraction_and_tagging"] == [
         "default.yaml",
         "subjects/primary_olympiad.yaml",
     ]
@@ -382,15 +416,39 @@ def test_stage2_unified_stage3d_and_preview_builders(tmp_path: Path) -> None:
     assert "LEAK_UID" not in s3d_msgs[1]["content"]
     assert "等高三角形面积比转化" in s3d_msgs[1]["content"]
 
-    # 4. render_prompt_preview
-    for st in ("stage1", "stage2", "unified", "diagnose", "stage3a", "stage3c", "stage3d", "stage3e", "stage4"):
+    # 4. render_prompt_preview（含全阶段别名与 flattened_schema）
+    expected_versions = {
+        "1": "s1_v3",
+        "stage1": "s1_v3",
+        "stage1_secondary": "s1_v3",
+        "stage1_judge": "s1_v3",
+        "judge_qualitative": "s1_v3",
+        "judge_multi": "s1_v3",
+        "2": "s2_v2",
+        "stage2": "s2_v2",
+        "unified": "unified-v2.0",
+        "diagnose": "diag_v3",
+        "3a": "s3a_v2",
+        "stage3a": "s3a_v2",
+        "3c": "s3c_v2",
+        "stage3c": "s3c_v2",
+        "3d": "s3d_v2",
+        "stage3d": "s3d_v2",
+        "merge_judge": "s3d_v2",
+        "3e": "s3e_v2",
+        "stage3e": "s3e_v2",
+        "4": "s4_v2",
+        "stage4": "s4_v2",
+    }
+    for st, exp_ver in expected_versions.items():
         preview = render_prompt_preview(stage=st, grade_subject="小学奥数", config_dir=Path("config"))
         assert preview["prompt_digest"] == u_bundle.prompt_digest
-        assert preview["prompt_version"]
+        assert preview["prompt_version"] == exp_ver
         assert len(preview["messages"]) == 2
-        if st in ("stage2", "unified"):
-            assert "flattened_schema" in preview
-            assert "$defs" not in preview["flattened_schema"]
+        assert "flattened_schema" in preview
+        flat_dump = json.dumps(preview["flattened_schema"], ensure_ascii=False)
+        assert '"$defs"' not in flat_dump
+        assert '"$ref"' not in flat_dump
 
     with pytest.raises(ValueError, match="未知"):
         render_prompt_preview(stage="unknown_stage", grade_subject="小学奥数", config_dir=Path("config"))
@@ -410,7 +468,9 @@ def test_existing_builders_backward_compatible_and_profile_aware(tmp_path: Path)
         encoding="utf-8",
     )
 
-    assert STAGE1_PROMPT_VERSION == "s1_v2"
+    assert STAGE1_PROMPT_VERSION == "s1_v3"
+    assert STAGE2_PROMPT_VERSION == "s2_v2"
+    assert UNIFIED_PROMPT_VERSION == "unified-v2.0"
     inp = Stage1Input(
         question_uid="primary_olympiad:ch01:ch01_001",
         grade_subject="小学奥数",
@@ -487,3 +547,29 @@ def test_existing_builders_backward_compatible_and_profile_aware(tmp_path: Path)
         prompt_profile="custom_prof",
     )
     assert "CUSTOM_PROFILE_MARKER_XYZ" in diag_msgs[0]["content"]
+
+
+def test_try_load_seam_bundle_fallback_when_tmp_config_missing_prompts(tmp_path: Path) -> None:
+    empty_cfg = tmp_path / "empty_config"
+    empty_cfg.mkdir(parents=True)
+    inp = Stage1Input(
+        question_uid="primary_olympiad:ch01:ch01_001",
+        grade_subject="小学奥数",
+        question_text="求 1+2。",
+        has_images=False,
+    )
+    s1_msgs = build_stage1_messages(
+        inp,
+        role="PRIMARY",
+        assets_dir=tmp_path,
+        config_dir=empty_cfg,
+        prompt_profile=None,
+    )
+    assert "四要素可重构盲读协议" in s1_msgs[0]["content"]
+    s2_msgs = build_stage2_messages(
+        grade_subject="小学奥数",
+        question_text="求面积。",
+        config_dir=empty_cfg,
+        prompt_profile=None,
+    )
+    assert "等高模型面积比转化" in s2_msgs[0]["content"]

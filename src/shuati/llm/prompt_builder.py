@@ -24,14 +24,25 @@ from pydantic import BaseModel
 
 from shuati.llm.seam_loader import ResolvedSeamBundle, load_prompt_seams
 from shuati.models.schemas import (
+    ExternalDiagnosisOutput,
+    MergeJudgeBatchOutput,
+    MultiSolutionJudgeOutput,
+    PrerequisiteDagOutput,
+    QualitativeJudgeOutput,
     Stage1Input,
+    Stage1PrimaryOutput,
+    Stage1SecondaryOutput,
     Stage2OnlyOutput,
+    Stage3cBatchMappingOutput,
+    Stage3dClusterAssignOutput,
+    Stage4RefineBatchOutput,
+    TaxonomyProposeOutput,
     UnifiedS1S2Output,
 )
 
-STAGE1_PROMPT_VERSION = "s1_v2"
-STAGE2_PROMPT_VERSION = "s2_v1"
-UNIFIED_PROMPT_VERSION = "unified-v1.0"
+STAGE1_PROMPT_VERSION = "s1_v3"
+STAGE2_PROMPT_VERSION = "s2_v2"
+UNIFIED_PROMPT_VERSION = "unified-v2.0"
 
 _ANSWER_PART_SPEC_TEXT = """`final_answers` 为 `AnswerPart` 非空数组（**严禁改名为 `questions`、`answers` 或其他键**）。每个 `AnswerPart` 必须包含以下字段：
 - `label`: 小问标签，仅允许 `"主问"` 或 `"(1)"`, `"(2)"`...；严禁自造 `"(1)-1"`、`"(1)-k"` 等子标签。
@@ -98,6 +109,13 @@ def _try_load_seam_bundle(
     if default_yaml.is_file():
         return load_prompt_seams(
             config_dir=config_dir,
+            grade_subject=grade_subject,
+            profile=None,
+        )
+    repo_config_dir = Path(__file__).resolve().parents[3] / "config"
+    if (repo_config_dir / "prompts" / "default.yaml").is_file():
+        return load_prompt_seams(
+            config_dir=repo_config_dir,
             grade_subject=grade_subject,
             profile=None,
         )
@@ -297,7 +315,7 @@ def build_stage1_messages(
     )
 
     sympy_rule = (
-        "\n7. `sympy_code` 规范（存在 `verify_mode == \"SYMBOLIC\"` 小问时必填非空字符串，否则置 `null`）："
+        "\n6. `sympy_code` 规范（存在 `verify_mode == \"SYMBOLIC\"` 小问时必填非空字符串，否则置 `null`）："
         "仅允许导入 sympy / math / fractions；严禁调用 sympify / parse_expr / lambdify / S(<字符串>) / eval / exec / open；"
         "必须定义 def verify(): 返回字典，键为归一后的小问标签（如 '主问' 或 '(1)'），值必须经由真实数学运算得出（禁止硬编码常量返回）。"
         if role == "PRIMARY"
@@ -344,17 +362,15 @@ def build_stage1_messages(
     system_text = (
         f"你是一位严谨的{inp.grade_subject}学科解题专家。{role_desc}\n"
         "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下硬性规则：\n"
-        "1. JSON 字段顺序中 `visual_facts` 必须排在首位！若存在配图，`visual_facts` 须客观描述图中全部可见元素"
-        "（顶点字母、线面位置关系、垂直/平行/等长/角度标注、阴影区域封闭边界与包含关系）；"
-        "`visual_facts` 严禁写入原图未画出的辅助线、未标注的几何性质或任何推导结论。无图题 `visual_facts` 置空字符串 \"\"。\n"
-        "2. 若图片模糊、标注缺失或阴影边界有歧义，必须将 `visual_ambiguity_flag` 设为 true 并在 `visual_ambiguity_note` 说明。\n"
-        "3. 小问标签归一规范：题干有显式编号时统一使用 \"(1)\", \"(2)\"...；单问使用 \"主问\"；"
+        "1. JSON 字段顺序中 `visual_facts` 必须排在首位！无图题置空字符串 \"\"；"
+        "有图时仅客观描述图中可见元素，严禁写入未画出的辅助线或推导结论，歧义时置 `visual_ambiguity_flag=true` 并在 `visual_ambiguity_note` 说明。\n"
+        "2. 小问标签归一规范：题干有显式编号时统一使用 \"(1)\", \"(2)\"...；单问使用 \"主问\"；"
         "无编号“计算+说理”复合问拆为 \"(1)\" 与 \"(2)\"；严禁自造 \"(1)-1\"、\"(1)-k\" 等子小问标签！\n"
-        "4. 单值小问使用 `collection_mode: \"SINGLE\"`（此时 `items` 为 `null`，且若为 `SYMBOLIC` 则 `sympy_expr` 必须放在 `AnswerPart` 顶层）；"
+        "3. 单值小问使用 `collection_mode: \"SINGLE\"`（此时 `items` 为 `null`，且若为 `SYMBOLIC` 则 `sympy_expr` 必须放在 `AnswerPart` 顶层）；"
         "同一小问多空或多值使用 `ORDERED_TUPLE` / `UNORDERED_MULTISET` / `LABELED_MAP` 并装入非空 `items` 数组。\n"
-        "5. `answer_type` 与 `verify_mode` 必须严格匹配："
+        "4. `answer_type` 与 `verify_mode` 必须严格匹配："
         "NUMERIC/EXPRESSION/RATIO/SET_OR_INTERVAL -> SYMBOLIC；CHOICE/SYMBOL_FILL -> EXACT；TEXT/PROOF -> QUALITATIVE。\n"
-        "6. 数值约定：题干未明确指定 π 近似值（如“π 取 3.14”）时，`sympy_expr` 必须保留精确符号 pi、sqrt(...) 或分数。"
+        "5. 数值约定：题干未明确指定 π 近似值（如“π 取 3.14”）时，`sympy_expr` 必须保留精确符号 pi、sqrt(...) 或分数。"
         f"{sympy_rule}{seam_section}\n\n"
         "【输出 JSON 结构模板】\n"
         f"{top_keys_desc}\n"
@@ -407,7 +423,7 @@ def build_qualitative_judge_messages(
     seam_tail = f"\n{judge_seam}" if judge_seam else ""
 
     system_text = (
-        "你是严谨的理科阅卷裁判。请判断两位解题者对同一小问的定性表述或作图操作方法是否在核心科学结论与方法上等价。\n"
+        "你是严谨的理科阅卷裁判。请判断两位解题者对同一小问的定性表述或作图操作是否在核心科学结论与数理依据上等价。\n"
         "请严格输出 JSON：{\"equivalent\": bool, \"confidence\": \"HIGH\"|\"MEDIUM\"|\"LOW\", \"reason\": \"...\"}。"
         f"{seam_tail}"
     )
@@ -442,8 +458,8 @@ def build_multi_solution_judge_messages(
     seam_tail = f"\n{judge_seam}" if judge_seam else ""
 
     system_text = (
-        "你是竞赛数学教研专家。请判断以下两份正确解答是否属于本质不同的解题路线（如几何割补构造 vs 代数方程/相似比例），"
-        "而非仅仅是算式顺序或文字措辞的微小差异。\n"
+        "你是竞赛数学教研专家。请判断以下两份正确解答是否属于本质不同的解题路线（跨核心数学范式/模型），"
+        "而非伪多解差异。\n"
         "请严格输出 JSON：{\"is_distinct_method\": bool, \"reason\": \"...\"}。"
         f"{seam_tail}"
     )
@@ -558,16 +574,13 @@ def build_stage2_messages(
     system_text = (
         f"你是严谨的{grade_subject}学科题库深度拆解与难度标定专家（Stage 2）。\n"
         f"{override_section}\n\n"
-        "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下硬性规则：\n"
-        "1. `steps`（1~5 个有教学意义的逻辑推理步，合并纯四则代入计算）：\n"
-        "   - `step_index`: 从 1 开始连续递增整数；\n"
-        "   - `sub_goal`: 该步核心子目标；`core_formula`: 核心关系式/公式；`hint`: 启发提示（严禁直接剧透最终答案数值）；\n"
-        "   - `raw_l1`: 该步所属一级学科大模块名；`raw_l2`: 该步所属二级知识实体名；\n"
-        "   - `raw_l3`: **4~14 字脱壳原子转化算子短语**，严禁包含题干具体数字、人名道具或整句解说。\n"
-        "2. `abstract_skeleton`：抹除人名、道具与题干具体数字，用纯学科元语言概括“已知结构 → 核心转化 → 求解目标”。\n"
-        "3. `thinking_methods`（具体可操作技法，禁用“转化与化归/逻辑推理/综合法/分析法”等万金油泛词）、`classic_motifs`（经典母题，宁缺毋滥）。\n"
-        f"4. {_TRAP_ENUM_SPEC_TEXT}\n"
-        f"5. {_DIFFICULTY_RUBRIC_SPEC_TEXT}{seam_section}\n\n"
+        "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下硬性结构契约（教研细则见下方【学科与阶段指导】）：\n"
+        "1. `steps`（1~5 个有教学意义的逻辑推理步，`step_index` 从 1 连续递增）：\n"
+        "   - 必填 `sub_goal`、`core_formula`、`hint`（设问式零泄密，严禁剧透得数）、`raw_l1`、`raw_l2`；\n"
+        "   - `raw_l3`: **4~14 字脱壳原子转化算子短语**，严禁包含题干具体数字（含汉字数字参数）、人名道具或整句解说。\n"
+        "2. `abstract_skeleton`（三段式去情境抽象骨架）、`primary_l1_module`、`secondary_l1_modules`、`thinking_methods`（1~3 个具体可操作技法，禁用万金油泛词）、`classic_motifs`（仅公认经典母题原型，未命中置 `[]`）。\n"
+        f"3. {_TRAP_ENUM_SPEC_TEXT}\n"
+        f"4. {_DIFFICULTY_RUBRIC_SPEC_TEXT}{seam_section}\n\n"
         "【输出 JSON 结构模板】\n"
         "{\n"
         '  "task_id": "原样回填 task_id",\n'
@@ -705,17 +718,16 @@ def build_unified_s1_s2_messages(
 
     system_text = (
         f"你是严谨的{grade_subject}学科知识编译器专家（UNIFIED_S1_S2 合一求解与深度拆解）。\n"
-        "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下全部硬性契约：\n"
-        "1. `visual_facts` 必须仅客观描述图中可见元素（顶点、位置关系、标注、阴影边界），严禁写入未画出的辅助线或推导结论；无图题置 `\"\"`。"
-        "若图片模糊或存在歧义，设 `visual_ambiguity_flag=true` 并在 `visual_ambiguity_note` 说明。\n"
-        "2. `method_summary`（一句话解法路线，≥2字）与 `solution_markdown`（完整推导过程，≥5字）必填非空。\n"
+        "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下全部硬性契约（教研细则见下方【学科与接缝规范】）：\n"
+        "1. `visual_facts` 必须置于顶层内容字段首位（无图题置 `\"\"`），仅客观描述可见元素，严禁写入未画出的辅助线或推导结论；"
+        "仅在原图模糊或边界/标注存疑时设 `visual_ambiguity_flag=true` 并在 `visual_ambiguity_note` 说明。\n"
+        "2. `method_summary`（≥2字）与 `solution_markdown`（≥5字）必填非空。\n"
         "3. `sympy_code`（存在 `verify_mode == \"SYMBOLIC\"` 小问时必填，否则置 `null`）：仅允许导入 sympy / math / fractions；"
         "严禁调用 sympify / parse_expr / lambdify / S(<字符串>) / eval / exec / open；"
         "**必须定义 `def verify():`** 返回字典（键为归一后小问标签如 `'主问'` 或 `'(1)'`，值为通过真实运算得出的结果，禁止硬编码常量返回）。\n"
         f"4. 数值与标签规范：{pi_rule} 小问标签仅允许 `\"主问\"` 或 `\"(1)\"`, `\"(2)\"`...，禁止自造 `\"(1)-1\"` 或 `\"(1)-k\"`。\n"
-        "5. `steps`（1~5 个有教学意义的逻辑推理步）：`step_index` 从 1 连续递增；`hint` 严禁直接剧透终值；"
-        "`raw_l3` 必须是 **4~14 字脱壳原子转化算子短语**，不含具体数字或人名道具。\n"
-        "6. `abstract_skeleton` 必须完全抹除人名、道具与具体数字；`thinking_methods` 禁用万金油泛词。\n"
+        "5. `steps`（1~5 步，`step_index` 从 1 连续递增）：`hint` 设问式零泄密；`raw_l3` 必须是 **4~14 字脱壳原子转化算子短语**，不含具体数字或人名道具。\n"
+        "6. `abstract_skeleton`、`thinking_methods`（1~3 个具体技法，禁用万金油泛词）、`classic_motifs`（未命中置 `[]`）严格遵循下方接缝规范。\n"
         f"7. {_TRAP_ENUM_SPEC_TEXT}\n"
         f"8. {_DIFFICULTY_RUBRIC_SPEC_TEXT}\n\n"
         f"【学科与接缝规范（digest={bundle.prompt_digest}）】\n"
@@ -803,9 +815,8 @@ def build_taxonomy_propose_messages(
         f"自底向上归纳一套干净、互斥、层次清晰的二层分类词表（{module_range[0]}~{module_range[1]} 个一级大模块 L1，"
         f"合计 {l2_range[0]}~{l2_range[1]} 个二级知识实体 L2）。\n"
         "严格要求：\n"
-        "1. 每个 L1 内部 L2 实体名称禁止重复或高度同义；所有别名收录在 `aliases`。\n"
-        "2. 覆盖几何、数论、组合、应用题/行程、计算/代数等主要分支中实际出现的高频簇。\n"
-        "3. 仅返回符合 TaxonomyProposeOutput 的合法 JSON 对象。"
+        "1. L1 按核心研究对象正交划分，严禁交叉伪大类；L1 内部 L2 名称禁止重复或高度同义，别名收入 `aliases`。\n"
+        "2. 仅返回符合 TaxonomyProposeOutput 的合法 JSON 对象。"
         f"{seam_tail}"
     )
     payload = {
@@ -842,8 +853,8 @@ def build_stage3c_mapping_messages(
         "你是理科题库知识词表对齐专家。请结合题目抽象骨架与各步骤原始标签，"
         "将一批脱敏题目中的每一步映射至标准词表中的 `(mapped_l1, mapped_l2)`，并判定整题 `primary_l1_module` 与 `secondary_l1_modules`。\n"
         "严格要求：\n"
-        "1. `primary_l1_module` 与每步 `mapped_l1` 必须严格取自给定标准词表的 L1。\n"
-        "2. `mapped_l2` 优先取自对应 L1 下的标准 L2；仅当确实无可归入 L2 时才填写最接近或简明新 L2 名并设 `is_novel_l2=true`。\n"
+        "1. `primary_l1_module`、`secondary_l1_modules` 与每步 `mapped_l1` 必须严格取自给定标准词表的 L1。\n"
+        "2. `mapped_l2` 优先向上归入同 L1 下语义最贴近的标准 L2；仅当同 L1 下全部 L2 均无法覆盖时才设 `is_novel_l2=true`。\n"
         "3. 保留每题原始 `task_item_id` 与每步 `step_index`，返回符合 Stage3cBatchMappingOutput 的合法 JSON 对象。"
         f"{seam_tail}"
     )
@@ -898,14 +909,12 @@ def build_stage3d_cluster_assign_messages(
     lo, hi = int(target_canonical_range[0]), int(target_canonical_range[1])
     system_text = (
         "你是理科知识图谱原子算子归纳专家（Stage 3d Cluster-then-Assign）。"
-        f"给定严格限定在「{grade_subject} / {l1_module} / {l2_entity}」单 L2 域内的全部去重 `raw_l3` 短语及出现频次，"
-        f"请归纳提炼出 {lo}~{hi} 个标准原子转化算子（`canonical_name`），并将每一条输入 `raw_l3` 精确映射归入其中一个标准算子。\n"
+        f"给定严格限定在「{grade_subject} / {l1_module} / {l2_entity}」作用域内的全部去重词条及频次，"
+        f"请归纳提炼出 {lo}~{hi} 个标准 `canonical_name`，并将每一条输入词条精确映射归入其中一个标准项。\n"
         "严格要求：\n"
-        "1. 每个 `canonical_name` 必须是 **4~14 字脱壳原子转化算子短语**，严禁夹带具体数字、人名道具或万金油泛词。\n"
-        "2. 仅当两条 `raw_l3` 在该 L2 域内属于同一核心方法/转化动作（仅表述/语序/繁简差异）时归入同一标准算子；"
-        "存在前置条件或核心模型差异（如“等高模型”vs“蝴蝶模型”）必须分立，严禁过度合并。\n"
-        "3. 输入清单中的所有 `raw_l3` 必须 100% 覆盖分配，不得遗漏或保留未分配孤岛。\n"
-        "4. 仅返回合法 JSON 对象：`{\"canonical_operators\": [{\"canonical_name\": \"...\", \"rationale\": \"...\", \"members\": [\"...\"]}], \"assignments\": {\"原raw_l3\": \"canonical_name\"}}`。"
+        "1. 严格遵循下方【算子归纳补充规范】的三态作用域命名协议（常规域 4~14 字脱壳算子 / MOTIF 公认母题正名 / METHOD 4~6 字技法名）及宁独不混原则。\n"
+        "2. 严禁创建“其他/杂项”垃圾桶簇；输入清单中的所有词条必须 100% 覆盖分配，不得遗漏。\n"
+        "3. 仅返回合法 JSON 对象：`{\"canonical_operators\": [{\"canonical_name\": \"...\", \"rationale\": \"...\", \"members\": [\"...\"]}], \"assignments\": {\"原raw_l3\": \"canonical_name\"}}`。"
         f"{seam_tail}"
     )
 
@@ -970,9 +979,8 @@ def build_merge_judge_messages(
         "你是理科知识点与解题概念去重裁判。给定同一严格作用域内的候选同义词对，"
         "请判断每一对是否本质上指代同一知识点/方法/母题。\n"
         "严格要求：\n"
-        "1. 仅当两者数学含义等价、仅为表述/语序/简繁差异时设 `should_merge=true`，并给出最规范凝练的 `canonical_name`。\n"
-        "2. 若存在关键条件、限定场景或适用对象差异（如“等高模型”vs“蝴蝶模型”），必须设 `should_merge=false`。\n"
-        "3. 返回符合 MergeJudgeBatchOutput 的合法 JSON 对象。"
+        "1. 仅当两者数学含义等价、仅为表述/语序/简繁差异时设 `should_merge=true`，并按下方【归并补充准则】给出规范 `canonical_name`；存在核心条件或模型差异必须设 `should_merge=false`。\n"
+        "2. 返回符合 MergeJudgeBatchOutput 的合法 JSON 对象。"
         f"{seam_tail}"
     )
     user_payload = {
@@ -1013,11 +1021,11 @@ def build_prerequisite_dag_messages(
     seam_tail = f"\n\n【先修图谱补充】\n{stage_seam}" if stage_seam else ""
 
     system_text = (
-        "你是理科课程先修依赖分析师。给定解题步骤中观察到的前置→后继 L2 转移频次与标准词表，"
+        "你是理科课程先修依赖分析师。给定解题步骤中观察到的转移频次与标准词表，"
         "请提炼真正具有教学先修关系（掌握 source 才能顺利学习/应用 target）的 L2 有向边列表。\n"
         "严格要求：\n"
         "1. `source_l1/source_l2` 与 `target_l1/target_l2` 必须严格取自标准词表。\n"
-        "2. 严禁自环；严格保证边集构成有向无环图（DAG）。\n"
+        "2. 严禁自环与有向环（DAG），严禁步序倒置伪边与偶然共现边。\n"
         "3. 返回符合 PrerequisiteDagOutput 的合法 JSON 对象。"
         f"{seam_tail}"
     )
@@ -1050,11 +1058,9 @@ def build_stage4_refine_messages(
 
     system_text = (
         "你是理科题库教研拓扑质检员。请审核以下候选题目关系对（已脱敏，不含题号与来源）。\n"
-        "判定标准：\n"
-        "- CONTRASTIVE：表面情境/句式高度相似但核心解法或考点截然不同，适合做防定势辨析。\n"
-        "- ISOMORPHIC：表皮不同或略有差异但核心数学结构与方法高度同构。\n"
-        "- SCAFFOLD（D-Audit-5 方向锁死）：source 必须为降阶前置铺垫子题（低 Elo） → target 必须为升维母题（高 Elo，target 包含 source 的核心技能且难度显著更高）。\n"
-        "请为每对给出 `is_valid`（true/false）及简明教学说明 `pedagogical_note`，返回 Stage4RefineBatchOutput JSON。"
+        "硬性方向与输出契约：\n"
+        "- `SCAFFOLD`（D-Audit-5 方向锁死）：`source = 降阶铺垫子题（低 Elo） → target = 升维母题（高 Elo）`，必须满足真子步包含。\n"
+        "- 为每对给出 `is_valid`（true/false）及考后复盘 `pedagogical_note`（无效置 `\"\"`，有效严格按下方【精裁补充规则】对应句式书写），返回 Stage4RefineBatchOutput JSON。"
         f"{seam_tail}"
     )
     sanitized_pairs = [
@@ -1112,22 +1118,18 @@ def build_external_diagnose_messages(
     seam_section = f"\n\n【学科与接缝补充规范】\n{seam_notes}" if seam_notes else ""
 
     system_text = (
-        f"你是严谨的{grade_subject}学科错题诊断专家。请阅读题干与配图，严格输出一个合法 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下全部硬性规则：\n"
+        f"你是严谨的{grade_subject}学科错题诊断专家。请阅读题干与配图，严格输出一个合法 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下全部硬性契约（教研细则见下方【学科与接缝补充规范】）：\n"
         "1. `visual_facts` 必须排在 JSON 顶层首位（无图题置空字符串 \"\"），仅写客观视觉事实，严禁写入未画出的辅助线或推导结论。\n"
-        "2. 必须输出非空的 `method_summary`（一句话解法路线，≥2字）与 `solution_markdown`（完整推导过程，≥5字），严禁留空。\n"
+        "2. 必须输出非空的 `method_summary`（≥2字）与 `solution_markdown`（≥5字），严禁留空。\n"
         "3. `sympy_code`（存在 `verify_mode == \"SYMBOLIC\"` 小问时必填，否则置 `null`）：仅允许导入 sympy / math / fractions；"
         "严禁调用 sympify / parse_expr / lambdify / S(<字符串>) / eval / exec / open；"
         "**必须定义 `def verify():`** 返回字典（键为归一后小问标签如 `'主问'` 或 `'(1)'`，值为通过真实运算得出的字符串或列表，禁止仅用 print(...) 或硬编码常量）。\n"
-        "4. `steps`（1~5 个有教学意义的逻辑推理步，合并纯四则代入计算）：\n"
-        "   - `step_index`: 从 1 开始连续递增整数；\n"
-        "   - `sub_goal`: 该步核心子目标；`core_formula`: 核心关系式/公式；`hint`: 启发提示（严禁直接剧透最终答案数值）；\n"
-        "   - `raw_l1`: 该步所属一级学科大模块名（**必须取自下方标准词表的 L1**，严禁写解说句子）；\n"
-        "   - `raw_l2`: 该步所属二级知识实体名（**优先取自下方标准词表的 L2**，严禁写解说句子）；\n"
-        "   - `raw_l3`: **4~14 字脱壳原子转化算子短语**（如“相遇路程和公式转化”“速度比与时间反比转换”），不含题干具体数字或人名道具，严禁写完整句子。\n"
-        "5. `abstract_skeleton`：抹除人名、道具与题干具体数字，用纯学科元语言概括“已知结构 → 核心转化 → 求解目标”。\n"
-        "6. `primary_l1_module`、`secondary_l1_modules`、`matched_l2` 必须严格从下方标准词表选取；`thinking_methods`（具体可操作技法，禁用“转化与化归/逻辑推理/综合法/分析法”等泛词）、`classic_motifs`（经典母题原型，宁缺毋滥）。\n"
-        f"7. {_TRAP_ENUM_SPEC_TEXT}\n"
-        f"8. {_DIFFICULTY_RUBRIC_SPEC_TEXT}{seam_section}\n\n"
+        "4. `steps`（1~5 个有教学意义的逻辑推理步，`step_index` 从 1 连续递增）：\n"
+        "   - 必填 `sub_goal`、`core_formula`、`hint`（设问式零泄密，严禁剧透终值）；\n"
+        "   - `raw_l1`（**必须取自下方标准词表的 L1**）、`raw_l2`（**优先取自下方标准词表的 L2**）、`raw_l3`（**4~14 字脱壳原子转化算子短语**，严禁数字/人名道具/整句解说）。\n"
+        "5. `abstract_skeleton`（三段式去情境抽象骨架）、`primary_l1_module`、`secondary_l1_modules`、`matched_l2` 严格从下方标准词表选取；`thinking_methods`（1~3 个具体技法，禁用万金油泛词）、`classic_motifs`（未命中置 `[]`）。\n"
+        f"6. {_TRAP_ENUM_SPEC_TEXT}\n"
+        f"7. {_DIFFICULTY_RUBRIC_SPEC_TEXT}{seam_section}\n\n"
         "【输出 JSON 顶层结构模板】\n"
         "{\n"
         '  "visual_facts": "",\n'
@@ -1204,7 +1206,7 @@ def render_prompt_preview(
     version_key: str
     schema_cls: type[BaseModel] | None = None
 
-    if norm_stage in ("stage1", "s1", "stage1_primary", "stage1_secondary"):
+    if norm_stage in ("1", "stage1", "s1", "stage1_primary", "stage1_secondary"):
         role: Literal["PRIMARY", "SECONDARY"] = "SECONDARY" if norm_stage == "stage1_secondary" else "PRIMARY"
         raw_opts = payload.get("options")
         stage1_opts: dict[str, str] = (
@@ -1227,7 +1229,32 @@ def render_prompt_preview(
             prompt_profile=prompt_profile,
         )
         version_key = "stage1"
-    elif norm_stage in ("stage2", "s2", "stage2_only"):
+        schema_cls = Stage1SecondaryOutput if role == "SECONDARY" else Stage1PrimaryOutput
+    elif norm_stage in ("stage1_judge", "judge_qualitative", "qualitative_judge"):
+        messages = build_qualitative_judge_messages(
+            label=str(payload.get("label") or "(2)"),
+            answer_a=str(payload.get("answer_a") or "连接正方形对角线分割面积"),
+            answer_b=str(payload.get("answer_b") or "过顶点作对角线平分图形"),
+            question_text=str(payload.get("question_text") or "请说明分割正方形面积的作法。"),
+            grade_subject=grade_subject,
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage1"
+        schema_cls = QualitativeJudgeOutput
+    elif norm_stage in ("judge_multi", "multi_solution_judge"):
+        messages = build_multi_solution_judge_messages(
+            summary_a=str(payload.get("summary_a") or "等高模型面积比例法"),
+            sol_a=str(payload.get("sol_a") or "利用共高三角形底边比等于面积比求解。"),
+            summary_b=str(payload.get("summary_b") or "设未知数列一次方程求解"),
+            sol_b=str(payload.get("sol_b") or "设阴影面积为 x，依总面积列方程求解。"),
+            grade_subject=grade_subject,
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage1"
+        schema_cls = MultiSolutionJudgeOutput
+    elif norm_stage in ("2", "stage2", "s2", "stage2_only"):
         messages = build_stage2_messages(
             grade_subject=grade_subject,
             question_text=str(payload.get("question_text") or "如图，正方形 ABCD 边长为 4，求阴影部分面积。"),
@@ -1277,7 +1304,8 @@ def render_prompt_preview(
             prompt_profile=prompt_profile,
         )
         version_key = "diagnose"
-    elif norm_stage in ("stage3a", "propose", "stage3_propose"):
+        schema_cls = ExternalDiagnosisOutput
+    elif norm_stage in ("3a", "stage3a", "propose", "stage3_propose"):
         messages = build_taxonomy_propose_messages(
             grade_subject=grade_subject,
             clusters_summary=list(payload.get("clusters_summary") or [{"cluster_id": 0, "total_freq": 10, "representative": "行程问题 / 相遇问题"}]),
@@ -1286,7 +1314,8 @@ def render_prompt_preview(
             prompt_profile=prompt_profile,
         )
         version_key = "stage3a"
-    elif norm_stage in ("stage3c", "stage3c_mapping"):
+        schema_cls = TaxonomyProposeOutput
+    elif norm_stage in ("3c", "stage3c", "stage3c_mapping"):
         messages = build_stage3c_mapping_messages(
             grade_subject=grade_subject,
             taxonomy_enum_text=str(payload.get("taxonomy_enum_text") or "- 行程问题: 相遇与追及"),
@@ -1295,7 +1324,8 @@ def render_prompt_preview(
             prompt_profile=prompt_profile,
         )
         version_key = "stage3c"
-    elif norm_stage in ("stage3d", "stage3d_cluster_assign"):
+        schema_cls = Stage3cBatchMappingOutput
+    elif norm_stage in ("3d", "stage3d", "stage3d_cluster_assign"):
         messages = build_stage3d_cluster_assign_messages(
             grade_subject=grade_subject,
             l1_module=str(payload.get("l1_module") or "平面几何"),
@@ -1305,6 +1335,7 @@ def render_prompt_preview(
             prompt_profile=prompt_profile,
         )
         version_key = "stage3d"
+        schema_cls = Stage3dClusterAssignOutput
     elif norm_stage in ("merge_judge",):
         messages = build_merge_judge_messages(
             target_kind=str(payload.get("target_kind") or "KNOWLEDGE_NODE"),
@@ -1315,7 +1346,8 @@ def render_prompt_preview(
             prompt_profile=prompt_profile,
         )
         version_key = "stage3d"
-    elif norm_stage in ("stage3e", "stage3e_prerequisite"):
+        schema_cls = MergeJudgeBatchOutput
+    elif norm_stage in ("3e", "stage3e", "stage3e_prerequisite"):
         messages = build_prerequisite_dag_messages(
             grade_subject=grade_subject,
             taxonomy_enum_text=str(payload.get("taxonomy_enum_text") or "- 平面几何: 等高模型, 蝴蝶模型"),
@@ -1324,7 +1356,8 @@ def render_prompt_preview(
             prompt_profile=prompt_profile,
         )
         version_key = "stage3e"
-    elif norm_stage in ("stage4", "stage4_refine"):
+        schema_cls = PrerequisiteDagOutput
+    elif norm_stage in ("4", "stage4", "stage4_refine"):
         messages = build_stage4_refine_messages(
             candidate_pairs=list(payload.get("candidate_pairs") or [{"pair_id": "p1", "relation_type": "SCAFFOLD", "source_text": "基础铺垫题", "target_text": "综合母题"}]),
             grade_subject=grade_subject,
@@ -1332,6 +1365,7 @@ def render_prompt_preview(
             prompt_profile=prompt_profile,
         )
         version_key = "stage4"
+        schema_cls = Stage4RefineBatchOutput
     else:
         raise ValueError(f"未知的 prompt stage: {stage!r}")
 

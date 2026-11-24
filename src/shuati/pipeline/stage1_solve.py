@@ -1227,11 +1227,19 @@ async def run_stage1_compile(
         max_attempts = max(1, settings.pipeline.max_stage_attempts)
 
         work_items: list[tuple[Stage1Input, str, int, bool]] = []
+        seam_ver_by_gs: dict[str, str] = {}
+        seam_ver_by_uid: dict[str, str] = {}
         for row in rows:
             uid = row["question_uid"]
             if row["eff_verification_status"] == "HUMAN_VERIFIED" and not include_human_verified:
                 result.skipped_human_verified += 1
                 continue
+
+            gs = str(row["grade_subject"])
+            if gs not in seam_ver_by_gs:
+                seam_ver_by_gs[gs] = _resolve_stage1_seam_meta(cfg_dir, gs, prompt_profile)[0]
+            row_seam_ver = seam_ver_by_gs[gs]
+            seam_ver_by_uid[uid] = row_seam_ver
 
             cas_images: list[str] = json.loads(row["cas_images_json"] or "[]")
             image_captions: list[str] = json.loads(row["image_captions_json"] or "[]")
@@ -1242,7 +1250,7 @@ async def run_stage1_compile(
                 vlm_primary_model=vlm_p_model,
                 vlm_secondary_model=vlm_s_model,
                 dual_vlm_policy=dual_policy,
-                prompt_version=STAGE1_PROMPT_VERSION,
+                prompt_version=row_seam_ver,
             )
 
             cs_status = row["cs_status"] or "PENDING"
@@ -1318,7 +1326,7 @@ async def run_stage1_compile(
                     (
                         inp.question_uid,
                         input_hash,
-                        STAGE1_PROMPT_VERSION,
+                        seam_ver_by_uid.get(inp.question_uid, STAGE1_PROMPT_VERSION),
                         vlm_p_model,
                         next_attempt,
                     ),
@@ -1334,6 +1342,7 @@ async def run_stage1_compile(
 
         async def _process_one(inp: Stage1Input, input_hash: str, attempt_no: int) -> None:
             uid = inp.question_uid
+            row_seam_ver = seam_ver_by_uid.get(uid, STAGE1_PROMPT_VERSION)
             async with task_sem:
                 result.processed += 1
                 primary_call = None
@@ -1342,8 +1351,20 @@ async def run_stage1_compile(
                 api_error: str | None = None
 
                 try:
-                    p_msgs = build_stage1_messages(inp, role="PRIMARY", assets_dir=assets_path)
-                    s_msgs = build_stage1_messages(inp, role="SECONDARY", assets_dir=assets_path)
+                    p_msgs = build_stage1_messages(
+                        inp,
+                        role="PRIMARY",
+                        assets_dir=assets_path,
+                        config_dir=cfg_dir,
+                        prompt_profile=prompt_profile,
+                    )
+                    s_msgs = build_stage1_messages(
+                        inp,
+                        role="SECONDARY",
+                        assets_dir=assets_path,
+                        config_dir=cfg_dir,
+                        prompt_profile=prompt_profile,
+                    )
                     must_dual = inp.has_images or dual_policy == "always"
                     if must_dual:
                         p_res, s_res = await asyncio.gather(
@@ -1353,7 +1374,7 @@ async def run_stage1_compile(
                                 messages=p_msgs,
                                 schema=Stage1PrimaryOutput,
                                 question_uid=uid,
-                                prompt_version=STAGE1_PROMPT_VERSION,
+                                prompt_version=row_seam_ver,
                             ),
                             gateway.call_structured(
                                 slot="vlm_secondary",
@@ -1361,7 +1382,7 @@ async def run_stage1_compile(
                                 messages=s_msgs,
                                 schema=Stage1SecondaryOutput,
                                 question_uid=uid,
-                                prompt_version=STAGE1_PROMPT_VERSION,
+                                prompt_version=row_seam_ver,
                             ),
                         )
                         primary_call = p_res
@@ -1373,7 +1394,7 @@ async def run_stage1_compile(
                             messages=p_msgs,
                             schema=Stage1PrimaryOutput,
                             question_uid=uid,
-                            prompt_version=STAGE1_PROMPT_VERSION,
+                            prompt_version=row_seam_ver,
                         )
                         p_parts_pre = normalize_answer_parts(primary_call.parsed.final_answers)
                         all_sym = all(p.verify_mode == "SYMBOLIC" for p in p_parts_pre)
@@ -1390,7 +1411,7 @@ async def run_stage1_compile(
                                 messages=s_msgs,
                                 schema=Stage1SecondaryOutput,
                                 question_uid=uid,
-                                prompt_version=STAGE1_PROMPT_VERSION,
+                                prompt_version=row_seam_ver,
                             )
                 except LLMGatewayError as exc:
                     api_error = f"{exc.error_kind}: {exc}"
@@ -1419,7 +1440,7 @@ async def run_stage1_compile(
                             (
                                 uid,
                                 vlm_p_model,
-                                STAGE1_PROMPT_VERSION,
+                                row_seam_ver,
                                 input_hash,
                                 api_error or "Unknown error",
                             ),
@@ -1481,7 +1502,13 @@ async def run_stage1_compile(
 
                 async def _qual_judge(label: str, ans_a: str, ans_b: str) -> QualitativeJudgeOutput:
                     q_msgs = build_qualitative_judge_messages(
-                        label, ans_a, ans_b, question_text=inp.question_text
+                        label,
+                        ans_a,
+                        ans_b,
+                        question_text=inp.question_text,
+                        grade_subject=inp.grade_subject,
+                        config_dir=cfg_dir,
+                        prompt_profile=prompt_profile,
                     )
                     q_res = await gateway.call_structured(
                         slot="judge_llm",
@@ -1489,7 +1516,7 @@ async def run_stage1_compile(
                         messages=q_msgs,
                         schema=QualitativeJudgeOutput,
                         question_uid=uid,
-                        prompt_version=STAGE1_PROMPT_VERSION,
+                        prompt_version=row_seam_ver,
                     )
                     return q_res.parsed
 
@@ -1532,6 +1559,9 @@ async def run_stage1_compile(
                             primary_out.solution_markdown,
                             secondary_out.method_summary,
                             secondary_out.solution_markdown,
+                            grade_subject=inp.grade_subject,
+                            config_dir=cfg_dir,
+                            prompt_profile=prompt_profile,
                         )
                         ms_res = await gateway.call_structured(
                             slot="judge_llm",
@@ -1539,7 +1569,7 @@ async def run_stage1_compile(
                             messages=ms_msgs,
                             schema=MultiSolutionJudgeOutput,
                             question_uid=uid,
-                            prompt_version=STAGE1_PROMPT_VERSION,
+                            prompt_version=row_seam_ver,
                         )
                         is_distinct_method = bool(ms_res.parsed.is_distinct_method)
                         multi_reason = ms_res.parsed.reason
@@ -1580,7 +1610,7 @@ async def run_stage1_compile(
                         (
                             uid,
                             primary_call.model_name,
-                            STAGE1_PROMPT_VERSION,
+                            row_seam_ver,
                             input_hash,
                             primary_out.visual_facts,
                             1 if primary_out.visual_ambiguity_flag else 0,
@@ -1635,7 +1665,7 @@ async def run_stage1_compile(
                             (
                                 uid,
                                 secondary_call.model_name,
-                                STAGE1_PROMPT_VERSION,
+                                row_seam_ver,
                                 input_hash,
                                 secondary_out.visual_facts,
                                 1 if secondary_out.visual_ambiguity_flag else 0,
@@ -1693,7 +1723,7 @@ async def run_stage1_compile(
                             updated_at = datetime('now')
                         WHERE question_uid = ? AND stage = 'S1'
                         """,
-                        (input_hash, STAGE1_PROMPT_VERSION, primary_call.model_name, uid),
+                        (input_hash, row_seam_ver, primary_call.model_name, uid),
                     )
 
                     refresh.propagate_stage_stale(conn, uid, "S1")

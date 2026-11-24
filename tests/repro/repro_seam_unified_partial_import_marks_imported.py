@@ -37,6 +37,9 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="repro_unified_"))
     cfg_dir = tmp / "config"
     shutil.copytree(ROOT / "config", cfg_dir)
+    settings_txt = (cfg_dir / "settings.yaml").read_text(encoding="utf-8")
+    settings_txt = settings_txt.replace('dir: "human/"', f'dir: "{(tmp / "human").as_posix()}"')
+    (cfg_dir / "settings.yaml").write_text(settings_txt, encoding="utf-8")
     db_path = tmp / "t.db"
     anchors = [f"primary_olympiad:ch_t:anc_{i}" for i in range(1, 5)]
     qa, qb = "primary_olympiad:ch_t:qa", "primary_olympiad:ch_t:qb"

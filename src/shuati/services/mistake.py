@@ -29,6 +29,7 @@ from shuati.llm.prompt_builder import (
     build_qualitative_judge_messages,
     build_stage1_messages,
 )
+from shuati.llm.seam_loader import load_prompt_seams
 from shuati.models.domain import AnswerPart
 from shuati.models.schemas import (
     ExternalDiagnosisOutput,
@@ -50,6 +51,26 @@ from shuati.verify.answer_parts import (
 )
 from shuati.verify.equivalence import compare_answer_parts
 from shuati.verify.sympy_sandbox import run_verify_script
+
+DIAGNOSE_PROMPT_VERSION = "diag_v3"
+
+
+def _resolve_diagnose_prompt_version(
+    config_dir: Path | str = Path("config"),
+    grade_subject: str = "小学奥数",
+    prompt_profile: str | None = None,
+) -> str:
+    cfg = Path(config_dir)
+    if (cfg / "prompts" / "default.yaml").is_file() or (
+        prompt_profile is not None and prompt_profile.strip()
+    ):
+        bundle = load_prompt_seams(
+            config_dir=cfg,
+            grade_subject=grade_subject,
+            profile=prompt_profile,
+        )
+        return bundle.prompt_versions.get("diagnose", DIAGNOSE_PROMPT_VERSION)
+    return DIAGNOSE_PROMPT_VERSION
 
 _DRAFT_TTL_SECONDS = 7 * 86400
 
@@ -354,12 +375,14 @@ async def diagnose_external_mistake_async(
     else:
         tax_enum = _build_taxonomy_enum_summary(conn, grade_subject)
         anchors_text = _build_anchors_prompt_text(conn, grade_subject, config_dir=config_dir)
+        diag_ver = _resolve_diagnose_prompt_version(config_dir, grade_subject)
         msgs = build_external_diagnose_messages(
             grade_subject=grade_subject,
             question_text=norm_text,
             taxonomy_enum_text=tax_enum,
             preprocessed_image_paths=preprocessed_imgs,
             anchors_prompt_text=anchors_text,
+            config_dir=Path(config_dir),
         )
         gw = LLMGateway(gw_settings, conn=None)
         try:
@@ -368,7 +391,7 @@ async def diagnose_external_mistake_async(
                 stage="DIAGNOSE",
                 messages=msgs,
                 schema=ExternalDiagnosisOutput,
-                prompt_version="diag_v2",
+                prompt_version=diag_ver,
             )
             diag = res.parsed
         finally:
@@ -572,6 +595,7 @@ async def ingest_external_mistake_async(
     user_note: str = "",
     dry_run: bool = False,
     assets_dir: Path | str = Path("data/assets/images"),
+    config_dir: Path | str = Path("config"),
     vectors_dir: Path | str = Path("data/vectors"),
     drafts_dir: Path | str = Path("data/drafts"),
     human_dir: Path | str = Path("human"),
@@ -625,6 +649,7 @@ async def ingest_external_mistake_async(
             grade_subject=eff_gs,
             image_paths=image_paths,
             known_answer=eff_known_answer,
+            config_dir=config_dir,
             vectors_dir=vectors_dir,
             drafts_dir=drafts_dir,
             use_mock=eff_mock,
@@ -856,6 +881,7 @@ async def ingest_external_mistake_async(
             )
 
             # 2. 写入双盲 stage1_vlm_runs + question_solutions
+            diag_ver = _resolve_diagnose_prompt_version(config_dir, eff_gs)
             conn.execute(
                 """
                 INSERT INTO stage1_vlm_runs(
@@ -863,10 +889,11 @@ async def ingest_external_mistake_async(
                     visual_facts, method_summary, solution_markdown, final_answers_json,
                     sympy_code, sympy_status
                 )
-                VALUES (?, 'PRIMARY', 'external_diagnose', 'diag_v1', ?, 'OK', ?, ?, ?, ?, ?, ?);
+                VALUES (?, 'PRIMARY', 'external_diagnose', ?, ?, 'OK', ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     uid,
+                    diag_ver,
                     raw_content_hash,
                     diag.visual_facts,
                     diag.method_summary,

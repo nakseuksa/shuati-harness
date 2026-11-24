@@ -705,6 +705,8 @@ def compile_stage(
                         conn,
                         grade_subject=gs,
                         lock_path=db.parent / ".compile.lock",
+                        config_dir=config_dir,
+                        prompt_profile=prompt_profile,
                     )
                 elif norm_stage in ("3E", "S3E"):
                     data_out = asyncio.run(
@@ -753,12 +755,16 @@ def compile_stage(
                             mode="api",
                             batch_size=batch_size or 20,
                             lock_path=db.parent / ".compile.lock",
+                            config_dir=config_dir,
+                            prompt_profile=prompt_profile,
                         )
                     )
                     s3d_res = run_stage3d_mount(
                         conn,
                         grade_subject=gs,
                         lock_path=db.parent / ".compile.lock",
+                        config_dir=config_dir,
+                        prompt_profile=prompt_profile,
                     )
                     cmp_res = asyncio.run(
                         run_compaction_async(
@@ -769,6 +775,8 @@ def compile_stage(
                             mode="api",
                             use_mock=use_mock_flag,
                             lock_path=db.parent / ".compile.lock",
+                            config_dir=config_dir,
+                            prompt_profile=prompt_profile,
                         )
                     )
                     s3e_res = asyncio.run(
@@ -778,6 +786,8 @@ def compile_stage(
                             grade_subject=gs,
                             mode="api",
                             lock_path=db.parent / ".compile.lock",
+                            config_dir=config_dir,
+                            prompt_profile=prompt_profile,
                         )
                     )
                     s4_res = asyncio.run(
@@ -790,6 +800,8 @@ def compile_stage(
                             vectors_dir=vectors_dir,
                             use_mock=use_mock_flag,
                             lock_path=db.parent / ".compile.lock",
+                            config_dir=config_dir,
+                            prompt_profile=prompt_profile,
                         )
                     )
                     data_out = {

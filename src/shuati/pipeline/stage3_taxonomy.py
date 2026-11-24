@@ -60,8 +60,8 @@ from shuati.models.schemas import (
 from shuati.pipeline.subagent_bridge import export_task_batches, load_and_validate_results
 from shuati.vectors.store import VectorStore
 
-STAGE3C_PROMPT_VERSION = "s3c_v1"
-STAGE3D_PROMPT_VERSION = "s3d_v1"
+STAGE3C_PROMPT_VERSION = "s3c_v2"
+STAGE3D_PROMPT_VERSION = "s3d_v2"
 
 
 def _sha256_json(obj: Any) -> str:
@@ -248,11 +248,11 @@ async def propose_taxonomy_async(
             prompt_profile=prompt_profile,
         )
 
+        p_ver, p_digest = _resolve_seam_meta(
+            config_dir, grade_subject, "stage3a", "s3a_v2", prompt_profile
+        )
         if mode == "export":
             resolved_model = resolve_subagent_model(settings, "propose", subagent_model)
-            p_ver, p_digest = _resolve_seam_meta(
-                config_dir, grade_subject, "stage3a", "s3a_v1", prompt_profile
-            )
             manifest = export_task_batches(
                 "propose",
                 [
@@ -287,7 +287,7 @@ async def propose_taxonomy_async(
                 stage="STAGE3A_PROPOSE",
                 messages=messages,
                 schema=TaxonomyProposeOutput,
-                prompt_version="s3a_v1",
+                prompt_version=p_ver,
             )
             proposed = res.parsed
         finally:
@@ -418,6 +418,7 @@ def _persist_stage3c_question(
     primary_l1: str,
     secondary_l1s: list[str],
     step_mappings: list[dict[str, Any]],
+    prompt_version: str = STAGE3C_PROMPT_VERSION,
 ) -> int:
     """持久化单题 S3C 映射（保护 raw_*，记录新型 L2 候选，刷新生效层与下游 STALE）。"""
     novel_added = 0
@@ -512,7 +513,7 @@ def _persist_stage3c_question(
             last_error = '',
             updated_at = datetime('now');
         """,
-        (uid, s3c_hash, STAGE3C_PROMPT_VERSION, model_name),
+        (uid, s3c_hash, prompt_version, model_name),
     )
     refresh.mark_stages_stale(conn, uid, ["S3D", "S4"])
     effective.recompute(conn, uid)
@@ -537,6 +538,9 @@ async def run_stage3c_async(
     """Stage 3c：零成本精确/别名命中 + 脱敏逐题上下文批映射。"""
     slug, tax_ver, spec, lookup = _load_active_taxonomy(conn, grade_subject)
     taxonomy_enum = format_taxonomy_enum(spec)
+    p_ver, p_digest = _resolve_seam_meta(
+        config_dir, grade_subject, "stage3c", STAGE3C_PROMPT_VERSION, prompt_profile
+    )
 
     q_rows = conn.execute(
         """
@@ -580,7 +584,7 @@ async def run_stage3c_async(
         q_steps = steps_by_q.get(uid, [])
         s3c_hash = _sha256_json(
             {
-                "pv": STAGE3C_PROMPT_VERSION,
+                "pv": p_ver,
                 "tv": tax_ver,
                 "prim": qr["m_primary_l1_module"],
                 "raw_l1s": qr["raw_l1_candidates_json"],
@@ -673,6 +677,7 @@ async def run_stage3c_async(
                         primary_l1=eh["primary_l1"],
                         secondary_l1s=eh["secondary_l1s"],
                         step_mappings=eh["steps"],
+                        prompt_version=p_ver,
                     )
                     updated += 1
                 conn.commit()
@@ -736,9 +741,6 @@ async def run_stage3c_async(
                     }
                 )
             resolved_model = resolve_subagent_model(settings, "3c", subagent_model)
-            p_ver, p_digest = _resolve_seam_meta(
-                config_dir, grade_subject, "stage3c", STAGE3C_PROMPT_VERSION, prompt_profile
-            )
             manifest = export_task_batches(
                 "3c",
                 batches,
@@ -816,6 +818,7 @@ async def run_stage3c_async(
                             primary_l1=qmap.primary_l1_module,
                             secondary_l1s=qmap.secondary_l1_modules,
                             step_mappings=step_payloads,
+                            prompt_version=p_ver,
                         )
                         updated += 1
                 conn.commit()
@@ -865,13 +868,15 @@ async def run_stage3c_async(
                     grade_subject=grade_subject,
                     taxonomy_enum_text=taxonomy_enum,
                     question_items=prompt_items,
+                    config_dir=Path(config_dir),
+                    prompt_profile=prompt_profile,
                 )
                 res = await gateway.call_structured(
                     slot="text_llm",
                     stage="STAGE3C",
                     messages=msgs,
                     schema=Stage3cBatchMappingOutput,
-                    prompt_version=STAGE3C_PROMPT_VERSION,
+                    prompt_version=p_ver,
                 )
                 return chunk, res.parsed, res.model_name
 
@@ -933,6 +938,7 @@ async def run_stage3c_async(
                             primary_l1=prim,
                             secondary_l1s=secs,
                             step_mappings=step_payloads,
+                            prompt_version=p_ver,
                         )
                         updated += 1
                 conn.commit()
@@ -956,9 +962,14 @@ def run_stage3d_mount(
     *,
     grade_subject: str,
     lock_path: Path | str = Path("data/.compile.lock"),
+    config_dir: Path | str = Path("config"),
+    prompt_profile: str | None = None,
 ) -> dict[str, Any]:
     """Stage 3d 确定性步骤 L3 节点挂载（零 LLM 调用，写入 eff_node_ids_json 并触发 S4=STALE）。"""
     slug, tax_ver, _, lookup = _load_active_taxonomy(conn, grade_subject)
+    p_ver, _ = _resolve_seam_meta(
+        config_dir, grade_subject, "stage3d", STAGE3D_PROMPT_VERSION, prompt_profile
+    )
     default_l1 = lookup.l1_names()[0]
     default_l2 = lookup.l2_names(default_l1)[0]
 
@@ -1047,7 +1058,7 @@ def run_stage3d_mount(
                 q_steps = steps_by_q.get(uid, [])
                 s3d_hash = _sha256_json(
                     {
-                        "pv": STAGE3D_PROMPT_VERSION,
+                        "pv": p_ver,
                         "tv": tax_ver,
                         "steps": [
                             (str(s["step_id"]), str(s["m_l1"]), str(s["m_l2"]), str(s["raw_l3"]))
@@ -1120,7 +1131,7 @@ def run_stage3d_mount(
                         last_error = '',
                         updated_at = datetime('now');
                     """,
-                    (uid, s3d_hash, STAGE3D_PROMPT_VERSION),
+                    (uid, s3d_hash, p_ver),
                 )
                 refresh.mark_stages_stale(conn, uid, ["S4"])
                 effective.recompute(conn, uid)
@@ -1344,11 +1355,11 @@ async def _run_compaction_cluster_async(
                 }
             )
 
+    p_ver, p_digest = _resolve_seam_meta(
+        config_dir, grade_subject, "stage3d", STAGE3D_PROMPT_VERSION, prompt_profile
+    )
     if mode == "export":
         resolved_model = resolve_subagent_model(settings, "3d", subagent_model)
-        p_ver, p_digest = _resolve_seam_meta(
-            config_dir, grade_subject, "stage3d", "s3d_cluster_v1", prompt_profile
-        )
         manifest = export_task_batches(
             "compact",
             all_batches,
@@ -1406,7 +1417,7 @@ async def _run_compaction_cluster_async(
                     stage="STAGE3D_COMPACT",
                     messages=b["messages"],
                     schema=Stage3dClusterAssignOutput,
-                    prompt_version="s3d_cluster_v1",
+                    prompt_version=p_ver,
                 )
                 return res.parsed
 
@@ -1583,11 +1594,11 @@ async def _run_compaction_pairwise_async(
                 }
             )
 
+    p_ver, p_digest = _resolve_seam_meta(
+        config_dir, grade_subject, "stage3d", STAGE3D_PROMPT_VERSION, prompt_profile
+    )
     if mode == "export":
         resolved_model = resolve_subagent_model(settings, "3d", subagent_model)
-        p_ver, p_digest = _resolve_seam_meta(
-            config_dir, grade_subject, "stage3d", "s3d_compact_v1", prompt_profile
-        )
         manifest = export_task_batches(
             "compact",
             all_batches,
@@ -1634,7 +1645,7 @@ async def _run_compaction_pairwise_async(
                     stage="STAGE3D_COMPACT",
                     messages=b["messages"],
                     schema=MergeJudgeBatchOutput,
-                    prompt_version="s3d_compact_v1",
+                    prompt_version=p_ver,
                 )
                 return res.parsed
 
@@ -1838,6 +1849,9 @@ async def run_stage3e_async(
     """Stage 3e：构建 L2 先修 DAG（Kahn 破环）与跨模块共现知识边。"""
     slug, tax_ver, spec, lookup = _load_active_taxonomy(conn, grade_subject)
     taxonomy_enum = format_taxonomy_enum(spec)
+    p_ver, p_digest = _resolve_seam_meta(
+        config_dir, grade_subject, "stage3e", "s3e_v2", prompt_profile
+    )
 
     # 1. 确保全部 L2 节点已写入 knowledge_nodes 并建立 (l1, l2) -> node_id 映射
     l2_node_map: dict[tuple[str, str], str] = {}
@@ -1906,9 +1920,6 @@ async def run_stage3e_async(
             prompt_profile=prompt_profile,
         )
         resolved_model = resolve_subagent_model(settings, "3e", subagent_model)
-        p_ver, p_digest = _resolve_seam_meta(
-            config_dir, grade_subject, "stage3e", "s3e_v1", prompt_profile
-        )
         manifest = export_task_batches(
             "3e",
             [{"batch_id": "3e_batch_0001", "messages": msgs, "task_item_ids": ["3e_dag_0001"]}],
@@ -1945,6 +1956,8 @@ async def run_stage3e_async(
             grade_subject=grade_subject,
             taxonomy_enum_text=taxonomy_enum,
             ordered_transitions=ordered_transitions,
+            config_dir=Path(config_dir),
+            prompt_profile=prompt_profile,
         )
         gateway = LLMGateway(settings, conn=conn)
         try:
@@ -1953,7 +1966,7 @@ async def run_stage3e_async(
                 stage="STAGE3E_DAG",
                 messages=msgs,
                 schema=PrerequisiteDagOutput,
-                prompt_version="s3e_v1",
+                prompt_version=p_ver,
             )
             dag_out = res.parsed
         finally:

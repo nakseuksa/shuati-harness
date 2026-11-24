@@ -113,7 +113,7 @@ def test_stage1_input_schema_and_prompt_zero_leakage(tmp_path: Path) -> None:
 
 
 def test_other_prompt_builders() -> None:
-    assert STAGE1_PROMPT_VERSION == "s1_v2"
+    assert STAGE1_PROMPT_VERSION == "s1_v3"
 
     q_msgs = build_qualitative_judge_messages("(2)", "连接对角线", "作对角线", "求作法")
     assert len(q_msgs) == 2 and "连接对角线" in q_msgs[1]["content"]

@@ -273,7 +273,7 @@ async def test_self_contained_unified_export_lock_and_legacy_compat(tmp_path: Pa
     assert manifest["dispatch_driver"] == "swarm"
     assert manifest["max_parallel_workers"] == 4
     assert manifest["status"] == "PENDING_IMPORT"
-    assert manifest["prompt_version"] == "unified-v1.0"
+    assert manifest["prompt_version"] == "unified-v2.0"
     assert len(manifest["prompt_digest"]) == 16
 
     flat_u = json.loads((out_dir / "flat_schema_unified.json").read_text(encoding="utf-8"))
@@ -407,7 +407,7 @@ def test_subagent_bridge_manifest_flat_schema_and_lock(tmp_path: Path) -> None:
         out_dir,
         schema_cls=TaxonomyProposeOutput,
         subagent_model="gemini-4-neon-medium",
-        prompt_version="s3a_v1",
+        prompt_version="s3a_v2",
         prompt_digest="abcd1234ef567890",
         prompt_profile="strict",
         max_parallel_workers=4,
@@ -499,6 +499,7 @@ async def test_stage3_export_passes_subagent_options(tmp_path: Path) -> None:
         subagent_model="gemini-4-neon-high",
     )
     assert p_res["manifest"]["subagent_model"] == "gemini-4-neon-high"
+    assert p_res["manifest"]["prompt_version"] == "s3a_v2"
     assert (propose_dir / "flat_schema.json").exists()
 
     # 造 DRAFT 词表并测 stage3c export 透传
@@ -526,6 +527,7 @@ async def test_stage3_export_passes_subagent_options(tmp_path: Path) -> None:
         subagent_model="gemini-4-neon-medium",
     )
     assert c_res["manifest"]["subagent_model"] == "gemini-4-neon-medium"
+    assert c_res["manifest"]["prompt_version"] == "s3c_v2"
     conn.close()
 
 
@@ -539,21 +541,42 @@ def test_cli_atomic_compiler_commands_and_dry_run(tmp_path: Path) -> None:
     d_list = json.loads(r_list.stdout)
     assert d_list["ok"] is True
     assert d_list["data"]["default_exists"] is True
+    snippet_paths = {sn["path"] for sn in d_list["data"]["snippets"]}
+    assert {
+        "snippets/primary_olympiad_l3_examples.md",
+        "snippets/primary_olympiad_concepts_guide.md",
+        "snippets/primary_olympiad_visual_and_hint_examples.md",
+    }.issubset(snippet_paths)
 
     r_lint = runner.invoke(app, ["prompt", "lint", "--config-dir", str(cfg_dir), "--json"])
     assert r_lint.exit_code == 0, r_lint.output
     d_lint = json.loads(r_lint.stdout)
     assert d_lint["data"]["ok"] is True
+    assert d_lint["data"]["warnings"] == []
 
-    r_render = runner.invoke(
-        app,
-        ["prompt", "render", "--stage", "unified", "--grade-subject", "小学奥数", "--config-dir", str(cfg_dir), "--json"],
-    )
-    assert r_render.exit_code == 0, r_render.output
-    d_render = json.loads(r_render.stdout)
-    assert d_render["data"]["prompt_version"] == "unified-v1.0"
-    assert "flattened_schema" in d_render["data"]
-    _assert_no_refs(d_render["data"]["flattened_schema"])
+    for st, exp_ver in (
+        ("unified", "unified-v2.0"),
+        ("1", "s1_v3"),
+        ("stage1_judge", "s1_v3"),
+        ("judge_multi", "s1_v3"),
+        ("2", "s2_v2"),
+        ("3a", "s3a_v2"),
+        ("3c", "s3c_v2"),
+        ("3d", "s3d_v2"),
+        ("merge_judge", "s3d_v2"),
+        ("3e", "s3e_v2"),
+        ("4", "s4_v2"),
+        ("diagnose", "diag_v3"),
+    ):
+        r_render = runner.invoke(
+            app,
+            ["prompt", "render", "--stage", st, "--grade-subject", "小学奥数", "--config-dir", str(cfg_dir), "--json"],
+        )
+        assert r_render.exit_code == 0, r_render.output
+        d_render = json.loads(r_render.stdout)
+        assert d_render["data"]["prompt_version"] == exp_ver
+        assert "flattened_schema" in d_render["data"]
+        _assert_no_refs(d_render["data"]["flattened_schema"])
 
     # 2. tool verify-sympy & validate-draft (--input @file 与 --stdin)
     sym_payload = {

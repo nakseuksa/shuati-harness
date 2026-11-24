@@ -349,10 +349,10 @@ async def run_stage4_weave_async(
             bundle = load_prompt_seams(
                 config_dir=cfg_p, grade_subject=grade_subject, profile=prompt_profile
             )
-            p_ver = bundle.prompt_versions.get("stage4", "s4_refine_v1")
+            p_ver = bundle.prompt_versions.get("stage4", "s4_v2")
             p_digest = bundle.prompt_digest
         else:
-            p_ver = "s4_refine_v1"
+            p_ver = "s4_v2"
             p_digest = ""
 
         manifest = export_task_batches(
@@ -408,6 +408,14 @@ async def run_stage4_weave_async(
                 cand.pedagogical_note = verdict[1]
                 verified_refine_edges.append(cand)
     elif refine_candidates:
+        cfg_p = Path(config_dir)
+        if (cfg_p / "prompts" / "default.yaml").is_file() or prompt_profile is not None:
+            bundle = load_prompt_seams(
+                config_dir=cfg_p, grade_subject=grade_subject, profile=prompt_profile
+            )
+            p_ver = bundle.prompt_versions.get("stage4", "s4_v2")
+        else:
+            p_ver = "s4_v2"
         gateway = LLMGateway(settings, conn=conn)
         eff_bs = max(1, int(batch_size))
         chunks = [refine_candidates[i : i + eff_bs] for i in range(0, len(refine_candidates), eff_bs)]
@@ -432,7 +440,7 @@ async def run_stage4_weave_async(
                 stage="STAGE4_REFINE",
                 messages=msgs,
                 schema=Stage4RefineBatchOutput,
-                prompt_version="s4_refine_v1",
+                prompt_version=p_ver,
             )
             return pid_to_edge, res.parsed
 

@@ -91,7 +91,7 @@ def register_compiler_commands(app: typer.Typer, run_cli_action: Any) -> None:
         stage: str = typer.Option(
             "unified",
             "--stage",
-            help="目标阶段：unified / stage1 / stage2 / stage3a / stage3c / stage3d / merge_judge / stage3e / stage4 / diagnose",
+            help="目标阶段：unified / 1 (stage1/stage1_secondary) / stage1_judge / judge_multi / 2 (stage2) / 3a (stage3a) / 3c (stage3c) / 3d (stage3d) / merge_judge / 3e (stage3e) / 4 (stage4) / diagnose",
         ),
         grade_subject: str = typer.Option("小学奥数", "--grade-subject", help="学段学科"),
         prompt_profile: str | None = typer.Option(

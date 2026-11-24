@@ -38,7 +38,10 @@ def _setup_cfg(tmp_path: Path) -> Path:
     for fname in ("settings.yaml", "subjects.yaml", "method_blacklist.yaml"):
         src = Path("config") / fname
         if src.exists():
-            (cfg_dir / fname).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            txt = src.read_text(encoding="utf-8")
+            if fname == "settings.yaml":
+                txt = txt.replace('dir: "human/"', f'dir: "{(tmp_path / "human").as_posix()}"')
+            (cfg_dir / fname).write_text(txt, encoding="utf-8")
     prompts_src = Path("config/prompts")
     if prompts_src.is_dir():
         for fp in prompts_src.rglob("*"):

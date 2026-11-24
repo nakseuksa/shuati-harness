@@ -54,7 +54,7 @@ from shuati.verify.answer_parts import normalize_answer_parts
 from shuati.verify.equivalence import compare_answer_parts
 
 SUBAGENT_MODEL_NAME = "subagent-unified"
-UNIFIED_PROMPT_VERSION = "unified-v1.0"
+UNIFIED_PROMPT_VERSION = "unified-v2.0"
 
 _EXEMPT_ANGLE_NUMS = frozenset({"45", "60", "90", "180", "360"})
 _SPOILER_PHRASE_RE = re.compile(
