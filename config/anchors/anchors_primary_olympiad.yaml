@@ -1,7 +1,7 @@
 grade_subject: 小学奥数
 version: "1.0"
 anchors:
-  - question_uid: "primary_olympiad:ch01_计算基础:ch01_006"
+  - question_uid: "primary_olympiad:ch34_余数:ch34_028"
     target_tier: "L1_基础直达"
     scores:
       C: 1
@@ -9,9 +9,9 @@ anchors:
       T: 1
       L: 1
     base_elo: 1120
-    rationale: "纯三位数整数加减法直接计算，单一概念、单步直达、无技巧转化、基础算术量。"
+    rationale: "单一同余可加性直推，1 步直达、条件全透明、口算级负荷。"
 
-  - question_uid: "primary_olympiad:ch28_平面直线图形高年级卷:ch28_004"
+  - question_uid: "primary_olympiad:ch29_平面曲线图形:ch29_010"
     target_tier: "L3_综合中档"
     scores:
       C: 2
@@ -19,9 +19,9 @@ anchors:
       T: 2
       L: 1
     base_elo: 1510
-    rationale: "正方形外围一线三直角全等 + 勾股平方和转化（2个核心概念、2步推演、需识别等量代换技巧、计算极简）。"
+    rationale: "需结合配图多层遮挡转译真实区域边界（T=2），串联设份法与扇形圆环面积差 3 步求解。"
 
-  - question_uid: "primary_olympiad:ch28_平面直线图形高年级卷:ch28_002"
+  - question_uid: "primary_olympiad:ch33_最大公因数与最小公倍数:ch33_019"
     target_tier: "L4-A_进阶拔高(繁)"
     scores:
       C: 2
@@ -29,24 +29,24 @@ anchors:
       T: 2
       L: 3
     base_elo: 1745
-    rationale: "等腰三角形与梯形比例几何结合分段追及行程（典型高步骤连锁推理与高计算繁琐度 L=3，单维复杂度受控于 C=2）。"
+    rationale: "整除计数与三集合维恩图分块奇偶追踪（概念受控 C=2，但需分 7 类互不相交子集逐一核算整除商，S=3, L=3 典型繁而不超纲）。"
 
-  - question_uid: "primary_olympiad:ch28_平面直线图形高年级卷:ch28_008"
+  - question_uid: "primary_olympiad:ch25_逻辑推理:ch25_005"
     target_tier: "L4-B_进阶拔高(巧)"
     scores:
       C: 3
       S: 2
       T: 3
-      L: 2
-    base_elo: 2030
-    rationale: "正六边形内双正方形与不等腰梯形拼合（需巧妙构造直角斜边方程与面积恒等消元，技巧转化度 T=3 且运算简洁）。"
+      L: 1
+    base_elo: 1965
+    rationale: "需将对局转化为图论顶点度数模型，利用甲满度（4）与丁单度（1）交替剥离极端顶点锁死连边（强洞察巧解 T=3、零繁算 L=1）。"
 
-  - question_uid: "primary_olympiad:ch28_平面直线图形高年级卷:ch28_011"
+  - question_uid: "primary_olympiad:ch38_计数原理:ch38_075"
     target_tier: "L5-2_竞赛超难"
     scores:
       C: 4
       S: 2
       T: 2
-      L: 1
-    base_elo: 2530
-    rationale: "缺角十字形内嵌旋转最大正方形极值问题（融合对称性建模、旋转边界不等式约束与可行性双边界验算，四概念综合 C=4）。"
+      L: 2
+    base_elo: 2595
+    rationale: "融合蜂窝邻接拓扑建模、极值度（6 与 5）公共格强制占位约束与分类加乘计数（高阶组合构造 C=4）。"
