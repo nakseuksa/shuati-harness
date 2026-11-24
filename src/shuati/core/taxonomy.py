@@ -540,9 +540,67 @@ def transition_taxonomy(
                 (grade_subject,),
             )
 
-            # Step 3: 清理旧版本知识点拓扑与节点，失效草案并查集审计账本
+            # Step 3: 先建新版本 L2 节点骨架，迁移 practice_log.stuck_node_id，再清理旧节点与拓扑边
+            for mod in updated_spec.modules:
+                for l2 in mod.l2_entities:
+                    l2_id = make_node_id(slug, target_version, "L2", mod.name, l2.name, "")
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO knowledge_nodes(
+                            node_id, grade_subject, taxonomy_version, node_level,
+                            l1_module, l2_entity, l3_operator, aliases_json, redirect_to_id
+                        )
+                        VALUES (?, ?, ?, 'L2', ?, ?, '', ?, NULL);
+                        """,
+                        (
+                            l2_id,
+                            grade_subject,
+                            target_version,
+                            mod.name,
+                            l2.name,
+                            json.dumps(l2.aliases, ensure_ascii=False),
+                        ),
+                    )
+
             old_node_where = "grade_subject = ? AND taxonomy_version != ?"
             old_node_params: tuple[Any, ...] = (grade_subject, target_version)
+
+            pl_rows = conn.execute(
+                f"""
+                SELECT p.log_id, kn.l1_module, kn.l2_entity
+                FROM practice_log p
+                JOIN knowledge_nodes kn ON kn.node_id = p.stuck_node_id
+                WHERE kn.{old_node_where};
+                """,
+                old_node_params,
+            ).fetchall()
+            migrated_practice_logs = 0
+            nulled_practice_logs = 0
+            for pr in pl_rows:
+                raw_l1 = str(pr["l1_module"] or "")
+                raw_l2 = str(pr["l2_entity"] or "")
+                mapped_pair = l2_renames.get((normalize_label(raw_l1), normalize_label(raw_l2)))
+                if mapped_pair is not None:
+                    cand_l1, cand_l2 = mapped_pair
+                else:
+                    cand_l1 = l1_renames.get(normalize_label(raw_l1), raw_l1)
+                    cand_l2 = raw_l2
+                pair_hit = lookup.resolve_l2(cand_l1, cand_l2)
+                if pair_hit is not None:
+                    new_l1, new_l2 = pair_hit
+                    new_l2_id = make_node_id(slug, target_version, "L2", new_l1, new_l2, "")
+                    conn.execute(
+                        "UPDATE practice_log SET stuck_node_id = ? WHERE log_id = ?;",
+                        (new_l2_id, pr["log_id"]),
+                    )
+                    migrated_practice_logs += 1
+                else:
+                    conn.execute(
+                        "UPDATE practice_log SET stuck_node_id = NULL WHERE log_id = ?;",
+                        (pr["log_id"],),
+                    )
+                    nulled_practice_logs += 1
+
             conn.execute(
                 f"""
                 DELETE FROM knowledge_edges
@@ -572,30 +630,7 @@ def transition_taxonomy(
                         (lr["merge_id"],),
                     )
 
-            # 写入 L2 标准节点骨架
-            for mod in updated_spec.modules:
-                for l2 in mod.l2_entities:
-                    l2_id = make_node_id(slug, target_version, "L2", mod.name, l2.name, "")
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO knowledge_nodes(
-                            node_id, grade_subject, taxonomy_version, node_level,
-                            l1_module, l2_entity, l3_operator, aliases_json, redirect_to_id
-                        )
-                        VALUES (?, ?, ?, 'L2', ?, ?, '', ?, NULL);
-                        """,
-                        (
-                            l2_id,
-                            grade_subject,
-                            target_version,
-                            mod.name,
-                            l2.name,
-                            json.dumps(l2.aliases, ensure_ascii=False),
-                        ),
-                    )
-
-            # Step 4: 更新 grade_subjects 与全学段 S3C/S3D/S4 状态
-            save_taxonomy_spec(updated_spec, target_yaml_path)
+            # Step 4: 更新 grade_subjects 与全学段 S3C/S3D/S4 状态（磁盘 YAML 写盘延后到 commit 之后）
             conn.execute(
                 """
                 UPDATE grade_subjects
@@ -619,6 +654,9 @@ def transition_taxonomy(
             conn.rollback()
             raise
 
+        # 事务提交成功后才原子写盘 YAML，杜绝回滚撕裂磁盘文件
+        save_taxonomy_spec(updated_spec, target_yaml_path)
+
         # 事务提交后通过 effective.recompute 刷新生效列并导出 human/ 镜像
         effective.recompute_all(conn, grade_subject=grade_subject)
         conn.commit()
@@ -634,7 +672,77 @@ def transition_taxonomy(
         "backup_path": str(backup_path),
         "migrated_overrides": len(migrated),
         "suspended_overrides": len(unmapped),
+        "migrated_practice_logs": migrated_practice_logs,
+        "nulled_practice_logs": nulled_practice_logs,
         "stale_questions": len(q_uids),
+    }
+
+
+def get_taxonomy_maintenance_status(conn: sqlite3.Connection, grade_subject: str) -> dict[str, Any]:
+    """检测学段是否处于词表维护降级期（LOCKED/DRAFT 且存在活跃 S2=OK 但 S3C/S3D 为 STALE/PENDING 题目）。"""
+    gs_row = conn.execute(
+        "SELECT taxonomy_status, taxonomy_version FROM grade_subjects WHERE grade_subject = ?;",
+        (grade_subject,),
+    ).fetchone()
+    if gs_row is None:
+        return {
+            "grade_subject": grade_subject,
+            "taxonomy_status": "NONE",
+            "taxonomy_version": "",
+            "degraded": False,
+            "code": "",
+            "reason": "",
+            "stale_s3c_count": 0,
+            "stale_s3d_count": 0,
+            "message": "",
+        }
+
+    tax_status = str(gs_row["taxonomy_status"] or "NONE")
+    tax_version = str(gs_row["taxonomy_version"] or "")
+    stale_s3c_count = 0
+    stale_s3d_count = 0
+
+    if tax_status in ("LOCKED", "DRAFT"):
+        counts = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN cs3c.status IN ('STALE', 'PENDING') THEN 1 ELSE 0 END), 0) AS s3c_cnt,
+                COALESCE(SUM(CASE WHEN cs3d.status IN ('STALE', 'PENDING') THEN 1 ELSE 0 END), 0) AS s3d_cnt
+            FROM questions q
+            JOIN compile_state cs2
+              ON cs2.question_uid = q.question_uid AND cs2.stage = 'S2' AND cs2.status = 'OK'
+            LEFT JOIN compile_state cs3c
+              ON cs3c.question_uid = q.question_uid AND cs3c.stage = 'S3C'
+            LEFT JOIN compile_state cs3d
+              ON cs3d.question_uid = q.question_uid AND cs3d.stage = 'S3D'
+            WHERE q.grade_subject = ?
+              AND q.is_retired = 0
+              AND q.eff_is_excluded = 0;
+            """,
+            (grade_subject,),
+        ).fetchone()
+        if counts is not None:
+            stale_s3c_count = int(counts["s3c_cnt"] or 0)
+            stale_s3d_count = int(counts["s3d_cnt"] or 0)
+
+    degraded = tax_status in ("LOCKED", "DRAFT") and (stale_s3c_count > 0 or stale_s3d_count > 0)
+    message = (
+        f"MAINTENANCE_DEGRADED: 学段 {grade_subject} 处于词表重编维护降级期"
+        f"（S3C 待重编 {stale_s3c_count} 题，S3D 待重编 {stale_s3d_count} 题），"
+        "请完成 Stage 3c/3d 重编以恢复完整知识树与节点检索。"
+        if degraded
+        else ""
+    )
+    return {
+        "grade_subject": grade_subject,
+        "taxonomy_status": tax_status,
+        "taxonomy_version": tax_version,
+        "degraded": degraded,
+        "code": "MAINTENANCE_DEGRADED" if degraded else "",
+        "reason": "MAINTENANCE_DEGRADED" if degraded else "",
+        "stale_s3c_count": stale_s3c_count,
+        "stale_s3d_count": stale_s3d_count,
+        "message": message,
     }
 
 
@@ -859,7 +967,6 @@ def migrate_taxonomy_incremental(
 
             target_yaml = default_taxonomy_path(config_dir, slug, "LOCKED")
             locked_spec = spec.model_copy(update={"status": "LOCKED"})
-            save_taxonomy_spec(locked_spec, target_yaml)
             conn.execute(
                 "UPDATE grade_subjects SET taxonomy_version = ?, taxonomy_file = ? WHERE grade_subject = ?;",
                 (target_ver, str(target_yaml), grade_subject),
@@ -872,6 +979,8 @@ def migrate_taxonomy_incremental(
         except BaseException:
             conn.rollback()
             raise
+
+        save_taxonomy_spec(locked_spec, target_yaml)
 
         for uid in affected_uids:
             effective.recompute(conn, uid)

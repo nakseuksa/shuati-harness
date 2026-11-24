@@ -33,9 +33,14 @@ from shuati.services.mistake import (
 
 _HR_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
 _HEADING_RE = re.compile(r"^\s*#{2,3}\s+(.+?)\s*$")
+_HEADING_PARTS_RE = re.compile(r"^(\s*#{2,3})\s+(.+?)\s*$")
+_HEADING_NO_SPACE_RE = re.compile(r"^(\s*#{2,3})([^\s#].*)$")
+_INLINE_BODY_HEADING_RE = re.compile(r"^((?:第\s*\d+\s*题(?:\s*[：:.、])?|\d+\s*[.、)．]))\s*(.+)$")
+_Q_NUM_PREFIX_RE = re.compile(r"^(?:第\s*\d+\s*题(?:\s*[：:.、])?|\d+\s*[.、)．）]?)\s*")
 _H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$")
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _EXPLICIT_IMAGE_LINE_RE = re.compile(r"^\s*(?:图片|配图|图|image)\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
+_EXPLICIT_IMAGE_PREFIX_RE = re.compile(r"^(\s*(?:图片|配图|图|image)\s*[:：]\s*)(.+?)\s*$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -703,3 +708,218 @@ async def diagnose_external_file_async(
         raise PreconditionError(msg)
 
     return summary
+
+
+def _is_image_only_line(line: str) -> bool:
+    if _EXPLICIT_IMAGE_LINE_RE.match(line):
+        return True
+    if "![" in line and "](" in line:
+        return _MD_IMAGE_RE.sub("", line).strip() == ""
+    return False
+
+
+def _absolutize_image_line(line: str, base_dir: Path, fixes_applied: list[str]) -> str:
+    m_exp = _EXPLICIT_IMAGE_PREFIX_RE.match(line)
+    if m_exp:
+        prefix, raw_val = m_exp.group(1), m_exp.group(2)
+        ref = _clean_explicit_image_ref(raw_val)
+        if ref and not Path(ref).is_absolute():
+            abs_p = (base_dir / ref).resolve()
+            fixes_applied.append(f"相对图片路径转绝对路径: {ref} -> {abs_p.as_posix()}")
+            return f"{prefix}{abs_p.as_posix()}"
+        return line
+
+    if "![" in line and "](" in line:
+        def _repl(m: re.Match[str]) -> str:
+            full = m.group(0)
+            inside = m.group(1)
+            ref = _extract_md_image_target(inside)
+            if not ref or Path(ref).is_absolute():
+                return full
+            abs_p = (base_dir / ref).resolve()
+            fixes_applied.append(f"相对图片路径转绝对路径: {ref} -> {abs_p.as_posix()}")
+            new_inside = inside.replace(ref, abs_p.as_posix(), 1)
+            prefix_md = full[: full.index("(") + 1]
+            return f"{prefix_md}{new_inside})"
+
+        return _MD_IMAGE_RE.sub(_repl, line)
+    return line
+
+
+def _block_has_body_text(lines: list[str], start_idx: int) -> bool:
+    for idx in range(start_idx, len(lines)):
+        ln = lines[idx]
+        if _HR_RE.match(ln) or _HEADING_RE.match(ln):
+            break
+        if not ln.strip():
+            continue
+        if _is_image_only_line(ln):
+            continue
+        return True
+    return False
+
+
+def preflight_question_list_markdown(
+    file_path: Path | str,
+    *,
+    out_normalized: Path | str | None = None,
+    drafts_dir: Path | str = Path("data/drafts"),
+) -> dict[str, Any]:
+    """严格只读源文件，修复常见排版坑位并输出规范化副本，运行预检统计。
+
+    修复项：
+    1. `##12.` / `###2.` 等井号后漏空格补齐；
+    2. `---` 分隔线后孤立/错位的 `图片:` / `配图:` 行归位至前一道题末尾；
+    3. 标题与题干正文同行（如 `##19. 一列火车...`）拆分题号标题与正文，防止题干丢失；
+    4. 相对图片路径按源文件所在目录转为绝对路径。
+    """
+    fp = Path(file_path)
+    if not fp.exists() or not fp.is_file():
+        raise PreconditionError(f"找不到题目列表文件: {fp}")
+
+    if out_normalized is not None:
+        norm_path = Path(out_normalized)
+        if norm_path.resolve() == fp.resolve():
+            raise PreconditionError(f"PRECONDITION_FAILED: out_normalized 不得指向源文件本身（源文件严格只读）: {fp}")
+    else:
+        ts_slug, _ = _now_ts_str("Asia/Shanghai")
+        norm_path = Path(drafts_dir) / "preflight" / f"{ts_slug}_{fp.stem}.normalized.md"
+
+    raw_text = fp.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    src_base_dir = fp.resolve().parent
+    fixes_applied: list[str] = []
+
+    # 1. 修复 `##12.` / `###2.` 标题漏空格
+    pass1_lines: list[str] = []
+    for line_no, raw_line in enumerate(raw_text.split("\n"), start=1):
+        m_no_space = _HEADING_NO_SPACE_RE.match(raw_line)
+        if m_no_space:
+            fixed = f"{m_no_space.group(1)} {m_no_space.group(2).lstrip()}"
+            pass1_lines.append(fixed)
+            fixes_applied.append(f"L{line_no}: 标题补空格 '{raw_line.strip()}' -> '{fixed.strip()}'")
+        else:
+            pass1_lines.append(raw_line)
+
+    # 2. 修复 `---` 分隔线后孤立错位的 `图片:` 行归位
+    pass2_lines: list[str] = []
+    i = 0
+    n_lines = len(pass1_lines)
+    while i < n_lines:
+        cur = pass1_lines[i]
+        if _HR_RE.match(cur):
+            has_prev_content = any(ln.strip() and not _HR_RE.match(ln) for ln in pass2_lines)
+            j = i + 1
+            collected_imgs: list[str] = []
+            while j < n_lines:
+                nxt = pass1_lines[j]
+                if not nxt.strip():
+                    j += 1
+                    continue
+                if _is_image_only_line(nxt):
+                    collected_imgs.append(nxt)
+                    j += 1
+                    continue
+                break
+            at_boundary = j >= n_lines or bool(_HEADING_RE.match(pass1_lines[j])) or bool(_HR_RE.match(pass1_lines[j]))
+            if has_prev_content and collected_imgs and at_boundary:
+                for img_line in collected_imgs:
+                    pass2_lines.append(img_line)
+                    fixes_applied.append(f"错位图片行归位至分隔线前: '{img_line.strip()}'")
+                pass2_lines.append(cur)
+                i = j
+                continue
+        pass2_lines.append(cur)
+        i += 1
+
+    # 3. 拆分标题与正文同行（避免丢弃题干）
+    pass3_lines: list[str] = []
+    auto_q_idx = 0
+    for idx, line in enumerate(pass2_lines):
+        m_head = _HEADING_PARTS_RE.match(line)
+        if m_head:
+            auto_q_idx += 1
+            hashes = m_head.group(1).strip()
+            content = m_head.group(2).strip()
+            has_body = _block_has_body_text(pass2_lines, idx + 1)
+            m_inline = _INLINE_BODY_HEADING_RE.match(content)
+            if m_inline:
+                title_part = m_inline.group(1).strip()
+                rest_part = m_inline.group(2).strip()
+                looks_like_prose = (
+                    not has_body
+                    or len(rest_part) >= 16
+                    or any(ch in rest_part for ch in "。？！?!，,;；：:")
+                    or bool(re.search(r"\d", rest_part))
+                )
+                if rest_part and looks_like_prose:
+                    pass3_lines.append(f"{hashes} {title_part}")
+                    pass3_lines.append(rest_part)
+                    fixes_applied.append(f"拆分同行标题与题干: '{content[:30]}'")
+                    continue
+            else:
+                stripped_stem = _Q_NUM_PREFIX_RE.sub("", content).strip()
+                if not has_body and stripped_stem and (
+                    len(stripped_stem) >= 12
+                    or any(ch in stripped_stem for ch in "。？！?!，,;；：:")
+                    or bool(re.search(r"\d", stripped_stem))
+                ):
+                    pass3_lines.append(f"{hashes} 第 {auto_q_idx} 题")
+                    pass3_lines.append(stripped_stem)
+                    fixes_applied.append(f"无正文标题降级为题干: '{stripped_stem[:30]}'")
+                    continue
+        pass3_lines.append(line)
+
+    # 4. 相对图片路径转绝对路径
+    pass4_lines = [_absolutize_image_line(ln, src_base_dir, fixes_applied) for ln in pass3_lines]
+    normalized_text = "\n".join(pass4_lines).rstrip() + "\n"
+
+    norm_path.parent.mkdir(parents=True, exist_ok=True)
+    norm_path.write_text(normalized_text, encoding="utf-8")
+
+    parsed_items = parse_question_list_markdown(norm_path)
+    missing_images: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    items_out: list[dict[str, Any]] = []
+
+    if not parsed_items:
+        warnings.append("未能从规范化副本中解析出任何有效题目。")
+
+    for item in parsed_items:
+        item_missing: list[str] = []
+        for p, raw_ref in zip(item.image_paths, item.raw_image_refs, strict=False):
+            if not p.exists():
+                p_str = str(p)
+                item_missing.append(p_str)
+                missing_images.append(
+                    {
+                        "index": item.index,
+                        "title": item.title,
+                        "image_path": p_str,
+                        "raw_ref": raw_ref,
+                    }
+                )
+        if not item.question_text.strip():
+            warnings.append(f"第 {item.index} 题（{item.title}）题干文本为空。")
+        items_out.append(
+            {
+                "index": item.index,
+                "title": item.title,
+                "char_count": len(item.question_text),
+                "image_count": len(item.image_paths),
+                "missing_images": item_missing,
+                "preview": item.question_text[:80].replace("\n", " "),
+            }
+        )
+
+    if missing_images:
+        warnings.append(f"共有 {len(missing_images)} 张配图文件不存在，请检查路径。")
+
+    return {
+        "source_file": str(fp.resolve()),
+        "normalized_file": str(norm_path.resolve()),
+        "fixes_applied": fixes_applied,
+        "total_questions": len(parsed_items),
+        "missing_images": missing_images,
+        "warnings": warnings,
+        "items": items_out,
+    }

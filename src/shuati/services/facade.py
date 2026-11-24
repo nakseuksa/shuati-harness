@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from shuati.config import Settings
-from shuati.core import effective, refresh
+from shuati.core import effective, refresh, taxonomy
 from shuati.db import human_mirror, repository
 from shuati.db.connection import PreconditionError, SingleWriterExecutor, get_connection
 from shuati.db.repository import NotFoundError
@@ -540,15 +540,36 @@ def reconfirm_stale_overrides(
         raise NotFoundError(f"题目 '{uid}' 不存在")
     content_hash = raw_row["content_hash"]
 
+    q_gs_row = conn.execute(
+        "SELECT grade_subject FROM questions WHERE question_uid = ?",
+        (uid,),
+    ).fetchone()
+    current_tax_ver = ""
+    if q_gs_row:
+        gs_row = conn.execute(
+            "SELECT taxonomy_version FROM grade_subjects WHERE grade_subject = ?",
+            (q_gs_row["grade_subject"],),
+        ).fetchone()
+        if gs_row:
+            current_tax_ver = str(gs_row["taxonomy_version"] or "").strip()
+
+    ver_fields = sorted(effective.VERIFICATION_OVERRIDE_FIELDS)
+    ph = ",".join("?" for _ in ver_fields)
+    tax_fields = sorted(effective.TAXONOMY_OVERRIDE_FIELDS)
+    tax_ph = ",".join("?" for _ in tax_fields)
     stale_rows = conn.execute(
-        """
+        f"""
         SELECT * FROM human_overrides
         WHERE question_uid = ?
           AND is_active = 1
-          AND (is_suspended = 1 OR base_fingerprint != ?)
+          AND (
+              is_suspended = 1
+              OR (field_name IN ({ph}) AND base_fingerprint != ?)
+              OR (field_name IN ({tax_ph}) AND taxonomy_version != '' AND ? != '' AND taxonomy_version != ?)
+          )
         ORDER BY override_id ASC
         """,
-        (uid, content_hash),
+        (uid, *ver_fields, content_hash, *tax_fields, current_tax_ver, current_tax_ver),
     ).fetchall()
     if not stale_rows:
         raise PreconditionError(f"题目 '{uid}' 没有待确认的挂起/过期覆写")
@@ -573,6 +594,11 @@ def reconfirm_stale_overrides(
                 "UPDATE human_overrides SET is_active = 0 WHERE override_id = ?",
                 (old["override_id"],),
             )
+            new_tax_ver = (
+                current_tax_ver
+                if old["field_name"] in effective.TAXONOMY_OVERRIDE_FIELDS
+                else old["taxonomy_version"]
+            )
             conn.execute(
                 """
                 INSERT INTO human_overrides(
@@ -589,7 +615,7 @@ def reconfirm_stale_overrides(
                     source,
                     new_bid,
                     content_hash,
-                    old["taxonomy_version"],
+                    new_tax_ver,
                 ),
             )
 
@@ -776,7 +802,6 @@ from shuati.services.mistake import (  # noqa: E402, F401
 )
 from shuati.services.practice import (  # noqa: E402, F401
     apply_single_override,
-    browse_taxonomy,
     check_answer_async,
     create_learner,
     get_related_questions,
@@ -785,11 +810,115 @@ from shuati.services.practice import (  # noqa: E402, F401
     log_batch_practice,
     log_practice,
     resolve_learner_id,
-    search_questions,
     use_learner,
     void_practice_log,
 )
-from shuati.services.reveal import apply_reveal  # noqa: E402, F401
+from shuati.services.practice import browse_taxonomy as _practice_browse_taxonomy  # noqa: E402
+from shuati.services.practice import search_questions as _practice_search_questions  # noqa: E402
+from shuati.services.reveal import RevealMode, apply_reveal  # noqa: E402, F401
+
+
+def browse_taxonomy(
+    conn: sqlite3.Connection,
+    *,
+    grade_subject: str,
+    learner_id: str | None = None,
+    l1: str | None = None,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """浏览学段知识树、先修 DAG、题量与学习者掌握热力（含维护降级检测）。"""
+    res = _practice_browse_taxonomy(
+        conn,
+        grade_subject=grade_subject,
+        learner_id=learner_id,
+        l1=l1,
+        settings=settings,
+    )
+    maint = taxonomy.get_taxonomy_maintenance_status(conn, grade_subject)
+    warnings = list(res.get("warnings") or [])
+    if maint["degraded"]:
+        res["maintenance_degraded"] = True
+        if maint["message"] and not any(str(w).startswith("MAINTENANCE_DEGRADED") for w in warnings):
+            warnings.append(maint["message"])
+    res["warnings"] = warnings
+    res["maintenance_status"] = maint
+    return res
+
+
+def search_questions(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    grade_subject: str | None = None,
+    l1: str | None = None,
+    l2: str | None = None,
+    l3: str | None = None,
+    motif: str | None = None,
+    method: str | None = None,
+    trap: str | None = None,
+    tier: str | None = None,
+    elo_min: int | None = None,
+    elo_max: int | None = None,
+    query: str | None = None,
+    semantic: str | None = None,
+    exclude_solved: bool = False,
+    learner_id: str | None = None,
+    reveal: RevealMode = "quiz",
+    hint_level: int = 1,
+    include_visual_facts: bool = False,
+    limit: int = 20,
+    assets_dir: Path | str = Path("data/assets/images"),
+    vectors_dir: Path | str = Path("data/vectors"),
+    use_mock: bool | None = None,
+) -> dict[str, Any]:
+    """多维条件 + FTS5 + 骨架语义综合检索（对 --l2/--l3 附加词表维护降级检测）。"""
+    res = _practice_search_questions(
+        conn,
+        settings,
+        grade_subject=grade_subject,
+        l1=l1,
+        l2=l2,
+        l3=l3,
+        motif=motif,
+        method=method,
+        trap=trap,
+        tier=tier,
+        elo_min=elo_min,
+        elo_max=elo_max,
+        query=query,
+        semantic=semantic,
+        exclude_solved=exclude_solved,
+        learner_id=learner_id,
+        reveal=reveal,
+        hint_level=hint_level,
+        include_visual_facts=include_visual_facts,
+        limit=limit,
+        assets_dir=assets_dir,
+        vectors_dir=vectors_dir,
+        use_mock=use_mock,
+    )
+    if l2 or l3:
+        target_subjects = (
+            [grade_subject]
+            if grade_subject
+            else [
+                str(r["grade_subject"])
+                for r in conn.execute(
+                    "SELECT grade_subject FROM grade_subjects WHERE taxonomy_status IN ('LOCKED', 'DRAFT');"
+                ).fetchall()
+            ]
+        )
+        warnings = list(res.get("warnings") or [])
+        degraded_any = False
+        for gs_name in target_subjects:
+            maint = taxonomy.get_taxonomy_maintenance_status(conn, gs_name)
+            if maint["degraded"]:
+                degraded_any = True
+                if maint["message"] and maint["message"] not in warnings:
+                    warnings.append(maint["message"])
+        res["maintenance_degraded"] = degraded_any
+        res["warnings"] = warnings
+    return res
 
 
 def get_question_detail(

@@ -1,18 +1,37 @@
-"""字段白名单 Prompt 构造器：严禁 uid / source_collection / chapter / 原始图片路径入 Prompt，内存 EXIF 矫正与多图显式编号。"""
+"""字段白名单 Prompt 构造器：严禁 uid / source_collection / chapter / 原始图片路径入 Prompt，内存 EXIF 矫正与多图显式编号。
+
+同时集成三层提示词接缝引擎（seam_loader）并锁死全部硬契约：
+- 防泄漏白名单投影；
+- `AnswerPart` 映射矩阵与标签规范；
+- `def verify():` SymPy AST 规范；
+- `visual_facts` 首位与四维难度 `evidence` 先于 `score`；
+- D-Audit-4 人工视觉/答案最高权威指令；
+- D-Audit-5 `SCAFFOLD` 方向 `source = 子题 → target = 母题`。
+"""
 
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
 from PIL import Image, ImageOps
+from pydantic import BaseModel
 
-from shuati.models.schemas import Stage1Input
+from shuati.llm.seam_loader import ResolvedSeamBundle, load_prompt_seams
+from shuati.models.schemas import (
+    Stage1Input,
+    Stage2OnlyOutput,
+    UnifiedS1S2Output,
+)
 
 STAGE1_PROMPT_VERSION = "s1_v2"
+STAGE2_PROMPT_VERSION = "s2_v1"
+UNIFIED_PROMPT_VERSION = "unified-v1.0"
 
 _ANSWER_PART_SPEC_TEXT = """`final_answers` 为 `AnswerPart` 非空数组（**严禁改名为 `questions`、`answers` 或其他键**）。每个 `AnswerPart` 必须包含以下字段：
 - `label`: 小问标签，仅允许 `"主问"` 或 `"(1)"`, `"(2)"`...；严禁自造 `"(1)-1"`、`"(1)-k"` 等子标签。
@@ -40,6 +59,20 @@ _ANSWER_PART_SPEC_TEXT = """`final_answers` 为 `AnswerPart` 非空数组（**�
   - `SYMBOL_FILL`：`{"label": "(2)", "answer_type": "SYMBOL_FILL", "verify_mode": "EXACT", "collection_mode": "SINGLE", "answer": "＞", "unit": null, "sympy_expr": null, "items": null, "choice_label": null, "canonical": "＞"}`
   - `TEXT`/`PROOF`：`{"label": "(2)", "answer_type": "PROOF", "verify_mode": "QUALITATIVE", "collection_mode": "SINGLE", "answer": "由全等三角形判定 SAS 可得结论成立", "unit": null, "sympy_expr": null, "items": null, "choice_label": null, "canonical": null}`"""
 
+_TRAP_ENUM_SPEC_TEXT = """`trap_tags` **严禁自造中文自由文本**，仅允许从以下 6 个标准代码中选取（无匹配则置空数组 `[]`）：
+   - `TRAP_DOMAIN_BOUNDARY`（边界端点与定义域遗漏）
+   - `TRAP_SIGN_DIRECTION`（符号方向与正负/运动方向歧义）
+   - `TRAP_EXTRANEOUS_ROOT`（增根虚解与几何不可行）
+   - `TRAP_FRAME_SHIFT`（参考系转换与比例/基准量漂移）
+   - `TRAP_APPROX_CONDITION`（近似条件滥用与循环论证）
+   - `TRAP_ARITHMETIC_SLIP`（纯四则计算与抄写笔误）"""
+
+_DIFFICULTY_RUBRIC_SPEC_TEXT = """四维难度 `difficulty` 必须按学段最优标准解法并严格对照下方黄金锚点打分，每维**先写 `evidence`（可观测解题动作证据）再写整数 `score`**，严禁超界：
+   - `C_concept_count`（概念与思维深度，**整数 1~4**）：1=单模型直推；2=单点变形或常规双考点串联；3=跨模块综合或隐式深层建模；4=非标构造或高阶竞赛洞察。
+   - `S_chain_length`（逻辑推理链长，不含纯四则算术，**整数 1~3，严禁打 4**）：1=1~2 逻辑步；2=3~4 逻辑步；3=≥5 步或 ≥2 种独立情况分类讨论。
+   - `T_trickiness`（信息隐蔽度与陷阱，**整数 1~3，严禁打 4**）：1=显式透明；2=含冗余干扰/隐含条件或常规图文转译；3=强反直觉、极端临界边界或连环陷阱。
+   - `L_computation_load`（运算与审题负荷，**整数 1~3，严禁打 4**）：1=心算/短题干；2=常规纸笔多步演算；3=高繁复计算、多变量联立或高密度信息。"""
+
 _MIME_BY_FORMAT: dict[str, str] = {
     "JPEG": "image/jpeg",
     "PNG": "image/png",
@@ -47,6 +80,36 @@ _MIME_BY_FORMAT: dict[str, str] = {
     "GIF": "image/gif",
     "BMP": "image/bmp",
 }
+
+
+def _try_load_seam_bundle(
+    *,
+    grade_subject: str,
+    config_dir: Path,
+    prompt_profile: str | None,
+) -> ResolvedSeamBundle | None:
+    if prompt_profile is not None and prompt_profile.strip():
+        return load_prompt_seams(
+            config_dir=config_dir,
+            grade_subject=grade_subject,
+            profile=prompt_profile,
+        )
+    default_yaml = Path(config_dir) / "prompts" / "default.yaml"
+    if default_yaml.is_file():
+        return load_prompt_seams(
+            config_dir=config_dir,
+            grade_subject=grade_subject,
+            profile=None,
+        )
+    return None
+
+
+def _join_seam_sections(bundle: ResolvedSeamBundle | None, keys: Sequence[str], *, section: str = "blocks") -> str:
+    if bundle is None:
+        return ""
+    mapping = bundle.blocks if section == "blocks" else bundle.stages
+    parts = [mapping[k].strip() for k in keys if k in mapping and mapping[k].strip()]
+    return "\n\n".join(parts)
 
 
 def _load_transposed_image_data_url(image_path: Path) -> str:
@@ -69,11 +132,149 @@ def _load_transposed_image_data_url(image_path: Path) -> str:
         return f"data:{mime};base64,{b64}"
 
 
+def _resolve_local_image_path(img_ref: str | Path, assets_dir: Path | None) -> Path:
+    p = Path(img_ref)
+    if assets_dir is not None and not p.is_absolute():
+        direct = p
+        under_assets = Path(assets_dir) / p
+        if under_assets.exists() or not direct.exists():
+            return under_assets
+    return p
+
+
+def _append_image_blocks(
+    user_parts: list[dict[str, Any]],
+    *,
+    images: Sequence[str | Path],
+    captions: Sequence[str],
+    embed_images: bool,
+    assets_dir: Path | None,
+    always_label: bool = False,
+) -> None:
+    multi = len(images) >= 2
+    for idx, img_ref in enumerate(images, start=1):
+        cap = captions[idx - 1].strip() if idx - 1 < len(captions) else ""
+        if multi or always_label:
+            label_text = f"【配图 {idx}（{cap}）】" if cap else f"【配图 {idx}】"
+            user_parts.append({"type": "text", "text": label_text})
+        elif cap:
+            user_parts.append({"type": "text", "text": f"【配图 {idx}（{cap}）】"})
+
+        if embed_images:
+            resolved = _resolve_local_image_path(img_ref, assets_dir)
+            data_url = _load_transposed_image_data_url(resolved)
+            user_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+        else:
+            user_parts.append(
+                {
+                    "type": "image_path",
+                    "image_path": str(img_ref),
+                    "index": idx,
+                    "caption": cap,
+                }
+            )
+
+
+def flatten_json_schema(schema_cls: type[BaseModel]) -> dict[str, Any]:
+    """内联展开 Pydantic `$defs`/`$ref` 并锁死 Stage 2 四维难度硬界限（C∈[1,4]、S/T/L∈[1,3]）。"""
+    raw_schema = copy.deepcopy(schema_cls.model_json_schema())
+    defs: dict[str, Any] = {}
+    for def_key in ("$defs", "definitions"):
+        extracted = raw_schema.pop(def_key, None)
+        if isinstance(extracted, dict):
+            defs.update(extracted)
+
+    def _resolve_ref(ref_str: str, active_stack: set[str]) -> Any:
+        if not ref_str.startswith("#/"):
+            return {"$ref": ref_str}
+        parts = ref_str[2:].split("/")
+        if len(parts) == 2 and parts[0] in ("$defs", "definitions") and parts[1] in defs:
+            name = parts[1]
+            if name in active_stack:
+                return {"type": "object"}
+            return _inline(copy.deepcopy(defs[name]), active_stack | {name})
+        return {"$ref": ref_str}
+
+    def _inline(node: Any, active_stack: set[str]) -> Any:
+        if isinstance(node, list):
+            return [_inline(item, active_stack) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        if "$ref" in node:
+            ref_target = _resolve_ref(str(node["$ref"]), active_stack)
+            siblings = {k: v for k, v in node.items() if k != "$ref"}
+            if isinstance(ref_target, dict):
+                merged = copy.deepcopy(ref_target)
+                for k, v in siblings.items():
+                    merged[k] = _inline(v, active_stack)
+                return _inline(merged, active_stack)
+            return ref_target
+
+        out: dict[str, Any] = {}
+        for k, v in node.items():
+            if k in ("$defs", "definitions"):
+                continue
+            out[k] = _inline(v, active_stack)
+        return out
+
+    def _enforce_hard_bounds(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                _enforce_hard_bounds(item)
+            return
+        if not isinstance(node, dict):
+            return
+
+        props = node.get("properties")
+        if isinstance(props, dict):
+            if "visual_facts" in props:
+                reordered: dict[str, Any] = {"visual_facts": props["visual_facts"]}
+                for pk, pv in props.items():
+                    if pk != "visual_facts":
+                        reordered[pk] = pv
+                node["properties"] = reordered
+                props = reordered
+
+            for dim_key, max_val in (
+                ("C_concept_count", 4),
+                ("S_chain_length", 3),
+                ("T_trickiness", 3),
+                ("L_computation_load", 3),
+            ):
+                dim_schema = props.get(dim_key)
+                if isinstance(dim_schema, dict) and isinstance(dim_schema.get("properties"), dict):
+                    d_props = dim_schema["properties"]
+                    if "evidence" in d_props and "score" in d_props:
+                        dim_schema["properties"] = {
+                            "evidence": d_props["evidence"],
+                            "score": d_props["score"],
+                            **{k: v for k, v in d_props.items() if k not in ("evidence", "score")},
+                        }
+                        dim_schema["required"] = ["evidence", "score"]
+                    score_prop = dim_schema["properties"].get("score")
+                    if isinstance(score_prop, dict):
+                        score_prop["type"] = "integer"
+                        score_prop["minimum"] = 1
+                        score_prop["maximum"] = max_val
+
+        for v in node.values():
+            _enforce_hard_bounds(v)
+
+    flattened = _inline(raw_schema, set())
+    if isinstance(flattened, dict):
+        _enforce_hard_bounds(flattened)
+        return flattened
+    return {}
+
+
 def build_stage1_messages(
     inp: Stage1Input,
     *,
     role: Literal["PRIMARY", "SECONDARY"],
     assets_dir: Path,
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """严格字段白名单组装 Stage 1 消息。
 
@@ -82,6 +283,13 @@ def build_stage1_messages(
     - len(cas_images) >= 2 时，每张图前插入文本块：【配图 {i}】或【配图 {i}（{caption}）】；
     - 明确声明：禁止自造 (1)-k 子小问标签；未指定 π 近似值时保留精确符号 pi；visual_facts 严禁写入未画出的辅助线或推导结论。
     """
+    bundle = _try_load_seam_bundle(
+        grade_subject=inp.grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    seam_notes = _join_seam_sections(bundle, ("persona", "visual_extraction", "solving_conventions"))
+
     role_desc = (
         "你是主路独立解题与验真专家（PRIMARY），需在解答末尾给出可独立运行的 Python SymPy 验算脚本 sympy_code（定义 def verify(): 返回 dict[str, str | list[str]]）。"
         if role == "PRIMARY"
@@ -131,6 +339,8 @@ def build_stage1_messages(
             "`solution_markdown`（str，完整推导过程）、`final_answers`（AnswerPart 非空数组，严禁改名为 `questions` 或其他键）。"
         )
 
+    seam_section = f"\n\n【学科教研补充规范】\n{seam_notes}" if seam_notes else ""
+
     system_text = (
         f"你是一位严谨的{inp.grade_subject}学科解题专家。{role_desc}\n"
         "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下硬性规则：\n"
@@ -145,7 +355,7 @@ def build_stage1_messages(
         "5. `answer_type` 与 `verify_mode` 必须严格匹配："
         "NUMERIC/EXPRESSION/RATIO/SET_OR_INTERVAL -> SYMBOLIC；CHOICE/SYMBOL_FILL -> EXACT；TEXT/PROOF -> QUALITATIVE。\n"
         "6. 数值约定：题干未明确指定 π 近似值（如“π 取 3.14”）时，`sympy_expr` 必须保留精确符号 pi、sqrt(...) 或分数。"
-        f"{sympy_rule}\n\n"
+        f"{sympy_rule}{seam_section}\n\n"
         "【输出 JSON 结构模板】\n"
         f"{top_keys_desc}\n"
         f"{json_schema_template}\n\n"
@@ -162,17 +372,13 @@ def build_stage1_messages(
 
     images = inp.cas_images or []
     captions = inp.image_captions or []
-    multi = len(images) >= 2
-    for idx, cas_img in enumerate(images, start=1):
-        cap = captions[idx - 1].strip() if idx - 1 < len(captions) else ""
-        if multi:
-            label_text = f"【配图 {idx}（{cap}）】" if cap else f"【配图 {idx}】"
-            user_parts.append({"type": "text", "text": label_text})
-        elif cap:
-            user_parts.append({"type": "text", "text": f"【配图 {idx}（{cap}）】"})
-
-        data_url = _load_transposed_image_data_url(Path(assets_dir) / cas_img)
-        user_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+    _append_image_blocks(
+        user_parts,
+        images=images,
+        captions=captions,
+        embed_images=True,
+        assets_dir=Path(assets_dir),
+    )
 
     user_content: Any = user_parts if images else user_parts[0]["text"]
     return [
@@ -186,11 +392,24 @@ def build_qualitative_judge_messages(
     answer_a: str,
     answer_b: str,
     question_text: str = "",
+    *,
+    grade_subject: str = "小学奥数",
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """构造定性/作图小问语义等价裁判消息（纯文本，字段白名单）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    judge_seam = _join_seam_sections(bundle, ("stage1_judge",), section="stages")
+    seam_tail = f"\n{judge_seam}" if judge_seam else ""
+
     system_text = (
         "你是严谨的理科阅卷裁判。请判断两位解题者对同一小问的定性表述或作图操作方法是否在核心科学结论与方法上等价。\n"
         "请严格输出 JSON：{\"equivalent\": bool, \"confidence\": \"HIGH\"|\"MEDIUM\"|\"LOW\", \"reason\": \"...\"}。"
+        f"{seam_tail}"
     )
     sections = [f"【小问标签】{label}"]
     if question_text.strip():
@@ -208,12 +427,25 @@ def build_multi_solution_judge_messages(
     sol_a: str,
     summary_b: str,
     sol_b: str,
+    *,
+    grade_subject: str = "小学奥数",
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """构造一题多解本质路线差异裁判消息（纯文本，字段白名单）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    judge_seam = _join_seam_sections(bundle, ("stage1_judge",), section="stages")
+    seam_tail = f"\n{judge_seam}" if judge_seam else ""
+
     system_text = (
         "你是竞赛数学教研专家。请判断以下两份正确解答是否属于本质不同的解题路线（如几何割补构造 vs 代数方程/相似比例），"
         "而非仅仅是算式顺序或文字措辞的微小差异。\n"
         "请严格输出 JSON：{\"is_distinct_method\": bool, \"reason\": \"...\"}。"
+        f"{seam_tail}"
     )
     user_text = (
         f"【解法 A 摘要】{summary_a}\n【解法 A 正文】\n{sol_a}\n\n"
@@ -229,15 +461,27 @@ def build_review_resolve_messages(
     question_text: str,
     visual_facts: str,
     grade_subject: str,
+    *,
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """构造复核页 [R] 辅助重算参考解答草稿消息（纯文本 text_llm，零视觉 Token，字段白名单）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    seam_notes = _join_seam_sections(bundle, ("solving_conventions",))
+    seam_tail = f"\n\n【学科求解补充】\n{seam_notes}" if seam_notes else ""
+
     system_text = (
         f"你是{grade_subject}学科解答重算助手。人工复核员已核定该题的题干与客观视觉事实（visual_facts），"
         "请严格依据提供的题干与 visual_facts 重新推导完整参考解答、各小问结构化答案（final_answers）与 SymPy 验算脚本（sympy_code）。\n"
         "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），遵守以下要求：\n"
         "1. 小问标签仅允许 \"主问\" 或 \"(1)\", \"(2)\"...，禁止自造 \"(1)-1\" 子标签。\n"
         "2. `sympy_code`（存在 `SYMBOLIC` 小问时必填，否则置 `null`）：仅允许导入 sympy / math / fractions，"
-        "必须定义 def verify(): 返回 dict[str, str | list[str]]，并通过真实运算得出结果（禁止硬编码常量返回）。\n\n"
+        "必须定义 def verify(): 返回 dict[str, str | list[str]]，并通过真实运算得出结果（禁止硬编码常量返回）。"
+        f"{seam_tail}\n\n"
         "【输出 JSON 结构模板】\n"
         "顶层必填键：`method_summary`（str，一句话解法路线）、`solution_markdown`（str，完整推导过程）、"
         "`final_answers`（AnswerPart 非空数组，严禁改名为 `questions` 或其他键）、"
@@ -258,6 +502,283 @@ def build_review_resolve_messages(
     ]
 
 
+def build_stage2_messages(
+    *,
+    grade_subject: str,
+    question_text: str,
+    visual_facts: str = "",
+    verified_final_answers: list[dict[str, Any]] | None = None,
+    verified_method_summary: str = "",
+    verified_solution_markdown: str = "",
+    anchors_prompt_text: str = "",
+    taxonomy_enum_text: str = "",
+    options: dict[str, str] | None = None,
+    has_images: bool = False,
+    image_paths: Sequence[str | Path] | None = None,
+    image_captions: Sequence[str] | None = None,
+    assets_dir: Path | None = None,
+    embed_images: bool = True,
+    has_human_visual_override: bool = False,
+    has_human_answer_override: bool = False,
+    task_id: str | None = None,
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
+) -> list[dict[str, Any]]:
+    """Stage 2 多模态深度拆解与四维打标消息构造（D-Audit-4：有图传原图 + 人工视觉/答案最高权威）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    block_keys = ["persona", "steps_and_socratic_hint", "abstraction_and_tagging", "difficulty_rubric_notes"]
+    if has_images:
+        block_keys.insert(1, "visual_extraction")
+    seam_notes = _join_seam_sections(bundle, block_keys)
+
+    override_rules: list[str] = []
+    if has_human_visual_override:
+        override_rules.append(
+            "【D-Audit-4 人工视觉事实最高权威】本题的 `verified_visual_facts` 已由人工复核核定；"
+            "若原图印刷模糊、阴影边界或标注细节与已核定 `verified_visual_facts` 存在歧义冲突，"
+            "**必须无条件以人工核定的 `verified_visual_facts` 为准，严禁自行推翻重读**。"
+        )
+    if has_human_answer_override:
+        override_rules.append(
+            "【D-Audit-4 人工标准答案最高权威】本题的 `verified_final_answers` 已由人工复核核定；"
+            "步骤拆解、核心公式与提示**必须无条件服从该人工标准答案**，严禁篡改答案或得出相反结论。"
+        )
+    if not override_rules:
+        override_rules.append(
+            "【已验真事实约束】本题已通过 Stage 1 验真，所有拆解步骤与难度评估必须忠于已核定的参考解答与标准答案，不得自行推翻终值。"
+        )
+
+    seam_section = f"\n\n【学科与阶段指导】\n{seam_notes}" if seam_notes else ""
+    override_section = "\n".join(override_rules)
+
+    system_text = (
+        f"你是严谨的{grade_subject}学科题库深度拆解与难度标定专家（Stage 2）。\n"
+        f"{override_section}\n\n"
+        "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下硬性规则：\n"
+        "1. `steps`（1~5 个有教学意义的逻辑推理步，合并纯四则代入计算）：\n"
+        "   - `step_index`: 从 1 开始连续递增整数；\n"
+        "   - `sub_goal`: 该步核心子目标；`core_formula`: 核心关系式/公式；`hint`: 启发提示（严禁直接剧透最终答案数值）；\n"
+        "   - `raw_l1`: 该步所属一级学科大模块名；`raw_l2`: 该步所属二级知识实体名；\n"
+        "   - `raw_l3`: **4~14 字脱壳原子转化算子短语**，严禁包含题干具体数字、人名道具或整句解说。\n"
+        "2. `abstract_skeleton`：抹除人名、道具与题干具体数字，用纯学科元语言概括“已知结构 → 核心转化 → 求解目标”。\n"
+        "3. `thinking_methods`（具体可操作技法，禁用“转化与化归/逻辑推理/综合法/分析法”等万金油泛词）、`classic_motifs`（经典母题，宁缺毋滥）。\n"
+        f"4. {_TRAP_ENUM_SPEC_TEXT}\n"
+        f"5. {_DIFFICULTY_RUBRIC_SPEC_TEXT}{seam_section}\n\n"
+        "【输出 JSON 结构模板】\n"
+        "{\n"
+        '  "task_id": "原样回填 task_id",\n'
+        '  "steps": [{"step_index": 1, "sub_goal": "...", "core_formula": "...", "hint": "...", "raw_l1": "...", "raw_l2": "...", "raw_l3": "4~14字原子算子"}],\n'
+        '  "abstract_skeleton": "去情境抽象骨架（无具体数字）",\n'
+        '  "primary_l1_module": "一级大模块",\n'
+        '  "secondary_l1_modules": [],\n'
+        '  "thinking_methods": ["具体技法"],\n'
+        '  "classic_motifs": ["经典母题"],\n'
+        '  "trap_tags": [],\n'
+        '  "difficulty": {\n'
+        '    "C_concept_count": {"evidence": "...", "score": 2},\n'
+        '    "S_chain_length": {"evidence": "...", "score": 2},\n'
+        '    "T_trickiness": {"evidence": "...", "score": 2},\n'
+        '    "L_computation_load": {"evidence": "...", "score": 1}\n'
+        "  }\n"
+        "}"
+    )
+
+    sections: list[str] = []
+    if task_id:
+        sections.append(f"【task_id】{task_id}")
+    sections.append(f"【学段学科】{grade_subject}")
+    if taxonomy_enum_text.strip():
+        sections.append(f"【当前标准词表参考】\n{taxonomy_enum_text.strip()}")
+    if anchors_prompt_text.strip():
+        sections.append(f"【难度校准黄金锚点标尺】\n{anchors_prompt_text.strip()}")
+    sections.append(f"【题干】\n{question_text}")
+    if options:
+        sections.append(f"【选择题选项】{json.dumps(options, ensure_ascii=False)}")
+    if visual_facts.strip() or has_human_visual_override:
+        vf_label = "【人工核定视觉事实 visual_facts（最高权威）】" if has_human_visual_override else "【已核定视觉事实 visual_facts】"
+        sections.append(f"{vf_label}\n{visual_facts.strip() or '（无配图）'}")
+    if verified_final_answers is not None:
+        ans_label = "【人工核定标准答案 final_answers（最高权威）】" if has_human_answer_override else "【已验真标准答案 final_answers】"
+        sections.append(f"{ans_label}\n{json.dumps(verified_final_answers, ensure_ascii=False)}")
+    if verified_method_summary.strip():
+        sections.append(f"【已验真解法摘要】{verified_method_summary.strip()}")
+    if verified_solution_markdown.strip():
+        sections.append(f"【已验真参考解答】\n{verified_solution_markdown.strip()}")
+
+    user_parts: list[dict[str, Any]] = [{"type": "text", "text": "\n\n".join(sections)}]
+    imgs = list(image_paths or []) if has_images else []
+    caps = list(image_captions or [])
+    if imgs:
+        _append_image_blocks(
+            user_parts,
+            images=imgs,
+            captions=caps,
+            embed_images=embed_images,
+            assets_dir=assets_dir,
+            always_label=not embed_images,
+        )
+
+    user_content: Any = user_parts if imgs else user_parts[0]["text"]
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def build_unified_s1_s2_messages(
+    *,
+    task_payload: dict[str, Any],
+    anchors_prompt_text: str,
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
+    embed_images: bool = False,
+    assets_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], ResolvedSeamBundle]:
+    """构造 Stage 1+2 合一编译器（或 STAGE2_ONLY）脱敏消息，返回 `(messages, ResolvedSeamBundle)`。"""
+    # 严格白名单投影：绝不读取 question_uid / source_collection / raw_chapter / legacy_tags / raw_images
+    task_id = str(task_payload.get("task_id") or "")
+    mode = str(task_payload.get("mode") or "UNIFIED_S1_S2").strip().upper()
+    grade_subject = str(task_payload.get("grade_subject") or "小学奥数")
+    allow_pi_314 = bool(task_payload.get("allow_pi_314", False))
+    question_text = str(task_payload.get("question_text") or "")
+    q_format = str(task_payload.get("format") or "")
+    options = task_payload.get("options") if isinstance(task_payload.get("options"), dict) else {}
+    raw_images = task_payload.get("image_paths") if task_payload.get("image_paths") is not None else task_payload.get("cas_images")
+    images = [str(p) for p in raw_images] if isinstance(raw_images, list) else []
+    has_images = bool(task_payload.get("has_images", False) or len(images) > 0)
+    raw_caps = task_payload.get("image_captions")
+    captions = [str(c) for c in raw_caps] if isinstance(raw_caps, list) else []
+
+    bundle = load_prompt_seams(
+        config_dir=config_dir,
+        grade_subject=grade_subject,
+        profile=prompt_profile,
+    )
+
+    if mode == "STAGE2_ONLY":
+        verified_vf = str(task_payload.get("verified_visual_facts") or "")
+        verified_ans = task_payload.get("verified_final_answers")
+        verified_answers_list = verified_ans if isinstance(verified_ans, list) else None
+        msgs = build_stage2_messages(
+            grade_subject=grade_subject,
+            question_text=question_text,
+            visual_facts=verified_vf,
+            verified_final_answers=verified_answers_list,
+            verified_method_summary=str(task_payload.get("verified_method_summary") or ""),
+            verified_solution_markdown=str(task_payload.get("verified_solution_markdown") or ""),
+            anchors_prompt_text=anchors_prompt_text,
+            options=options or None,
+            has_images=has_images,
+            image_paths=images,
+            image_captions=captions,
+            assets_dir=assets_dir,
+            embed_images=embed_images,
+            has_human_visual_override=bool(task_payload.get("has_human_visual_override", False)),
+            has_human_answer_override=bool(task_payload.get("has_human_answer_override", False)),
+            task_id=task_id,
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        return msgs, bundle
+
+    seam_notes = _join_seam_sections(
+        bundle,
+        (
+            "persona",
+            "visual_extraction",
+            "solving_conventions",
+            "steps_and_socratic_hint",
+            "abstraction_and_tagging",
+            "difficulty_rubric_notes",
+        ),
+    )
+
+    pi_rule = (
+        "题干明确写明“π 取 3.14”等近似值时按指定近似值计算；未指定时 `sympy_expr` 必须保留精确符号 `pi`、`sqrt(...)` 或分数。"
+        if allow_pi_314
+        else "除非题干显式要求近似值，否则 `sympy_expr` 一律保留精确符号 `pi`、`sqrt(...)` 或分数。"
+    )
+
+    system_text = (
+        f"你是严谨的{grade_subject}学科知识编译器专家（UNIFIED_S1_S2 合一求解与深度拆解）。\n"
+        "请严格输出一个合法的 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下全部硬性契约：\n"
+        "1. `visual_facts` 必须仅客观描述图中可见元素（顶点、位置关系、标注、阴影边界），严禁写入未画出的辅助线或推导结论；无图题置 `\"\"`。"
+        "若图片模糊或存在歧义，设 `visual_ambiguity_flag=true` 并在 `visual_ambiguity_note` 说明。\n"
+        "2. `method_summary`（一句话解法路线，≥2字）与 `solution_markdown`（完整推导过程，≥5字）必填非空。\n"
+        "3. `sympy_code`（存在 `verify_mode == \"SYMBOLIC\"` 小问时必填，否则置 `null`）：仅允许导入 sympy / math / fractions；"
+        "严禁调用 sympify / parse_expr / lambdify / S(<字符串>) / eval / exec / open；"
+        "**必须定义 `def verify():`** 返回字典（键为归一后小问标签如 `'主问'` 或 `'(1)'`，值为通过真实运算得出的结果，禁止硬编码常量返回）。\n"
+        f"4. 数值与标签规范：{pi_rule} 小问标签仅允许 `\"主问\"` 或 `\"(1)\"`, `\"(2)\"`...，禁止自造 `\"(1)-1\"` 或 `\"(1)-k\"`。\n"
+        "5. `steps`（1~5 个有教学意义的逻辑推理步）：`step_index` 从 1 连续递增；`hint` 严禁直接剧透终值；"
+        "`raw_l3` 必须是 **4~14 字脱壳原子转化算子短语**，不含具体数字或人名道具。\n"
+        "6. `abstract_skeleton` 必须完全抹除人名、道具与具体数字；`thinking_methods` 禁用万金油泛词。\n"
+        f"7. {_TRAP_ENUM_SPEC_TEXT}\n"
+        f"8. {_DIFFICULTY_RUBRIC_SPEC_TEXT}\n\n"
+        f"【学科与接缝规范（digest={bundle.prompt_digest}）】\n"
+        f"{seam_notes}\n\n"
+        "【输出 JSON 顶层结构模板（`visual_facts` 置于内容字段首位）】\n"
+        "{\n"
+        '  "visual_facts": "",\n'
+        '  "task_id": "原样回填 task_id",\n'
+        '  "visual_ambiguity_flag": false,\n'
+        '  "visual_ambiguity_note": "",\n'
+        '  "method_summary": "一句话解法路线",\n'
+        '  "solution_markdown": "完整推导过程（Markdown/LaTeX）",\n'
+        '  "final_answers": [ ... ],\n'
+        '  "sympy_code": "def verify():\\n    ...\\n    return {\'主问\': str(ans)}\\n",\n'
+        '  "steps": [{"step_index": 1, "sub_goal": "...", "core_formula": "...", "hint": "...", "raw_l1": "...", "raw_l2": "...", "raw_l3": "4~14字原子算子"}],\n'
+        '  "abstract_skeleton": "去情境抽象骨架（无具体数字）",\n'
+        '  "primary_l1_module": "一级大模块",\n'
+        '  "secondary_l1_modules": [],\n'
+        '  "thinking_methods": ["具体技法"],\n'
+        '  "classic_motifs": ["经典母题"],\n'
+        '  "trap_tags": [],\n'
+        '  "difficulty": {\n'
+        '    "C_concept_count": {"evidence": "...", "score": 2},\n'
+        '    "S_chain_length": {"evidence": "...", "score": 2},\n'
+        '    "T_trickiness": {"evidence": "...", "score": 2},\n'
+        '    "L_computation_load": {"evidence": "...", "score": 1}\n'
+        "  }\n"
+        "}\n\n"
+        "【`final_answers` 元素 `AnswerPart` 规范】\n"
+        f"{_ANSWER_PART_SPEC_TEXT}"
+    )
+
+    text_sections: list[str] = []
+    if task_id:
+        text_sections.append(f"【task_id】{task_id}")
+    meta_line = f"【学段学科】{grade_subject}"
+    if q_format:
+        meta_line += f" | 【题型】{q_format}"
+    text_sections.append(meta_line)
+    if anchors_prompt_text.strip():
+        text_sections.append(f"【难度校准黄金锚点标尺与词表约束】\n{anchors_prompt_text.strip()}")
+    text_sections.append(f"【题干】\n{question_text}")
+    if options:
+        text_sections.append(f"【选择题选项】{json.dumps(options, ensure_ascii=False)}")
+
+    user_parts: list[dict[str, Any]] = [{"type": "text", "text": "\n\n".join(text_sections)}]
+    if images:
+        _append_image_blocks(
+            user_parts,
+            images=images,
+            captions=captions,
+            embed_images=embed_images,
+            assets_dir=assets_dir,
+            always_label=not embed_images,
+        )
+
+    user_content: Any = user_parts if images else user_parts[0]["text"]
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_content},
+    ], bundle
+
+
 def build_taxonomy_propose_messages(
     *,
     grade_subject: str,
@@ -265,8 +786,18 @@ def build_taxonomy_propose_messages(
     top_pairs: list[dict[str, Any]],
     module_range: tuple[int, int] = (7, 10),
     l2_range: tuple[int, int] = (40, 70),
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, str]]:
     """Stage 3a：基于脱敏语义聚类摘要与高频词表归纳 L1/L2 标准目录树。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    stage_seam = _join_seam_sections(bundle, ("stage3_propose",), section="stages")
+    seam_tail = f"\n\n【学科归纳补充】\n{stage_seam}" if stage_seam else ""
+
     system_text = (
         "你是理科课程体系与知识图谱专家。请根据给定学段学科的脱敏知识标签聚类摘要与高频原词榜，"
         f"自底向上归纳一套干净、互斥、层次清晰的二层分类词表（{module_range[0]}~{module_range[1]} 个一级大模块 L1，"
@@ -275,6 +806,7 @@ def build_taxonomy_propose_messages(
         "1. 每个 L1 内部 L2 实体名称禁止重复或高度同义；所有别名收录在 `aliases`。\n"
         "2. 覆盖几何、数论、组合、应用题/行程、计算/代数等主要分支中实际出现的高频簇。\n"
         "3. 仅返回符合 TaxonomyProposeOutput 的合法 JSON 对象。"
+        f"{seam_tail}"
     )
     payload = {
         "grade_subject": grade_subject,
@@ -294,8 +826,18 @@ def build_stage3c_mapping_messages(
     grade_subject: str,
     taxonomy_enum_text: str,
     question_items: list[dict[str, Any]],
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, str]]:
     """Stage 3c：脱敏逐题上下文批映射（禁止传入 question_uid / 来源 / 章节信息）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    stage_seam = _join_seam_sections(bundle, ("stage3c_mapping",), section="stages")
+    seam_tail = f"\n\n【词表对齐补充】\n{stage_seam}" if stage_seam else ""
+
     system_text = (
         "你是理科题库知识词表对齐专家。请结合题目抽象骨架与各步骤原始标签，"
         "将一批脱敏题目中的每一步映射至标准词表中的 `(mapped_l1, mapped_l2)`，并判定整题 `primary_l1_module` 与 `secondary_l1_modules`。\n"
@@ -303,6 +845,7 @@ def build_stage3c_mapping_messages(
         "1. `primary_l1_module` 与每步 `mapped_l1` 必须严格取自给定标准词表的 L1。\n"
         "2. `mapped_l2` 优先取自对应 L1 下的标准 L2；仅当确实无可归入 L2 时才填写最接近或简明新 L2 名并设 `is_novel_l2=true`。\n"
         "3. 保留每题原始 `task_item_id` 与每步 `step_index`，返回符合 Stage3cBatchMappingOutput 的合法 JSON 对象。"
+        f"{seam_tail}"
     )
     user_payload = {
         "grade_subject": grade_subject,
@@ -331,13 +874,98 @@ def build_stage3c_mapping_messages(
     ]
 
 
+def build_stage3d_cluster_assign_messages(
+    *,
+    grade_subject: str,
+    l1_module: str,
+    l2_entity: str,
+    raw_l3_items: list[dict[str, Any]],
+    taxonomy_version: str = "",
+    target_canonical_range: tuple[int, int] = (5, 15),
+    pre_clusters: list[dict[str, Any]] | None = None,
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
+) -> list[dict[str, str]]:
+    """Stage 3d（D-Audit-2）：同 (grade_subject, taxonomy_version, L1, L2) 域 Cluster-then-Assign 标准算子归纳。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    stage_seam = _join_seam_sections(bundle, ("stage3d_cluster_assign",), section="stages")
+    seam_tail = f"\n\n【算子归纳补充规范】\n{stage_seam}" if stage_seam else ""
+
+    lo, hi = int(target_canonical_range[0]), int(target_canonical_range[1])
+    system_text = (
+        "你是理科知识图谱原子算子归纳专家（Stage 3d Cluster-then-Assign）。"
+        f"给定严格限定在「{grade_subject} / {l1_module} / {l2_entity}」单 L2 域内的全部去重 `raw_l3` 短语及出现频次，"
+        f"请归纳提炼出 {lo}~{hi} 个标准原子转化算子（`canonical_name`），并将每一条输入 `raw_l3` 精确映射归入其中一个标准算子。\n"
+        "严格要求：\n"
+        "1. 每个 `canonical_name` 必须是 **4~14 字脱壳原子转化算子短语**，严禁夹带具体数字、人名道具或万金油泛词。\n"
+        "2. 仅当两条 `raw_l3` 在该 L2 域内属于同一核心方法/转化动作（仅表述/语序/繁简差异）时归入同一标准算子；"
+        "存在前置条件或核心模型差异（如“等高模型”vs“蝴蝶模型”）必须分立，严禁过度合并。\n"
+        "3. 输入清单中的所有 `raw_l3` 必须 100% 覆盖分配，不得遗漏或保留未分配孤岛。\n"
+        "4. 仅返回合法 JSON 对象：`{\"canonical_operators\": [{\"canonical_name\": \"...\", \"rationale\": \"...\", \"members\": [\"...\"]}], \"assignments\": {\"原raw_l3\": \"canonical_name\"}}`。"
+        f"{seam_tail}"
+    )
+
+    sanitized_items: list[dict[str, Any]] = []
+    for it in raw_l3_items:
+        op_name = str(it.get("raw_l3") or it.get("l3_operator") or it.get("name") or "")
+        if not op_name.strip():
+            continue
+        raw_freq = it.get("freq")
+        if raw_freq is None:
+            raw_freq = it.get("count", 1)
+        item_entry: dict[str, Any] = {
+            "raw_l3": op_name,
+            "freq": int(raw_freq) if raw_freq is not None else 1,
+        }
+        if it.get("node_id"):
+            item_entry["node_id"] = str(it["node_id"])
+        if it.get("cluster_id") is not None:
+            item_entry["cluster_id"] = int(it["cluster_id"])
+        sanitized_items.append(item_entry)
+    user_payload: dict[str, Any] = {
+        "grade_subject": grade_subject,
+        "taxonomy_version": taxonomy_version,
+        "scope": {"l1_module": l1_module, "l2_entity": l2_entity},
+        "target_canonical_count": [lo, hi],
+        "raw_l3_items": sanitized_items,
+    }
+    if pre_clusters:
+        user_payload["pre_clusters"] = [
+            {
+                "cluster_id": int(c.get("cluster_id", idx)),
+                "members": [str(m) for m in (c.get("members") or [])],
+            }
+            for idx, c in enumerate(pre_clusters)
+        ]
+
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+    ]
+
+
 def build_merge_judge_messages(
     *,
     target_kind: str,
     scope_desc: str,
     candidate_pairs: list[dict[str, Any]],
+    grade_subject: str = "小学奥数",
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, str]]:
     """Stage 3d：L3 节点或全局概念候选对同义归并批裁判（零 question_uid）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    stage_seam = _join_seam_sections(bundle, ("stage3d_cluster_assign",), section="stages")
+    seam_tail = f"\n\n【归并补充准则】\n{stage_seam}" if stage_seam else ""
+
     system_text = (
         "你是理科知识点与解题概念去重裁判。给定同一严格作用域内的候选同义词对，"
         "请判断每一对是否本质上指代同一知识点/方法/母题。\n"
@@ -345,6 +973,7 @@ def build_merge_judge_messages(
         "1. 仅当两者数学含义等价、仅为表述/语序/简繁差异时设 `should_merge=true`，并给出最规范凝练的 `canonical_name`。\n"
         "2. 若存在关键条件、限定场景或适用对象差异（如“等高模型”vs“蝴蝶模型”），必须设 `should_merge=false`。\n"
         "3. 返回符合 MergeJudgeBatchOutput 的合法 JSON 对象。"
+        f"{seam_tail}"
     )
     user_payload = {
         "target_kind": target_kind,
@@ -371,8 +1000,18 @@ def build_prerequisite_dag_messages(
     grade_subject: str,
     taxonomy_enum_text: str,
     ordered_transitions: list[dict[str, Any]],
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, str]]:
     """Stage 3e：基于步序共现转移矩阵构建 L2 先修有向无环图（DAG）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    stage_seam = _join_seam_sections(bundle, ("stage3e_prerequisite",), section="stages")
+    seam_tail = f"\n\n【先修图谱补充】\n{stage_seam}" if stage_seam else ""
+
     system_text = (
         "你是理科课程先修依赖分析师。给定解题步骤中观察到的前置→后继 L2 转移频次与标准词表，"
         "请提炼真正具有教学先修关系（掌握 source 才能顺利学习/应用 target）的 L2 有向边列表。\n"
@@ -380,6 +1019,7 @@ def build_prerequisite_dag_messages(
         "1. `source_l1/source_l2` 与 `target_l1/target_l2` 必须严格取自标准词表。\n"
         "2. 严禁自环；严格保证边集构成有向无环图（DAG）。\n"
         "3. 返回符合 PrerequisiteDagOutput 的合法 JSON 对象。"
+        f"{seam_tail}"
     )
     user_payload = {
         "grade_subject": grade_subject,
@@ -395,15 +1035,27 @@ def build_prerequisite_dag_messages(
 def build_stage4_refine_messages(
     *,
     candidate_pairs: list[dict[str, Any]],
+    grade_subject: str = "小学奥数",
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, str]]:
-    """Stage 4：针对 CONTRASTIVE 及边界带 ISOMORPHIC/SCAFFOLD 的脱敏精裁（零 question_uid）。"""
+    """Stage 4：针对 CONTRASTIVE 及边界带 ISOMORPHIC/SCAFFOLD 的脱敏精裁（零 question_uid，D-Audit-5 锁死 SCAFFOLD 方向）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    stage_seam = _join_seam_sections(bundle, ("stage4_refine",), section="stages")
+    seam_tail = f"\n\n【精裁补充规则】\n{stage_seam}" if stage_seam else ""
+
     system_text = (
         "你是理科题库教研拓扑质检员。请审核以下候选题目关系对（已脱敏，不含题号与来源）。\n"
         "判定标准：\n"
         "- CONTRASTIVE：表面情境/句式高度相似但核心解法或考点截然不同，适合做防定势辨析。\n"
         "- ISOMORPHIC：表皮不同或略有差异但核心数学结构与方法高度同构。\n"
-        "- SCAFFOLD：source 为前置低阶铺垫子题 → target 为升维母题（target 包含 source 的核心技能且难度显著更高）。\n"
+        "- SCAFFOLD（D-Audit-5 方向锁死）：source 必须为降阶前置铺垫子题（低 Elo） → target 必须为升维母题（高 Elo，target 包含 source 的核心技能且难度显著更高）。\n"
         "请为每对给出 `is_valid`（true/false）及简明教学说明 `pedagogical_note`，返回 Stage4RefineBatchOutput JSON。"
+        f"{seam_tail}"
     )
     sanitized_pairs = [
         {
@@ -437,8 +1089,28 @@ def build_external_diagnose_messages(
     taxonomy_enum_text: str,
     preprocessed_image_paths: list[Path] | None = None,
     anchors_prompt_text: str = "",
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """外部新错题实时单路诊断消息构造（严格字段白名单，EXIF 矫正图片入 VLM，含 D4 标尺与黄金锚点）。"""
+    bundle = _try_load_seam_bundle(
+        grade_subject=grade_subject,
+        config_dir=config_dir,
+        prompt_profile=prompt_profile,
+    )
+    seam_notes = _join_seam_sections(
+        bundle,
+        (
+            "persona",
+            "visual_extraction",
+            "solving_conventions",
+            "steps_and_socratic_hint",
+            "abstraction_and_tagging",
+            "difficulty_rubric_notes",
+        ),
+    )
+    seam_section = f"\n\n【学科与接缝补充规范】\n{seam_notes}" if seam_notes else ""
+
     system_text = (
         f"你是严谨的{grade_subject}学科错题诊断专家。请阅读题干与配图，严格输出一个合法 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下全部硬性规则：\n"
         "1. `visual_facts` 必须排在 JSON 顶层首位（无图题置空字符串 \"\"），仅写客观视觉事实，严禁写入未画出的辅助线或推导结论。\n"
@@ -454,18 +1126,8 @@ def build_external_diagnose_messages(
         "   - `raw_l3`: **4~14 字脱壳原子转化算子短语**（如“相遇路程和公式转化”“速度比与时间反比转换”），不含题干具体数字或人名道具，严禁写完整句子。\n"
         "5. `abstract_skeleton`：抹除人名、道具与题干具体数字，用纯学科元语言概括“已知结构 → 核心转化 → 求解目标”。\n"
         "6. `primary_l1_module`、`secondary_l1_modules`、`matched_l2` 必须严格从下方标准词表选取；`thinking_methods`（具体可操作技法，禁用“转化与化归/逻辑推理/综合法/分析法”等泛词）、`classic_motifs`（经典母题原型，宁缺毋滥）。\n"
-        "7. `trap_tags` **严禁自造中文自由文本**，仅允许从以下 6 个标准代码中选取（无匹配则置空数组 `[]`）：\n"
-        "   - `TRAP_DOMAIN_BOUNDARY`（边界端点与定义域遗漏）\n"
-        "   - `TRAP_SIGN_DIRECTION`（符号方向与正负/运动方向歧义）\n"
-        "   - `TRAP_EXTRANEOUS_ROOT`（增根虚解与几何不可行）\n"
-        "   - `TRAP_FRAME_SHIFT`（参考系转换与比例/基准量漂移）\n"
-        "   - `TRAP_APPROX_CONDITION`（近似条件滥用与循环论证）\n"
-        "   - `TRAP_ARITHMETIC_SLIP`（纯四则计算与抄写笔误）\n"
-        "8. 四维难度 `difficulty` 必须按学段最优标准解法并严格对照下方黄金锚点打分，每维**先写 `evidence`（可观测解题动作证据）再写整数 `score`**，严禁超界：\n"
-        "   - `C_concept_count`（概念与思维深度，**整数 1~4**）：1=单模型直推；2=单点变形或常规双考点串联；3=跨模块综合或隐式深层建模；4=非标构造或高阶竞赛洞察。\n"
-        "   - `S_chain_length`（逻辑推理链长，不含纯四则算术，**整数 1~3，严禁打 4**）：1=1~2 逻辑步；2=3~4 逻辑步；3=≥5 步或 ≥2 种独立情况分类讨论。\n"
-        "   - `T_trickiness`（信息隐蔽度与陷阱，**整数 1~3，严禁打 4**）：1=显式透明；2=含冗余干扰/隐含条件或常规图文转译；3=强反直觉、极端临界边界或连环陷阱。\n"
-        "   - `L_computation_load`（运算与审题负荷，**整数 1~3，严禁打 4**）：1=心算/短题干；2=常规纸笔多步演算；3=高繁复计算、多变量联立或高密度信息。\n\n"
+        f"7. {_TRAP_ENUM_SPEC_TEXT}\n"
+        f"8. {_DIFFICULTY_RUBRIC_SPEC_TEXT}{seam_section}\n\n"
         "【输出 JSON 顶层结构模板】\n"
         "{\n"
         '  "visual_facts": "",\n'
@@ -520,3 +1182,171 @@ def build_external_diagnose_messages(
         {"role": "system", "content": system_text},
         {"role": "user", "content": user_content},
     ]
+
+
+def render_prompt_preview(
+    *,
+    stage: str,
+    grade_subject: str = "小学奥数",
+    config_dir: Path = Path("config"),
+    prompt_profile: str | None = None,
+    sample_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按 stage 渲染完整 Prompt 预览与继承溯源元信息（供 `shuati prompt render` 使用）。"""
+    bundle = load_prompt_seams(
+        config_dir=config_dir,
+        grade_subject=grade_subject,
+        profile=prompt_profile,
+    )
+    norm_stage = (stage or "").strip().lower()
+    payload = dict(sample_payload or {})
+    messages: list[dict[str, Any]]
+    version_key: str
+    schema_cls: type[BaseModel] | None = None
+
+    if norm_stage in ("stage1", "s1", "stage1_primary", "stage1_secondary"):
+        role: Literal["PRIMARY", "SECONDARY"] = "SECONDARY" if norm_stage == "stage1_secondary" else "PRIMARY"
+        raw_opts = payload.get("options")
+        stage1_opts: dict[str, str] = (
+            {str(k): str(v) for k, v in raw_opts.items()} if isinstance(raw_opts, dict) else {}
+        )
+        inp = Stage1Input(
+            question_uid="__preview_sanitized__",
+            grade_subject=grade_subject,
+            question_text=str(payload.get("question_text") or "甲乙两地相距 120 千米，货车往返需 5 小时，求平均速度。"),
+            cas_images=[],
+            image_captions=[],
+            options=stage1_opts,
+            has_images=False,
+        )
+        messages = build_stage1_messages(
+            inp,
+            role=role,
+            assets_dir=Path("data/assets/images"),
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage1"
+    elif norm_stage in ("stage2", "s2", "stage2_only"):
+        messages = build_stage2_messages(
+            grade_subject=grade_subject,
+            question_text=str(payload.get("question_text") or "如图，正方形 ABCD 边长为 4，求阴影部分面积。"),
+            visual_facts=str(payload.get("visual_facts") or "正方形 ABCD 中连接对角线 AC，阴影为三角形 ABC。"),
+            verified_final_answers=payload.get("verified_final_answers")
+            or [{"label": "主问", "answer_type": "NUMERIC", "verify_mode": "SYMBOLIC", "collection_mode": "SINGLE", "answer": "8", "sympy_expr": "8"}],
+            verified_method_summary=str(payload.get("verified_method_summary") or "正方形面积取半"),
+            verified_solution_markdown=str(payload.get("verified_solution_markdown") or "阴影面积为正方形面积的一半，即 4×4÷2 = 8。"),
+            anchors_prompt_text=str(payload.get("anchors_prompt_text") or ""),
+            has_images=bool(payload.get("has_images", False)),
+            has_human_visual_override=bool(payload.get("has_human_visual_override", False)),
+            has_human_answer_override=bool(payload.get("has_human_answer_override", False)),
+            task_id=str(payload.get("task_id") or "T0001"),
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage2"
+        schema_cls = Stage2OnlyOutput
+    elif norm_stage in ("unified", "unified_s1_s2"):
+        task_payload: dict[str, Any] = {
+            "task_id": str(payload.get("task_id") or "T0001"),
+            "mode": str(payload.get("mode") or "UNIFIED_S1_S2"),
+            "grade_subject": grade_subject,
+            "allow_pi_314": bool(payload.get("allow_pi_314", grade_subject == "小学奥数")),
+            "question_text": str(payload.get("question_text") or "一个圆半径为 3 厘米，求面积（π 取 3.14）。"),
+            "options": payload.get("options") if isinstance(payload.get("options"), dict) else {},
+            "has_images": bool(payload.get("has_images", False)),
+            "image_paths": list(payload.get("image_paths") or []),
+            "image_captions": list(payload.get("image_captions") or []),
+        }
+        messages, bundle = build_unified_s1_s2_messages(
+            task_payload=task_payload,
+            anchors_prompt_text=str(payload.get("anchors_prompt_text") or ""),
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+            embed_images=False,
+        )
+        version_key = "unified"
+        schema_cls = UnifiedS1S2Output
+    elif norm_stage in ("diagnose", "external_diagnose"):
+        messages = build_external_diagnose_messages(
+            grade_subject=grade_subject,
+            question_text=str(payload.get("question_text") or "甲乙两人同时从相距 100 米的两地相向而行。"),
+            taxonomy_enum_text=str(payload.get("taxonomy_enum_text") or "- 行程问题: 相遇与追及"),
+            anchors_prompt_text=str(payload.get("anchors_prompt_text") or ""),
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "diagnose"
+    elif norm_stage in ("stage3a", "propose", "stage3_propose"):
+        messages = build_taxonomy_propose_messages(
+            grade_subject=grade_subject,
+            clusters_summary=list(payload.get("clusters_summary") or [{"cluster_id": 0, "total_freq": 10, "representative": "行程问题 / 相遇问题"}]),
+            top_pairs=list(payload.get("top_pairs") or [{"raw_l1": "行程问题", "raw_l2": "相遇问题", "cnt": 10}]),
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage3a"
+    elif norm_stage in ("stage3c", "stage3c_mapping"):
+        messages = build_stage3c_mapping_messages(
+            grade_subject=grade_subject,
+            taxonomy_enum_text=str(payload.get("taxonomy_enum_text") or "- 行程问题: 相遇与追及"),
+            question_items=list(payload.get("question_items") or [{"task_item_id": "T0001", "abstract_skeleton": "相向运动求相遇时间", "steps": [{"step_index": 1, "raw_l1": "行程", "raw_l2": "相遇", "sub_goal": "求速度和"}]}]),
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage3c"
+    elif norm_stage in ("stage3d", "stage3d_cluster_assign"):
+        messages = build_stage3d_cluster_assign_messages(
+            grade_subject=grade_subject,
+            l1_module=str(payload.get("l1_module") or "平面几何"),
+            l2_entity=str(payload.get("l2_entity") or "等高模型"),
+            raw_l3_items=list(payload.get("raw_l3_items") or [{"raw_l3": "等高三角形面积比转化", "freq": 5}, {"raw_l3": "同高三角形底边比例转化", "freq": 3}]),
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage3d"
+    elif norm_stage in ("merge_judge",):
+        messages = build_merge_judge_messages(
+            target_kind=str(payload.get("target_kind") or "KNOWLEDGE_NODE"),
+            scope_desc=str(payload.get("scope_desc") or f"{grade_subject}/平面几何/等高模型"),
+            candidate_pairs=list(payload.get("candidate_pairs") or [{"pair_id": "p1", "name_a": "等高面积比", "name_b": "同高面积比", "cosine_sim": 0.92, "jaccard": 0.6}]),
+            grade_subject=grade_subject,
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage3d"
+    elif norm_stage in ("stage3e", "stage3e_prerequisite"):
+        messages = build_prerequisite_dag_messages(
+            grade_subject=grade_subject,
+            taxonomy_enum_text=str(payload.get("taxonomy_enum_text") or "- 平面几何: 等高模型, 蝴蝶模型"),
+            ordered_transitions=list(payload.get("ordered_transitions") or [{"from_l1": "平面几何", "from_l2": "等高模型", "to_l1": "平面几何", "to_l2": "蝴蝶模型", "cnt": 8}]),
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage3e"
+    elif norm_stage in ("stage4", "stage4_refine"):
+        messages = build_stage4_refine_messages(
+            candidate_pairs=list(payload.get("candidate_pairs") or [{"pair_id": "p1", "relation_type": "SCAFFOLD", "source_text": "基础铺垫题", "target_text": "综合母题"}]),
+            grade_subject=grade_subject,
+            config_dir=config_dir,
+            prompt_profile=prompt_profile,
+        )
+        version_key = "stage4"
+    else:
+        raise ValueError(f"未知的 prompt stage: {stage!r}")
+
+    result: dict[str, Any] = {
+        "stage": norm_stage,
+        "grade_subject": bundle.grade_subject,
+        "slug": bundle.slug,
+        "profile": bundle.profile,
+        "chain": list(bundle.chain),
+        "prompt_version": bundle.prompt_versions.get(version_key, ""),
+        "prompt_digest": bundle.prompt_digest,
+        "prompt_versions": dict(bundle.prompt_versions),
+        "sources": {k: list(v) for k, v in bundle.sources.items()},
+        "messages": messages,
+    }
+    if schema_cls is not None:
+        result["flattened_schema"] = flatten_json_schema(schema_cls)
+    return result

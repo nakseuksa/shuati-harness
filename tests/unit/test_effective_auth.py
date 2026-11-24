@@ -122,25 +122,52 @@ def test_recompute_and_override_lifecycle(db_conn):
     assert q2["eff_tier"] == "L4-B_进阶拔高(巧)"
     assert "difficulty_override_json" in json.loads(q2["eff_overridden_fields_json"])
 
-    # 测试指纹失配自动挂起：修改 raw_questions.content_hash 为 hash_v2
+    # 测试 v2.6 分组指纹策略：标注类 difficulty_override_json 解绑 content_hash，
+    # 源题 content_hash 变更为 hash_v2 时不得误杀黄金锚点/难度覆写
     db_conn.execute("UPDATE raw_questions SET content_hash = 'hash_v2' WHERE question_uid = ?", (uid,))
     db_conn.commit()
 
     effective.recompute(db_conn, uid)
     db_conn.commit()
 
-    # 验证覆写被挂起
-    ov = db_conn.execute(
-        "SELECT is_suspended, suspended_reason FROM human_overrides WHERE question_uid = ?",
+    ov_ann = db_conn.execute(
+        "SELECT is_suspended, suspended_reason FROM human_overrides WHERE question_uid = ? AND field_name = 'difficulty_override_json'",
         (uid,),
     ).fetchone()
-    assert ov["is_suspended"] == 1
-    assert ov["suspended_reason"] == "SOURCE_CHANGED"
+    assert ov_ann["is_suspended"] == 0
+    assert ov_ann["suspended_reason"] == ""
 
-    # 验证难度回退回机器层 (C=1, S=1, T=1, L=1 -> 1120)
     q3 = db_conn.execute("SELECT * FROM questions WHERE question_uid = ?", (uid,)).fetchone()
-    assert q3["eff_base_elo"] == 1120
-    assert q3["eff_tier"] == "L1_基础直达"
+    assert q3["eff_base_elo"] == 2070
+    assert q3["eff_tier"] == "L4-B_进阶拔高(巧)"
+
+    # 验真类 question_text 强绑 content_hash：携带旧指纹 hash_v1 时自动挂起为 SOURCE_CHANGED
+    db_conn.execute(
+        """
+        INSERT INTO human_overrides(
+            question_uid, field_name, override_value, reason, source,
+            base_fingerprint, is_active
+        )
+        VALUES (?, 'question_text', '旧版人工题干', '微调', 'REVIEW_UI', 'hash_v1', 1);
+        """,
+        (uid,),
+    )
+    db_conn.commit()
+
+    effective.recompute(db_conn, uid)
+    db_conn.commit()
+
+    ov_ver = db_conn.execute(
+        "SELECT is_suspended, suspended_reason FROM human_overrides WHERE question_uid = ? AND field_name = 'question_text'",
+        (uid,),
+    ).fetchone()
+    assert ov_ver["is_suspended"] == 1
+    assert ov_ver["suspended_reason"] == "SOURCE_CHANGED"
+
+    q4 = db_conn.execute("SELECT * FROM questions WHERE question_uid = ?", (uid,)).fetchone()
+    assert q4["eff_verification_status"] == "NEEDS_REVIEW"
+    assert "OVERRIDE_STALE" in q4["eff_review_reason"]
+    assert q4["eff_is_servable"] == 0
 
 
 def test_recompute_all_and_verify_consistency(db_conn):

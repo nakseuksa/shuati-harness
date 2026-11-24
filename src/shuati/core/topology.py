@@ -37,6 +37,7 @@ class QuestionFeature:
     eff_text: str
     eff_skeleton: str
     tag_labels: list[str]
+    l2_entities: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -100,7 +101,8 @@ def load_question_features(
     ph = ",".join("?" for _ in uids)
 
     # 加载激活的 MOTIF 与 TRAP 概念
-    motif_by_q: dict[str, set[str]] = {}
+    raw_motif_by_q: dict[str, set[str]] = {}
+    motif_doc_uids: dict[str, set[str]] = {}
     trap_by_q: dict[str, set[str]] = {}
     motif_names_by_q: dict[str, list[str]] = {}
     qc_rows = conn.execute(
@@ -114,30 +116,52 @@ def load_question_features(
     ).fetchall()
     for r in qc_rows:
         uid = str(r["question_uid"])
-        cid = _canon_concept(str(r["concept_id"])) or str(r["concept_id"])
+        orig_cid = str(r["concept_id"])
+        cid = _canon_concept(orig_cid) or orig_cid
         if r["kind"] == "MOTIF":
-            motif_by_q.setdefault(uid, set()).add(f"M:{cid}")
+            tok = f"M:{cid}"
+            raw_motif_by_q.setdefault(uid, set()).add(tok)
+            motif_doc_uids.setdefault(tok, set()).add(uid)
             motif_names_by_q.setdefault(uid, []).append(str(r["name"]))
         else:
             # D-Audit-3：纯四则笔误 TRAP_ARITHMETIC_SLIP 不参与跨题 SHARED_TRAP 织网
-            if str(r["name"]) == "TRAP_ARITHMETIC_SLIP" or cid == "TRAP:TRAP_ARITHMETIC_SLIP":
+            if (
+                str(r["name"]).strip() == "TRAP_ARITHMETIC_SLIP"
+                or orig_cid == "TRAP:TRAP_ARITHMETIC_SLIP"
+                or cid == "TRAP:TRAP_ARITHMETIC_SLIP"
+            ):
                 continue
             trap_by_q.setdefault(uid, set()).add(f"T:{cid}")
 
-    # 加载步骤 L3 节点按分支分组
+    # 仅保留 df >= 2 的高复用经典 MOTIF 参与跨题特征 k_union/k_branches（过滤 df == 1 孤岛噪音）
+    reusable_motifs = {tok for tok, u_set in motif_doc_uids.items() if len(u_set) >= 2}
+    motif_by_q: dict[str, set[str]] = {
+        uid: (toks & reusable_motifs) for uid, toks in raw_motif_by_q.items() if (toks & reusable_motifs)
+    }
+
+    # 加载步骤 L3 节点按分支分组，并收集无节点挂载步骤的 (m_l1, m_l2)
     branch_nodes_by_q: dict[str, dict[str, set[str]]] = {}
+    step_l2_by_q: dict[str, set[str]] = {}
     st_rows = conn.execute(
         f"""
-        SELECT question_uid, branch_id, m_knowledge_node_id
+        SELECT question_uid, branch_id, m_knowledge_node_id, m_l1, m_l2
         FROM question_steps
-        WHERE question_uid IN ({ph}) AND m_knowledge_node_id IS NOT NULL;
+        WHERE question_uid IN ({ph});
         """,
         uids,
     ).fetchall()
     for r in st_rows:
-        cn = _canon_node(str(r["m_knowledge_node_id"]))
-        if cn:
-            branch_nodes_by_q.setdefault(str(r["question_uid"]), {}).setdefault(str(r["branch_id"]), set()).add(f"N:{cn}")
+        uid = str(r["question_uid"])
+        raw_nid = r["m_knowledge_node_id"]
+        if raw_nid is not None:
+            cn = _canon_node(str(raw_nid))
+            if cn:
+                branch_nodes_by_q.setdefault(uid, {}).setdefault(str(r["branch_id"]), set()).add(f"N:{cn}")
+        else:
+            ml1 = str(r["m_l1"] or "").strip()
+            ml2 = str(r["m_l2"] or "").strip()
+            if ml1 and ml2:
+                step_l2_by_q.setdefault(uid, set()).add(f"{ml1}/{ml2}")
 
     # 判断是否存在 REPLACE 模式 taxonomy_override_json
     replace_uids: set[str] = set()
@@ -157,7 +181,7 @@ def load_question_features(
         except ValueError:
             pass
 
-    node_labels_cache: dict[str, str] = {}
+    node_info_cache: dict[str, tuple[str, str]] = {}
     features: dict[str, QuestionFeature] = {}
     for r in q_rows:
         uid = str(r["question_uid"])
@@ -172,16 +196,27 @@ def load_question_features(
 
         raw_nids = json.loads(r["eff_node_ids_json"] or "[]")
         labels: list[str] = []
+        l2_set: set[str] = set() if is_rep else set(step_l2_by_q.get(uid, set()))
         for nid in raw_nids:
-            if nid not in node_labels_cache:
+            if nid not in node_info_cache:
                 nr = conn.execute(
                     "SELECT l1_module, l2_entity, l3_operator FROM knowledge_nodes WHERE node_id = ?;",
                     (nid,),
                 ).fetchone()
-                node_labels_cache[nid] = (
-                    f"{nr['l1_module']}/{nr['l2_entity']}/{nr['l3_operator']}" if nr else nid
-                )
-            labels.append(node_labels_cache[nid])
+                if nr is not None:
+                    full_lbl = f"{nr['l1_module']}/{nr['l2_entity']}/{nr['l3_operator']}"
+                    l2_lbl = (
+                        f"{nr['l1_module']}/{nr['l2_entity']}"
+                        if str(nr["l1_module"]).strip() and str(nr["l2_entity"]).strip()
+                        else ""
+                    )
+                    node_info_cache[nid] = (full_lbl, l2_lbl)
+                else:
+                    node_info_cache[nid] = (nid, "")
+            full_lbl, l2_lbl = node_info_cache[nid]
+            labels.append(full_lbl)
+            if l2_lbl:
+                l2_set.add(l2_lbl)
         labels.extend(motif_names_by_q.get(uid, []))
 
         features[uid] = QuestionFeature(
@@ -196,6 +231,7 @@ def load_question_features(
             eff_text=str(r["eff_question_text"] or ""),
             eff_skeleton=str(r["eff_abstract_skeleton"] or ""),
             tag_labels=labels,
+            l2_entities=l2_set,
         )
 
     return features
@@ -359,7 +395,7 @@ def generate_candidate_edges(
 
     th = topology_cfg.thresholds
     max_knn_surf = max(th.clone.knn_k, th.contrastive.knn_k)
-    max_knn_skel = max(th.clone.knn_k, th.isomorphic.knn_k)
+    max_knn_skel = max(th.clone.knn_k, th.isomorphic.knn_k, 10)
 
     # 基于对齐子矩阵计算互近邻 rank
     surf_rank_uid: dict[str, dict[str, int]] = {}
@@ -382,12 +418,15 @@ def generate_candidate_edges(
 
     idf_k, idf_t = compute_idf_weights(features)
 
-    # 倒排索引：共享 K_set（用于 SCAFFOLD 召回）与共享 E_trap（用于 SHARED_TRAP 召回）
+    # 倒排索引：共享 K_set（用于 ISOMORPHIC/SCAFFOLD）、共享 L2（用于 SCAFFOLD 宽进）与共享 E_trap（用于 SHARED_TRAP）
     k_inverted: dict[str, list[str]] = {}
+    l2_inverted: dict[str, list[str]] = {}
     t_inverted: dict[str, list[str]] = {}
     for uid, feat in features.items():
         for tok in feat.k_union:
             k_inverted.setdefault(tok, []).append(uid)
+        for l2_tok in feat.l2_entities:
+            l2_inverted.setdefault(l2_tok, []).append(uid)
         for tr in feat.e_traps:
             t_inverted.setdefault(tr, []).append(uid)
 
@@ -410,20 +449,29 @@ def generate_candidate_edges(
         for ub in nbrs:
             _add_pair(ua, ub)
 
-    # 2. 倒排召回：共享至少 min_k_size 个知识点对 / 共享 E_trap 对
-    uid_list = sorted(features.keys())
-    for uid in uid_list:
-        if target_uids is not None and uid not in target_uids:
-            # 目标外节点仅需通过倒排映射到目标内节点，若目标集较大仍可自然覆盖
-            pass
+    # 2. 倒排召回：共享标准 L3/MOTIF / 共享核心 L2 且存在显著 Elo 阶差 / 共享 E_trap 对
+    seed_uids = sorted(target_uids & features.keys()) if target_uids is not None else sorted(features.keys())
+    for uid in seed_uids:
         k_counts: dict[str, int] = {}
         for tok in features[uid].k_union:
-            for other in k_inverted.get(tok, ()):
+            posting = k_inverted.get(tok, ())
+            for other in posting:
                 if other != uid:
                     k_counts[other] = k_counts.get(other, 0) + 1
         for other, cnt in k_counts.items():
-            if cnt >= th.scaffold.min_k_size:
+            if cnt >= th.scaffold.min_k_size or (
+                cnt >= 1 and len(features[uid].k_union) <= 12 and len(features[other].k_union) <= 12
+            ):
                 _add_pair(uid, other)
+
+        u_elo = features[uid].elo
+        for l2_tok in features[uid].l2_entities:
+            posting = l2_inverted.get(l2_tok, ())
+            if len(posting) > 500:
+                continue
+            for other in posting:
+                if other != uid and abs(u_elo - features[other].elo) >= th.scaffold.min_elo_diff:
+                    _add_pair(uid, other)
 
         t_counts: dict[str, int] = {}
         for tr in features[uid].e_traps:
@@ -458,14 +506,15 @@ def generate_candidate_edges(
             sr_ab is not None and sr_ba is not None and sr_ab <= th.clone.knn_k and sr_ba <= th.clone.knn_k
             and kr_ab is not None and kr_ba is not None and kr_ab <= th.clone.knn_k and kr_ba <= th.clone.knn_k
         )
-        if (
+        is_clone_hit = (
             is_mutual_clone
             and s_pct >= th.clone.surface_pct
             and s_sim >= th.clone.surface_sim_min
             and k_pct >= th.clone.skeleton_pct
             and k_sim >= th.clone.skeleton_sim_min
             and elo_diff <= th.clone.max_elo_diff
-        ):
+        )
+        if is_clone_hit:
             out_edges.append(
                 CandidateEdge(
                     source_uid=ua,
@@ -485,12 +534,19 @@ def generate_candidate_edges(
                 )
             )
 
-        # (2) ISOMORPHIC：互 Top-K 骨架极似且表皮不雷同，或骨架硬阈值+K_Jaccard 达标
+        # (2) ISOMORPHIC（D-Audit-2）：剔除 CLONE 级极高表皮，核心高置信直通 + 宽进候选带送 LLM 精裁
+        is_clone_level_surface = is_clone_hit or (
+            s_pct >= th.clone.surface_pct and s_sim >= th.clone.surface_sim_min
+        )
         is_mutual_iso = (
             kr_ab is not None and kr_ba is not None and kr_ab <= th.isomorphic.knn_k and kr_ba <= th.isomorphic.knn_k
         )
         iso_boundary = th.isomorphic.boundary_band
-        iso_struct_ok = is_mutual_iso and s_pct < th.isomorphic.surface_pct_max and elo_diff <= th.isomorphic.max_elo_diff
+        iso_struct_ok = (
+            is_mutual_iso
+            and not is_clone_level_surface
+            and elo_diff <= th.isomorphic.max_elo_diff
+        )
         iso_core_hit = (
             iso_struct_ok
             and k_pct >= th.isomorphic.skeleton_pct
@@ -505,12 +561,33 @@ def generate_candidate_edges(
             and k_sim >= th.isomorphic.skeleton_sim_min * (1.0 - iso_boundary)
             and k_jacc >= th.isomorphic.k_jaccard_min * (1.0 - iso_boundary)
         )
-        if iso_core_hit or iso_band_hit:
-            near_b = iso_band_hit or (
-                _near_threshold(k_pct, th.isomorphic.skeleton_pct, iso_boundary)
-                or _near_threshold(k_sim, th.isomorphic.skeleton_sim_min, iso_boundary)
-                or _near_threshold(k_jacc, th.isomorphic.k_jaccard_min, iso_boundary)
+        shared_k_tokens = fa.k_union & fb.k_union
+        is_skel_topk_any = (
+            (kr_ab is not None and kr_ab <= th.isomorphic.knn_k)
+            or (kr_ba is not None and kr_ba <= th.isomorphic.knn_k)
+        )
+        iso_wide_hit = (
+            not iso_core_hit
+            and not iso_band_hit
+            and not is_clone_level_surface
+            and elo_diff <= th.isomorphic.max_elo_diff
+            and (
+                (is_skel_topk_any and k_sim >= max(0.45, th.isomorphic.skeleton_sim_min * 0.70))
+                or (bool(shared_k_tokens) and (k_sim >= 0.45 or len(shared_k_tokens) >= 2))
             )
+        )
+        if iso_core_hit or iso_band_hit or iso_wide_hit:
+            if iso_wide_hit:
+                needs_ref = True
+                ref_reason = "WIDE_RECALL_ISOMORPHIC"
+            else:
+                near_b = iso_band_hit or (
+                    _near_threshold(k_pct, th.isomorphic.skeleton_pct, iso_boundary)
+                    or _near_threshold(k_sim, th.isomorphic.skeleton_sim_min, iso_boundary)
+                    or _near_threshold(k_jacc, th.isomorphic.k_jaccard_min, iso_boundary)
+                )
+                needs_ref = near_b
+                ref_reason = "BOUNDARY_BAND" if near_b else ""
             out_edges.append(
                 CandidateEdge(
                     source_uid=ua,
@@ -526,38 +603,68 @@ def generate_candidate_edges(
                     trap_overlap=trap_ov,
                     rank_score=0.6 * k_sim + 0.4 * k_jacc,
                     k_jaccard=k_jacc,
-                    needs_llm_refine=near_b,
-                    refine_reason="BOUNDARY_BAND" if near_b else "",
+                    needs_llm_refine=needs_ref,
+                    refine_reason=ref_reason,
                     rule_version=rule_ver,
                 )
             )
 
-        # (3) SCAFFOLD：有向边 source(低阶子题) -> target(高阶母题)，D_target - D_source >= min_elo_diff (D-Audit-5)
+        # (3) SCAFFOLD：有向边 source(低阶子题) -> target(高阶母题)，D_target - D_source >= min_elo_diff (D-Audit-2 & D-Audit-5)
         for high_f, low_f, low_in_high, high_in_low in (
             (fa, fb, cont_b_in_a, cont_a_in_b),
             (fb, fa, cont_a_in_b, cont_b_in_a),
         ):
             elo_gap = high_f.elo - low_f.elo
-            if len(low_f.k_union) < th.scaffold.min_k_size:
-                continue
-            if high_in_low >= th.scaffold.reverse_containment_max:
-                continue
             sc_band = th.scaffold.boundary_band
+            core_eligible = (
+                len(low_f.k_union) >= th.scaffold.min_k_size
+                and high_in_low < th.scaffold.reverse_containment_max
+            )
             sc_core = (
-                low_in_high >= th.scaffold.containment_min
+                core_eligible
+                and low_in_high >= th.scaffold.containment_min
                 and elo_gap >= th.scaffold.min_elo_diff
             )
             sc_boundary_hit = (
-                not sc_core
+                core_eligible
+                and not sc_core
                 and sc_band > 0
+                and elo_gap > 0
                 and low_in_high >= th.scaffold.containment_min * (1.0 - sc_band)
                 and elo_gap >= th.scaffold.min_elo_diff * (1.0 - sc_band)
             )
-            if sc_core or sc_boundary_hit:
-                near_b = sc_boundary_hit or (
-                    _near_threshold(low_in_high, th.scaffold.containment_min, sc_band)
-                    or _near_threshold(float(elo_gap), float(th.scaffold.min_elo_diff), sc_band)
-                )
+            shared_l2 = bool(low_f.l2_entities & high_f.l2_entities)
+            skel_related = (
+                (kr_ab is not None or kr_ba is not None or k_pct >= th.scaffold.skeleton_pct_min)
+                and (k_sim >= 0.45 or k_pct >= th.scaffold.skeleton_pct_min)
+            )
+            cont_wide_ok = (
+                low_in_high >= th.scaffold.containment_min
+                and high_in_low < th.scaffold.reverse_containment_max
+            )
+            sc_wide_hit = (
+                not sc_core
+                and not sc_boundary_hit
+                and elo_gap >= th.scaffold.min_elo_diff
+                and (cont_wide_ok or (shared_l2 and skel_related))
+            )
+            if sc_core or sc_boundary_hit or sc_wide_hit:
+                if sc_wide_hit:
+                    needs_ref = True
+                    ref_reason = "WIDE_RECALL_SCAFFOLD"
+                    r_score = (
+                        0.5 * max(low_in_high, k_sim)
+                        + 0.3 * min(1.0, max(0, elo_gap) / 400.0)
+                        + (0.2 if shared_l2 else 0.0)
+                    )
+                else:
+                    near_b = sc_boundary_hit or (
+                        _near_threshold(low_in_high, th.scaffold.containment_min, sc_band)
+                        or _near_threshold(float(elo_gap), float(th.scaffold.min_elo_diff), sc_band)
+                    )
+                    needs_ref = near_b
+                    ref_reason = "BOUNDARY_BAND" if near_b else ""
+                    r_score = 0.7 * low_in_high + 0.3 * min(1.0, max(0, elo_gap) / 400.0)
                 out_edges.append(
                     CandidateEdge(
                         source_uid=low_f.uid,
@@ -571,10 +678,10 @@ def generate_candidate_edges(
                         skeleton_pct=k_pct,
                         containment_score=low_in_high,
                         trap_overlap=trap_ov,
-                        rank_score=0.7 * low_in_high + 0.3 * min(1.0, max(0, elo_gap) / 400.0),
+                        rank_score=r_score,
                         k_jaccard=k_jacc,
-                        needs_llm_refine=near_b,
-                        refine_reason="BOUNDARY_BAND" if near_b else "",
+                        needs_llm_refine=needs_ref,
+                        refine_reason=ref_reason,
                         rule_version=rule_ver,
                     )
                 )
@@ -852,7 +959,7 @@ def weave_single_question(
         )
         return {"question_uid": question_uid, "written": 0}
 
-    new_candidates = generate_candidate_edges(
+    raw_candidates = generate_candidate_edges(
         conn,
         vector_store,
         grade_subject=grade_subject,
@@ -862,6 +969,8 @@ def weave_single_question(
         target_uids={question_uid},
         include_unservable=include_unservable,
     )
+    # 增量单题织网不直接写入未经 LLM 精裁的 WIDE_RECALL_* 宽进候选边
+    new_candidates = [e for e in raw_candidates if not e.refine_reason.startswith("WIDE_RECALL_")]
     # 先对与目标题关联的所有机器边连同对端现有同类型边一并校验度数上限
     touched_peers = {question_uid}
     for e in new_candidates:
@@ -878,7 +987,9 @@ def weave_single_question(
 
     combined: dict[tuple[str, str, str], CandidateEdge] = {}
     for r in existing_rows:
-        if r["source_question_uid"] == question_uid or r["target_question_uid"] == question_uid:
+        is_target_edge = r["source_question_uid"] == question_uid or r["target_question_uid"] == question_uid
+        conf_src = str(r["confidence_source"])
+        if is_target_edge and conf_src != "LLM_VERIFIED":
             continue
         rtype = str(r["relation_type"])
         key = (str(r["source_question_uid"]), str(r["target_question_uid"]), rtype)
@@ -900,13 +1011,16 @@ def weave_single_question(
             containment_score=float(r["containment_score"]),
             trap_overlap=float(r["trap_overlap"]),
             rank_score=rank_s,
-            confidence_source=str(r["confidence_source"]),
+            confidence_source=conf_src,
             pedagogical_note=str(r["pedagogical_note"]),
             rule_version=str(r["rule_version"]),
         )
     for e in new_candidates:
         u, v = normalize_edge_endpoints(e.relation_type, e.source_uid, e.target_uid)
-        combined[(u, v, e.relation_type)] = CandidateEdge(
+        key = (u, v, e.relation_type)
+        if key in combined and combined[key].confidence_source == "LLM_VERIFIED":
+            continue
+        combined[key] = CandidateEdge(
             **{**e.__dict__, "source_uid": u, "target_uid": v}
         )
 

@@ -550,7 +550,9 @@ async def run_stage1_compile(
             prev_attempts = int(row["cs_attempts"] or 0)
 
             is_unified_locked = (
-                cs_status == "OK" and cs_model == "subagent-unified" and cs_hash == rq_hash
+                cs_status == "OK"
+                and (cs_model == "subagent-unified" or cs_model.startswith("subagent:"))
+                and cs_hash == rq_hash
             )
             if not force and cs_status == "OK" and (is_unified_locked or cs_hash == input_hash):
                 result.skipped_ok += 1

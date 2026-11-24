@@ -16,7 +16,6 @@ from shuati.db.connection import get_connection
 from shuati.db.schema import init_db
 from shuati.pipeline.stage1_solve import run_stage1_compile
 from shuati.pipeline.unified_import import (
-    SUBAGENT_MODEL_NAME,
     export_unified_tasks,
     import_unified_results,
     register_anchors_from_yaml,
@@ -451,7 +450,7 @@ async def test_unified_pipeline_end_to_end_and_lock(tmp_path: Path) -> None:
             (pending_ambig_uid,),
         ).fetchone()
         assert cs_ambig_s2["status"] == "OK"
-        assert cs_ambig_s2["model_name"] == SUBAGENT_MODEL_NAME
+        assert cs_ambig_s2["model_name"] == "subagent:gemini-4-neon-medium"
 
         q_qual = conn.execute(
             "SELECT eff_verification_status, eff_is_servable, review_reason FROM questions WHERE question_uid = ?",
@@ -584,7 +583,7 @@ async def test_unified_pipeline_end_to_end_and_lock(tmp_path: Path) -> None:
             (pending_sfail_uid,),
         ).fetchone()
         assert s2_sf["status"] == "OK"
-        assert s2_sf["model_name"] == SUBAGENT_MODEL_NAME
+        assert s2_sf["model_name"] == "subagent:gemini-4-neon-medium"
 
     # 5. 验证防覆盖锁：即使 .env 模型改变，stage1_solve 默认跳过 subagent-unified
     s1_res = await run_stage1_compile(

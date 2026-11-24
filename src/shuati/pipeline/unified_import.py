@@ -16,18 +16,25 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
-from shuati.config import Settings, load_settings
+from shuati.config import (
+    Settings,
+    load_settings,
+    resolve_subagent_model,
+    validate_subagent_model_id,
+)
 from shuati.core import effective, refresh
 from shuati.core.difficulty import compute_difficulty
 from shuati.db import human_mirror, repository
@@ -38,6 +45,8 @@ from shuati.db.connection import (
     get_connection,
 )
 from shuati.db.schema import init_db
+from shuati.llm.prompt_builder import build_unified_s1_s2_messages, flatten_json_schema
+from shuati.llm.seam_loader import ResolvedSeamBundle, load_prompt_seams
 from shuati.models.domain import AnswerPart
 from shuati.models.schemas import Stage2OnlyOutput, UnifiedS1S2Output
 from shuati.pipeline.stage1_solve import _run_sympy_for_parts, materialize_solutions
@@ -74,6 +83,8 @@ class UnifiedExportResult:
     skipped_locked: int
     skipped_other_status: int
     batch_files: list[str] = field(default_factory=list)
+    subagent_model: str = ""
+    manifest_file: str = ""
 
 
 @dataclass
@@ -89,6 +100,12 @@ class UnifiedImportResult:
     failed_details: list[dict[str, Any]] = field(default_factory=list)
 
 
+def is_subagent_model_name(model_name: str | None) -> bool:
+    """判断 model_name 是否属于历史或新前缀的 Subagent 锁定标识。"""
+    m = (model_name or "").strip()
+    return m == SUBAGENT_MODEL_NAME or (m.startswith("subagent:") and len(m) > len("subagent:"))
+
+
 def is_compile_locked(
     status: str | None,
     model_name: str | None,
@@ -97,12 +114,12 @@ def is_compile_locked(
     *,
     force: bool = False,
 ) -> bool:
-    """检查阶段是否已被 subagent-unified 锁定且源题未变。"""
+    """检查阶段是否已被 subagent-unified 或 subagent:* 锁定且源题未变。"""
     if force:
         return False
     return (
         (status or "") == "OK"
-        and (model_name or "") == SUBAGENT_MODEL_NAME
+        and is_subagent_model_name(model_name)
         and bool(current_content_hash)
         and (recorded_hash or "") == current_content_hash
     )
@@ -310,6 +327,80 @@ def _format_sanitized_anchors_text(
     return "\n".join(lines)
 
 
+def _atomic_write_text(target: Path, content: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, target)
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def _check_unified_pending_lock(out_path: Path, *, overwrite_pending: bool) -> None:
+    """防踩踏锁：存在 PENDING_IMPORT、更新未消费 results*.jsonl 或损坏的状态文件时拦截覆盖导出（fail-closed）。"""
+    if overwrite_pending:
+        return
+
+    manifest_path = out_path / "unified_manifest.json"
+    task_map_path = out_path / "task_map.json"
+
+    manifest_data: dict[str, Any] = {}
+    if manifest_path.is_file():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise PreconditionError(
+                f"PENDING_UNIMPORTED_BATCH: 清单文件 '{manifest_path.as_posix()}' 损坏或无法解析 ({exc})，"
+                "已保守拦截覆盖导出；请人工核查或传入 --overwrite-pending"
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise PreconditionError(
+                f"PENDING_UNIMPORTED_BATCH: 清单文件 '{manifest_path.as_posix()}' 根结构非对象，"
+                "已保守拦截覆盖导出；请人工核查或传入 --overwrite-pending"
+            )
+        manifest_data = loaded
+
+    task_map_data: dict[str, Any] = {}
+    if task_map_path.is_file():
+        try:
+            loaded_tm = json.loads(task_map_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise PreconditionError(
+                f"PENDING_UNIMPORTED_BATCH: 映射文件 '{task_map_path.as_posix()}' 损坏或无法解析 ({exc})，"
+                "已保守拦截覆盖导出；请人工核查或传入 --overwrite-pending"
+            ) from exc
+        if not isinstance(loaded_tm, dict):
+            raise PreconditionError(
+                f"PENDING_UNIMPORTED_BATCH: 映射文件 '{task_map_path.as_posix()}' 根结构非对象，"
+                "已保守拦截覆盖导出；请人工核查或传入 --overwrite-pending"
+            )
+        task_map_data = loaded_tm
+
+    if manifest_data.get("status") == "PENDING_IMPORT" and len(task_map_data) > 0:
+        raise PreconditionError(
+            f"PENDING_UNIMPORTED_BATCH: '{out_path.as_posix()}' 尚有 {len(task_map_data)} 道未回灌任务 "
+            "(status=PENDING_IMPORT)，请先执行 `shuati unified import` 或传入 --overwrite-pending"
+        )
+
+    ref_mtime: float | None = None
+    manifest_imported = manifest_data.get("status") == "IMPORTED"
+    if manifest_path.is_file():
+        ref_mtime = manifest_path.stat().st_mtime
+    elif task_map_path.is_file() and len(task_map_data) > 0:
+        ref_mtime = task_map_path.stat().st_mtime
+
+    if ref_mtime is not None and out_path.is_dir():
+        for rf in sorted(out_path.glob("results*.jsonl")):
+            if not manifest_imported or rf.stat().st_mtime > ref_mtime:
+                raise PreconditionError(
+                    f"PENDING_UNIMPORTED_BATCH: '{out_path.as_posix()}' 存在比上次导出更新且未消费的结果文件 "
+                    f"'{rf.name}'，请先执行 `shuati unified import` 或传入 --overwrite-pending"
+                )
+
+
 def export_unified_tasks(
     *,
     db_path: Path,
@@ -320,17 +411,28 @@ def export_unified_tasks(
     limit: int | None = None,
     batch_size: int = 10,
     force: bool = False,
+    subagent_model: str | None = None,
+    prompt_profile: str | None = None,
+    overwrite_pending: bool = False,
 ) -> UnifiedExportResult:
-    """导出脱敏任务卡（UNIFIED_S1_S2 / STAGE2_ONLY）与隔离 task_map.json。"""
+    """导出脱敏任务卡（UNIFIED_S1_S2 / STAGE2_ONLY）与隔离 task_map.json 及自包含 manifest。"""
     cfg_dir = Path(config_dir)
     out_path = Path(out_dir)
+
+    settings: Settings = load_settings(cfg_dir / "settings.yaml")
+    try:
+        resolved_model = resolve_subagent_model(settings, "unified", subagent_model)
+    except ValueError as exc:
+        raise PreconditionError(f"PRECONDITION_FAILED: {exc}") from exc
+
+    _check_unified_pending_lock(out_path, overwrite_pending=overwrite_pending)
+
     out_path.mkdir(parents=True, exist_ok=True)
     batches_dir = out_path / "batches"
     batches_dir.mkdir(parents=True, exist_ok=True)
     for old_b in batches_dir.glob("batch_*.jsonl"):
         old_b.unlink()
 
-    settings: Settings = load_settings(cfg_dir / "settings.yaml")
     blacklist, seed_traps = _load_blacklist_and_traps(cfg_dir)
 
     with closing(get_connection(db_path, readonly=True)) as conn:
@@ -476,23 +578,82 @@ def export_unified_tasks(
                 "eff_final_answers_json": row["eff_final_answers_json"] or "[]",
             }
 
-        (out_path / "anchors_prompt.txt").write_text(anchors_prompt_text, encoding="utf-8")
-        (out_path / "task_map.json").write_text(
-            json.dumps(task_map, ensure_ascii=False, indent=2), encoding="utf-8"
+        seam_bundle: ResolvedSeamBundle | None = None
+        for item in sanitized_tasks:
+            msgs, bundle = build_unified_s1_s2_messages(
+                task_payload=item,
+                anchors_prompt_text=anchors_prompt_text,
+                config_dir=cfg_dir,
+                prompt_profile=prompt_profile,
+                embed_images=False,
+            )
+            item["messages"] = msgs
+            if seam_bundle is None:
+                seam_bundle = bundle
+
+        if seam_bundle is None:
+            seam_bundle = load_prompt_seams(
+                config_dir=cfg_dir,
+                grade_subject=grade_subject,
+                profile=prompt_profile,
+            )
+
+        flat_unified_path = out_path / "flat_schema_unified.json"
+        flat_stage2_path = out_path / "flat_schema_stage2.json"
+        _atomic_write_text(
+            flat_unified_path,
+            json.dumps(flatten_json_schema(UnifiedS1S2Output), ensure_ascii=False, indent=2),
         )
-        with open(out_path / "tasks.jsonl", "w", encoding="utf-8", newline="\n") as f:
-            for item in sanitized_tasks:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        _atomic_write_text(
+            flat_stage2_path,
+            json.dumps(flatten_json_schema(Stage2OnlyOutput), ensure_ascii=False, indent=2),
+        )
+
+        _atomic_write_text(out_path / "anchors_prompt.txt", anchors_prompt_text)
+        _atomic_write_text(
+            out_path / "task_map.json",
+            json.dumps(task_map, ensure_ascii=False, indent=2),
+        )
+        _atomic_write_text(
+            out_path / "tasks.jsonl",
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in sanitized_tasks),
+        )
 
         batch_files: list[str] = []
         eff_bs = max(1, batch_size)
         for idx in range(0, len(sanitized_tasks), eff_bs):
             chunk = sanitized_tasks[idx : idx + eff_bs]
             b_file = batches_dir / f"batch_{(idx // eff_bs) + 1:03d}.jsonl"
-            with open(b_file, "w", encoding="utf-8", newline="\n") as bf:
-                for item in chunk:
-                    bf.write(json.dumps(item, ensure_ascii=False) + "\n")
+            _atomic_write_text(
+                b_file,
+                "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in chunk),
+            )
             batch_files.append(b_file.as_posix())
+
+        manifest_path = out_path / "unified_manifest.json"
+        manifest_payload = {
+            "step_kind": "unified",
+            "grade_subject": grade_subject,
+            "subagent_model": resolved_model,
+            "dispatch_driver": "swarm",
+            "max_parallel_workers": int(settings.subagent.max_parallel_workers),
+            "prompt_version": seam_bundle.prompt_versions.get("unified", UNIFIED_PROMPT_VERSION),
+            "prompt_digest": seam_bundle.prompt_digest,
+            "prompt_profile": prompt_profile,
+            "flat_schema_unified_file": flat_unified_path.as_posix(),
+            "flat_schema_stage2_file": flat_stage2_path.as_posix(),
+            "task_map_file": (out_path / "task_map.json").as_posix(),
+            "batch_files": batch_files,
+            "task_count": len(sanitized_tasks),
+            "imported_task_ids": [],
+            "failed_task_ids": [],
+            "status": "PENDING_IMPORT",
+            "exported_at": datetime.now(UTC).isoformat(),
+        }
+        _atomic_write_text(
+            manifest_path,
+            json.dumps(manifest_payload, ensure_ascii=False, indent=2),
+        )
 
         return UnifiedExportResult(
             grade_subject=grade_subject,
@@ -503,6 +664,8 @@ def export_unified_tasks(
             skipped_locked=skipped_locked,
             skipped_other_status=skipped_other,
             batch_files=batch_files,
+            subagent_model=resolved_model,
+            manifest_file=manifest_path.as_posix(),
         )
 
 
@@ -623,6 +786,8 @@ def _write_stage2_db(
     uid: str,
     content_hash: str,
     out: Stage2OnlyOutput | UnifiedS1S2Output,
+    model_name: str = SUBAGENT_MODEL_NAME,
+    prompt_version: str = UNIFIED_PROMPT_VERSION,
 ) -> None:
     diff = out.difficulty
     c_val = diff.C_concept_count.score
@@ -739,7 +904,7 @@ def _write_stage2_db(
             last_error = '',
             updated_at = datetime('now')
         """,
-        (uid, content_hash, UNIFIED_PROMPT_VERSION, SUBAGENT_MODEL_NAME),
+        (uid, content_hash, prompt_version, model_name),
     )
 
     effective.recompute(conn, uid)
@@ -808,6 +973,7 @@ def import_unified_results(
     final_round: bool = False,
     force: bool = False,
     worker_tag: str = "main-session",
+    subagent_model: str | None = None,
 ) -> UnifiedImportResult:
     """校验并事务回灌主会话 Subagent 产出的 JSONL 结果。"""
     cfg_dir = Path(config_dir)
@@ -818,6 +984,36 @@ def import_unified_results(
     if not tmap_path.exists():
         raise PreconditionError(f"PRECONDITION_FAILED: 未找到 task_map.json: {tmap_path}")
     task_map: dict[str, dict[str, Any]] = json.loads(tmap_path.read_text(encoding="utf-8"))
+
+    manifest_path = tmap_path.parent / "unified_manifest.json"
+    manifest_data: dict[str, Any] | None = None
+    if manifest_path.is_file():
+        try:
+            loaded_mf = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_mf, dict):
+                manifest_data = loaded_mf
+        except Exception:
+            manifest_data = None
+
+    prompt_version_to_write = (
+        str(manifest_data.get("prompt_version") or UNIFIED_PROMPT_VERSION)
+        if manifest_data is not None
+        else UNIFIED_PROMPT_VERSION
+    )
+    if subagent_model is not None and subagent_model.strip():
+        try:
+            resolved_model = validate_subagent_model_id(subagent_model)
+        except ValueError as exc:
+            raise PreconditionError(f"PRECONDITION_FAILED: {exc}") from exc
+        model_name_to_write = f"subagent:{resolved_model}"
+    elif manifest_data is not None and str(manifest_data.get("subagent_model") or "").strip():
+        try:
+            resolved_model = validate_subagent_model_id(str(manifest_data["subagent_model"]))
+        except ValueError as exc:
+            raise PreconditionError(f"PRECONDITION_FAILED: {exc}") from exc
+        model_name_to_write = f"subagent:{resolved_model}"
+    else:
+        model_name_to_write = SUBAGENT_MODEL_NAME
 
     res_path = Path(results_file)
     if not res_path.exists():
@@ -838,6 +1034,9 @@ def import_unified_results(
 
     retry_path = retry_out or (tmap_path.parent / "retry_tasks.jsonl")
     retry_items: list[dict[str, Any]] = []
+    completed_task_ids: list[str] = []
+    final_failed_task_ids: list[str] = []
+    unknown_failed_count = 0
 
     stats = UnifiedImportResult(
         total_records=len(raw_records),
@@ -861,6 +1060,7 @@ def import_unified_results(
             meta = task_map.get(task_id)
             if meta is None:
                 stats.failed_final_count += 1
+                unknown_failed_count += 1
                 stats.failed_details.append({"task_id": task_id, "errors": ["UNKNOWN_TASK_ID"]})
                 continue
 
@@ -882,12 +1082,14 @@ def import_unified_results(
             ).fetchone()
             if db_row is None:
                 stats.failed_final_count += 1
+                final_failed_task_ids.append(task_id)
                 stats.failed_details.append({"task_id": task_id, "errors": ["QUESTION_NOT_FOUND"]})
                 continue
 
             current_hash = str(db_row["content_hash"])
             if current_hash != expected_hash:
                 stats.failed_final_count += 1
+                final_failed_task_ids.append(task_id)
                 stats.failed_details.append({"task_id": task_id, "errors": ["STALE_CONTENT_HASH"]})
                 continue
 
@@ -896,6 +1098,7 @@ def import_unified_results(
                     db_row["s2_status"], db_row["s2_model"], db_row["s2_hash"], current_hash, force=force
                 ):
                     stats.skipped_locked += 1
+                    completed_task_ids.append(task_id)
                     continue
                 try:
                     out_s2 = Stage2OnlyOutput.model_validate(raw_rec)
@@ -906,6 +1109,7 @@ def import_unified_results(
                         stats.retry_count += 1
                     else:
                         stats.failed_final_count += 1
+                        final_failed_task_ids.append(task_id)
                         stats.failed_details.append({"task_id": task_id, "errors": errs})
                     continue
 
@@ -926,12 +1130,21 @@ def import_unified_results(
                         stats.retry_count += 1
                     else:
                         stats.failed_final_count += 1
+                        final_failed_task_ids.append(task_id)
                         stats.failed_details.append({"task_id": task_id, "errors": s2_errors})
                     continue
 
                 with writer.transaction(conn):
-                    _write_stage2_db(conn, uid=uid, content_hash=current_hash, out=out_s2)
+                    _write_stage2_db(
+                        conn,
+                        uid=uid,
+                        content_hash=current_hash,
+                        out=out_s2,
+                        model_name=model_name_to_write,
+                        prompt_version=prompt_version_to_write,
+                    )
                 stats.ingested_stage2_only += 1
+                completed_task_ids.append(task_id)
                 continue
 
             # mode == "UNIFIED_S1_S2"
@@ -943,6 +1156,7 @@ def import_unified_results(
             )
             if s1_locked and s2_locked:
                 stats.skipped_locked += 1
+                completed_task_ids.append(task_id)
                 continue
 
             try:
@@ -954,6 +1168,7 @@ def import_unified_results(
                     stats.retry_count += 1
                 else:
                     stats.failed_final_count += 1
+                    final_failed_task_ids.append(task_id)
                     stats.failed_details.append({"task_id": task_id, "errors": errs})
                 continue
 
@@ -985,6 +1200,7 @@ def import_unified_results(
                     stats.retry_count += 1
                 else:
                     stats.failed_final_count += 1
+                    final_failed_task_ids.append(task_id)
                     stats.failed_details.append({"task_id": task_id, "errors": all_errors})
                 continue
 
@@ -1021,8 +1237,8 @@ def import_unified_results(
                     """,
                     (
                         uid,
-                        SUBAGENT_MODEL_NAME,
-                        UNIFIED_PROMPT_VERSION,
+                        model_name_to_write,
+                        prompt_version_to_write,
                         current_hash,
                         out_u.visual_facts,
                         1 if out_u.visual_ambiguity_flag else 0,
@@ -1078,15 +1294,23 @@ def import_unified_results(
                         last_error = '',
                         updated_at = datetime('now')
                     """,
-                    (uid, current_hash, UNIFIED_PROMPT_VERSION, SUBAGENT_MODEL_NAME),
+                    (uid, current_hash, prompt_version_to_write, model_name_to_write),
                 )
                 # 注意：用户决策要求 NEEDS_REVIEW 不阻断 Stage 2，直接落库 S2 结果并置 S2='OK'
-                _write_stage2_db(conn, uid=uid, content_hash=current_hash, out=out_u)
+                _write_stage2_db(
+                    conn,
+                    uid=uid,
+                    content_hash=current_hash,
+                    out=out_u,
+                    model_name=model_name_to_write,
+                    prompt_version=prompt_version_to_write,
+                )
 
             if m_status == "VERIFIED_CONSENSUS":
                 stats.ingested_verified += 1
             else:
                 stats.ingested_needs_review += 1
+            completed_task_ids.append(task_id)
 
     if retry_items:
         retry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1094,5 +1318,41 @@ def import_unified_results(
             for item in retry_items:
                 rf.write(json.dumps(item, ensure_ascii=False) + "\n")
         stats.retry_file = retry_path.as_posix()
+
+    if manifest_data is not None:
+        prev_imp = [
+            str(x)
+            for x in (manifest_data.get("imported_task_ids") or [])
+            if isinstance(x, str) and x
+        ]
+        prev_fail = [
+            str(x)
+            for x in (manifest_data.get("failed_task_ids") or [])
+            if isinstance(x, str) and x
+        ]
+        merged_imp = list(dict.fromkeys([*prev_imp, *completed_task_ids]))
+        imp_set = set(merged_imp)
+        merged_fail = [
+            tid for tid in dict.fromkeys([*prev_fail, *final_failed_task_ids]) if tid not in imp_set
+        ]
+        manifest_data["imported_task_ids"] = merged_imp
+        manifest_data["failed_task_ids"] = merged_fail
+
+        expected_ids = set(task_map.keys())
+        resolved_ids = imp_set | set(merged_fail)
+        all_tasks_resolved = len(expected_ids) > 0 and expected_ids.issubset(resolved_ids)
+        clean_pass = (
+            stats.retry_count == 0
+            and unknown_failed_count == 0
+            and (stats.failed_final_count == 0 or final_round)
+        )
+        if all_tasks_resolved and clean_pass:
+            manifest_data["status"] = "IMPORTED"
+            manifest_data["imported_at"] = datetime.now(UTC).isoformat()
+
+        _atomic_write_text(
+            manifest_path,
+            json.dumps(manifest_data, ensure_ascii=False, indent=2),
+        )
 
     return stats

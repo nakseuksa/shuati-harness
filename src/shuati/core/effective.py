@@ -21,6 +21,34 @@ from shuati.core.text_norm import detect_and_extract_choice_options
 
 _AUTHORIZED_WRITER = contextvars.ContextVar("shuati_authorized_effective_writer", default=False)
 
+VERIFICATION_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "question_text",
+        "visual_facts",
+        "final_answers_json",
+        "solutions_override_json",
+        "verification_status",
+        "format",
+        "is_excluded",
+    }
+)
+ANNOTATION_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "difficulty_override_json",
+        "abstract_skeleton",
+        "thinking_methods_json",
+        "classic_motifs_json",
+        "trap_tags_json",
+    }
+)
+TAXONOMY_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "primary_l1_module",
+        "secondary_l1_modules_json",
+        "taxonomy_override_json",
+    }
+)
+
 
 @contextmanager
 def authorized_effective_writer() -> Iterator[None]:
@@ -136,49 +164,79 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
     if not q_row:
         return
 
-    # 2. 读取 raw_questions content_hash 用于校验覆写指纹
+    # 2. 读取 raw_questions content_hash 与学段 taxonomy_version 用于分组校验
     raw_row = conn.execute(
         "SELECT content_hash FROM raw_questions WHERE question_uid = ?",
         (question_uid,),
     ).fetchone()
     current_content_hash = raw_row["content_hash"] if raw_row else ""
 
+    gs_row = conn.execute(
+        "SELECT taxonomy_version FROM grade_subjects WHERE grade_subject = ?",
+        (q_row["grade_subject"],),
+    ).fetchone()
+    current_taxonomy_version = str(gs_row["taxonomy_version"] or "").strip() if gs_row else ""
+
     # 3. 读取该题的人工覆写记录
     overrides = conn.execute(
         """
         SELECT
             override_id, field_name, override_value, base_fingerprint,
-            is_active, is_suspended, suspended_reason, bundle_id
+            taxonomy_version, is_active, is_suspended, suspended_reason, bundle_id
         FROM human_overrides
         WHERE question_uid = ? AND is_active = 1
         """,
         (question_uid,),
     ).fetchall()
 
-    # 识别需要挂起的 bundle（同 bundle_id 整组挂起）与单独覆写，记录真实触发原因
-    bundle_reasons: dict[str, str] = {}
+    # 识别需要挂起的 bundle（按分组规则）与单独覆写，记录真实触发原因
+    # - 验真类 (VERIFICATION_OVERRIDE_FIELDS): 强绑定 raw_questions.content_hash；
+    #   仅验真类的指纹失配或已挂起状态触发全 bundle 挂起（含同 bundle 全部字段）。
+    # - 标注类 (ANNOTATION_OVERRIDE_FIELDS): 解绑 content_hash（仅保留写入指纹作审计）。
+    # - 考点词表类 (TAXONOMY_OVERRIDE_FIELDS): 解绑 content_hash，仅校验非空 taxonomy_version；
+    #   词表类挂起绝不连坐同 bundle 的验真类覆写。
+    verification_bundle_reasons: dict[str, str] = {}
+    non_ver_bundle_reasons: dict[str, str] = {}
     stale_override_reasons: dict[int, str] = {}
+    direct_stale_ids: set[int] = set()
 
     for ov in overrides:
+        oid = int(ov["override_id"])
+        field_name = str(ov["field_name"])
         bid = ov["bundle_id"]
-        is_fingerprint_stale = ov["base_fingerprint"] != current_content_hash
         is_already_suspended = ov["is_suspended"] == 1
+        is_ver_field = field_name in VERIFICATION_OVERRIDE_FIELDS
 
-        if is_fingerprint_stale or is_already_suspended:
+        is_fingerprint_stale = is_ver_field and ov["base_fingerprint"] != current_content_hash
+        ov_tax_ver = str(ov["taxonomy_version"] or "").strip()
+        is_taxonomy_stale = (
+            field_name in TAXONOMY_OVERRIDE_FIELDS
+            and bool(ov_tax_ver)
+            and bool(current_taxonomy_version)
+            and ov_tax_ver != current_taxonomy_version
+        )
+
+        if is_fingerprint_stale or is_taxonomy_stale or is_already_suspended:
+            direct_stale_ids.add(oid)
             if is_fingerprint_stale:
                 reason = "SOURCE_CHANGED"
+            elif is_taxonomy_stale:
+                reason = "TAXONOMY_UNMAPPED"
             else:
                 reason = ov["suspended_reason"] or "SOURCE_CHANGED"
 
-            if bid:
-                # 若有成员指纹失配，优先 SOURCE_CHANGED
-                if bid not in bundle_reasons or reason == "SOURCE_CHANGED":
-                    bundle_reasons[bid] = reason
+            if bid and is_ver_field:
+                # 验真类触发全 bundle 挂起，优先 SOURCE_CHANGED
+                if bid not in verification_bundle_reasons or reason == "SOURCE_CHANGED":
+                    verification_bundle_reasons[bid] = reason
             else:
-                stale_override_reasons[ov["override_id"]] = reason
+                stale_override_reasons[oid] = reason
+                if bid and is_already_suspended and not is_taxonomy_stale:
+                    if bid not in non_ver_bundle_reasons:
+                        non_ver_bundle_reasons[bid] = reason
 
     # 执行整组或单条挂起持久化（仅挂起原本未挂起 is_suspended == 0 的记录）
-    for bid, reason in bundle_reasons.items():
+    for bid, reason in verification_bundle_reasons.items():
         conn.execute(
             """
             UPDATE human_overrides
@@ -187,6 +245,23 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
             """,
             (reason, question_uid, bid),
         )
+
+    if non_ver_bundle_reasons:
+        ver_fields = sorted(VERIFICATION_OVERRIDE_FIELDS)
+        ver_ph = ",".join("?" for _ in ver_fields)
+        for bid, reason in non_ver_bundle_reasons.items():
+            conn.execute(
+                f"""
+                UPDATE human_overrides
+                SET is_suspended = 1, suspended_reason = ?
+                WHERE question_uid = ?
+                  AND bundle_id = ?
+                  AND is_active = 1
+                  AND is_suspended = 0
+                  AND field_name NOT IN ({ver_ph})
+                """,
+                (reason, question_uid, bid, *ver_fields),
+            )
 
     for oid, reason in stale_override_reasons.items():
         conn.execute(
@@ -202,27 +277,25 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
     has_suspended_verification_override = False
 
     for ov in overrides:
+        oid = int(ov["override_id"])
+        field_name = str(ov["field_name"])
         bid = ov["bundle_id"]
         is_stale = (
-            (bid and bid in bundle_reasons)
-            or (ov["override_id"] in stale_override_reasons)
-            or (ov["base_fingerprint"] != current_content_hash)
-            or (ov["is_suspended"] == 1)
+            (bid and bid in verification_bundle_reasons)
+            or (
+                bid
+                and bid in non_ver_bundle_reasons
+                and field_name not in VERIFICATION_OVERRIDE_FIELDS
+            )
+            or (oid in stale_override_reasons)
+            or (oid in direct_stale_ids)
         )
         if is_stale:
-            if ov["field_name"] in (
-                "question_text",
-                "visual_facts",
-                "final_answers_json",
-                "solutions_override_json",
-                "verification_status",
-                "format",
-                "is_excluded",
-            ):
+            if field_name in VERIFICATION_OVERRIDE_FIELDS:
                 has_suspended_verification_override = True
             continue
 
-        active_overrides[ov["field_name"]] = dict(ov)
+        active_overrides[field_name] = dict(ov)
 
     # 4. 逐字段解析生效值（DESIGN.md §3.2-4 逐字段解析表）
     # (1) 题干与格式

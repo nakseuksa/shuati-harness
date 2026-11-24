@@ -44,15 +44,17 @@ def handle_source_content_changed(
 ) -> None:
     """源题内容变更（content_hash 变化）时的局部刷新与覆写挂起治理。
 
-    1. 核对该题的激活覆写：凡 base_fingerprint != new_content_hash 者，自动挂起；
-       若覆写带 bundle_id，则同一 bundle_id 整组一并挂起 (is_suspended=1, suspended_reason='SOURCE_CHANGED')；
+    1. 核对该题的激活覆写：仅对验真类覆写（VERIFICATION_OVERRIDE_FIELDS）校验
+       base_fingerprint != new_content_hash 并自动挂起；标注类与词表类解绑 content_hash；
+       若触发挂起的覆写带 bundle_id，则同一 bundle_id 整组一并挂起
+       (is_suspended=1, suspended_reason='SOURCE_CHANGED')；
     2. 将 S1, S2, S3C, S3D, S4 全阶段 compile_state 置为 STALE；
     3. 调用 effective.recompute(conn, uid)，进而触发 OVERRIDE_STALE 降级并刷新 questions_fts。
     """
     # 1. 查找所有激活中的覆写
     active_overrides = conn.execute(
         """
-        SELECT override_id, bundle_id, base_fingerprint
+        SELECT override_id, field_name, bundle_id, base_fingerprint, is_suspended
         FROM human_overrides
         WHERE question_uid = ? AND is_active = 1
         """,
@@ -63,7 +65,10 @@ def handle_source_content_changed(
     suspended_bundle_ids: set[str] = set()
 
     for ov in active_overrides:
-        if ov["base_fingerprint"] != new_content_hash:
+        if (
+            ov["field_name"] in effective.VERIFICATION_OVERRIDE_FIELDS
+            and ov["base_fingerprint"] != new_content_hash
+        ):
             suspended_override_ids.add(ov["override_id"])
             b_id = ov["bundle_id"]
             if b_id:
@@ -75,13 +80,13 @@ def handle_source_content_changed(
             if ov["bundle_id"] in suspended_bundle_ids:
                 suspended_override_ids.add(ov["override_id"])
 
-    # 执行挂起更新
+    # 执行挂起更新（不覆盖已因其他原因挂起行）
     for ov_id in suspended_override_ids:
         conn.execute(
             """
             UPDATE human_overrides
             SET is_suspended = 1, suspended_reason = 'SOURCE_CHANGED'
-            WHERE override_id = ?
+            WHERE override_id = ? AND is_suspended = 0
             """,
             (ov_id,),
         )

@@ -125,3 +125,8 @@ human_mirror:
   dir: "human/"
   include_practice_log: true
   backups_keep: 10
+
+subagent:
+  default_model: "${SUBAGENT_DEFAULT_MODEL:-gemini-4-neon-medium}"
+  max_parallel_workers: 4
+  stage_models: {}

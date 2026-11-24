@@ -133,6 +133,9 @@ def ingest(
     apply_retire: bool = typer.Option(
         False, "--apply-retire", help="下架源端已消失的题目 (is_retired=1)"
     ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="只读体检预览，不写数据库、不锁库、不复制图片"
+    ),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
     reports_dir: Path | None = typer.Option(None, "--reports-dir", help="体检报告输出目录"),
@@ -151,6 +154,7 @@ def ingest(
             grade_subject_override=grade_subject,
             dedup_near=dedup_near,
             apply_retire=apply_retire,
+            dry_run=dry_run,
         )
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
@@ -499,7 +503,7 @@ def reindex(
 
 @app.command(name="compile")
 def compile_stage(
-    stage: str = typer.Option(..., "--stage", help="编译阶段（支持: 1|3c|3d|3e|4|all）"),
+    stage: str = typer.Option(..., "--stage", help="编译阶段（支持: 1|2|3c|3d|3e|4|all）"),
     grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科（Stage 3/4 默认小学奥数）"),
     only_uids: list[str] | None = typer.Option(
         None, "--only-uids", help="限定题目 UID 或 source_id（可重复传参或逗号分隔）"
@@ -514,6 +518,9 @@ def compile_stage(
     results: Path | None = typer.Option(None, "--results", help="Subagent 回传结果 JSONL 路径"),
     batch_size: int | None = typer.Option(None, "--batch-size", help="覆盖默认批大小"),
     include_unservable: bool = typer.Option(False, "--include-unservable", help="Stage 4 包含 NEEDS_REVIEW 题目"),
+    subagent_model: str | None = typer.Option(None, "--subagent-model", help="覆盖 Subagent 锁模 ID（export 模式）"),
+    prompt_profile: str | None = typer.Option(None, "--prompt-profile", help="加载 Prompt profile（export 模式）"),
+    overwrite_pending: bool = typer.Option(False, "--overwrite-pending", help="允许覆盖挂起未回灌批（export 模式）"),
     vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
     mock: bool | None = typer.Option(None, "--mock/--no-mock", help="启用离线 Mock LLM"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
@@ -536,14 +543,14 @@ def compile_stage(
         )
         return
 
-    allowed_stages = ("1", "S1", "3C", "S3C", "3D", "S3D", "3E", "S3E", "4", "S4", "ALL")
+    allowed_stages = ("1", "S1", "2", "S2", "3C", "S3C", "3D", "S3D", "3E", "S3E", "4", "S4", "ALL")
     if norm_stage not in allowed_stages:
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
             "compile",
             error=ErrorDetail(
                 code="PRECONDITION_FAILED",
-                message=f"不支持编译阶段 '{stage}'（支持: 1, 3c, 3d, 3e, 4, all）",
+                message=f"不支持编译阶段 '{stage}'（支持: 1, 2, 3c, 3d, 3e, 4, all）",
             ),
             meta={"duration_ms": duration_ms},
             as_json=json,
@@ -577,6 +584,7 @@ def compile_stage(
             )
             data_out: dict[str, Any] = asdict(res)
         else:
+            from shuati.pipeline.stage2_decompose import run_stage2_decompose_async
             from shuati.pipeline.stage3_taxonomy import (
                 run_compaction_async,
                 run_stage3c_async,
@@ -596,7 +604,28 @@ def compile_stage(
             try:
                 _ensure_db_initialized(conn, config_dir)
                 effective.install_eff_write_guard(conn)
-                if norm_stage in ("3C", "S3C"):
+                if norm_stage in ("2", "S2"):
+                    data_out = asyncio.run(
+                        run_stage2_decompose_async(
+                            conn,
+                            settings,
+                            grade_subject=gs,
+                            mode=norm_mode,  # type: ignore[arg-type]
+                            only_uids=parsed_uids,
+                            force=force,
+                            batch_size=batch_size or 10,
+                            tasks_dir=tasks_dir or Path("data/unified/stage2"),
+                            results_path=results,
+                            lock_path=db.parent / ".compile.lock",
+                            config_dir=config_dir,
+                            assets_dir=assets_dir,
+                            subagent_model=subagent_model,
+                            prompt_profile=prompt_profile,
+                            overwrite_pending=overwrite_pending,
+                            use_mock=use_mock_flag,
+                        )
+                    )
+                elif norm_stage in ("3C", "S3C"):
                     data_out = asyncio.run(
                         run_stage3c_async(
                             conn,
@@ -607,6 +636,10 @@ def compile_stage(
                             tasks_dir=tasks_dir or Path("data/unified/stage3_4/3c"),
                             results_path=results,
                             lock_path=db.parent / ".compile.lock",
+                            config_dir=config_dir,
+                            subagent_model=subagent_model,
+                            prompt_profile=prompt_profile,
+                            overwrite_pending=overwrite_pending,
                         )
                     )
                 elif norm_stage in ("3D", "S3D"):
@@ -625,6 +658,10 @@ def compile_stage(
                             tasks_dir=tasks_dir or Path("data/unified/stage3_4/3e"),
                             results_path=results,
                             lock_path=db.parent / ".compile.lock",
+                            config_dir=config_dir,
+                            subagent_model=subagent_model,
+                            prompt_profile=prompt_profile,
+                            overwrite_pending=overwrite_pending,
                         )
                     )
                 elif norm_stage in ("4", "S4"):
@@ -641,6 +678,10 @@ def compile_stage(
                             vectors_dir=vectors_dir,
                             use_mock=use_mock_flag,
                             lock_path=db.parent / ".compile.lock",
+                            config_dir=config_dir,
+                            subagent_model=subagent_model,
+                            prompt_profile=prompt_profile,
+                            overwrite_pending=overwrite_pending,
                         )
                     )
                 else:  # ALL
@@ -845,6 +886,9 @@ def unified_export(
     limit: int | None = typer.Option(None, "--limit", help="最大导出题数"),
     batch_size: int = typer.Option(10, "--batch-size", help="每批任务卡数量"),
     force: bool = typer.Option(False, "--force", help="忽略锁定状态强制导出"),
+    subagent_model: str | None = typer.Option(None, "--subagent-model", help="覆盖 Subagent 锁模 ID"),
+    prompt_profile: str | None = typer.Option(None, "--prompt-profile", help="加载 Prompt profile"),
+    overwrite_pending: bool = typer.Option(False, "--overwrite-pending", help="允许覆盖挂起未回灌批"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
     json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
@@ -866,6 +910,9 @@ def unified_export(
             limit=limit,
             batch_size=batch_size,
             force=force,
+            subagent_model=subagent_model,
+            prompt_profile=prompt_profile,
+            overwrite_pending=overwrite_pending,
         )
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
@@ -914,6 +961,7 @@ def unified_import(
     final_round: bool = typer.Option(False, "--final", help="终轮回灌：SymPy 仍败者降级 NEEDS_REVIEW 保留 Stage 2"),
     force: bool = typer.Option(False, "--force", help="强制覆盖已锁定条目"),
     worker_tag: str = typer.Option("main-session", "--worker-tag", help="记录来源标识"),
+    subagent_model: str | None = typer.Option(None, "--subagent-model", help="显式指定回灌记录的 Subagent 模型 ID"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
     json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
@@ -932,6 +980,7 @@ def unified_import(
             final_round=final_round,
             force=force,
             worker_tag=worker_tag,
+            subagent_model=subagent_model,
         )
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
@@ -1035,6 +1084,9 @@ def taxonomy_propose(
     tasks_dir: Path = typer.Option(Path("data/unified/stage3_4/propose"), "--tasks-dir", help="Subagent 任务包目录"),
     results: Path | None = typer.Option(None, "--results", help="Subagent 回传结果 JSONL 路径"),
     n_clusters: int | None = typer.Option(None, "--n-clusters", help="覆盖聚类簇数（默认 60~100）"),
+    subagent_model: str | None = typer.Option(None, "--subagent-model", help="覆盖 Subagent 锁模 ID（export 模式）"),
+    prompt_profile: str | None = typer.Option(None, "--prompt-profile", help="加载 Prompt profile（export 模式）"),
+    overwrite_pending: bool = typer.Option(False, "--overwrite-pending", help="允许覆盖挂起未回灌批（export 模式）"),
     mock: bool | None = typer.Option(None, "--mock/--no-mock", help="使用离线 Mock Embedding/LLM"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
@@ -1063,6 +1115,9 @@ def taxonomy_propose(
                     config_dir=config_dir,
                     use_mock=use_mock_flag,
                     n_clusters=n_clusters,
+                    subagent_model=subagent_model,
+                    prompt_profile=prompt_profile,
+                    overwrite_pending=overwrite_pending,
                 )
             )
         finally:
@@ -1202,6 +1257,9 @@ def graph_compact(
     tasks_dir: Path = typer.Option(Path("data/unified/stage3_4/compact"), "--tasks-dir", help="Subagent 任务包目录"),
     results: Path | None = typer.Option(None, "--results", help="Subagent 回传结果路径"),
     vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
+    subagent_model: str | None = typer.Option(None, "--subagent-model", help="覆盖 Subagent 锁模 ID（export 模式）"),
+    prompt_profile: str | None = typer.Option(None, "--prompt-profile", help="加载 Prompt profile（export 模式）"),
+    overwrite_pending: bool = typer.Option(False, "--overwrite-pending", help="允许覆盖挂起未回灌批（export 模式）"),
     mock: bool | None = typer.Option(None, "--mock/--no-mock", help="使用离线 Mock 向量与 LLM"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
@@ -1233,6 +1291,10 @@ def graph_compact(
                     results_path=results,
                     use_mock=use_mock_flag,
                     lock_path=db.parent / ".compile.lock",
+                    config_dir=config_dir,
+                    subagent_model=subagent_model,
+                    prompt_profile=prompt_profile,
+                    overwrite_pending=overwrite_pending,
                 )
             )
         finally:
@@ -1402,9 +1464,11 @@ def export_cmd(
     _run_cli_action("export", json, _work)
 
 
+from shuati.cli.compiler_commands import register_compiler_commands as _register_compiler_commands  # noqa: E402
 from shuati.cli.m3_commands import register_m3_commands as _register_m3_commands  # noqa: E402
 
 _register_m3_commands(app, taxonomy_app, _run_cli_action)
+_register_compiler_commands(app, _run_cli_action)
 
 
 if __name__ == "__main__":

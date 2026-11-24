@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def _resolve_env_vars(text: str) -> str:
@@ -177,6 +178,73 @@ class HumanMirrorConfig(BaseModel):
     backups_keep: int = 10
 
 
+KNOWN_SUBAGENT_MODELS: frozenset[str] = frozenset(
+    {
+        "gemini-4-neon-medium",
+        "gemini-4-neon-high",
+        "gemini-4-neon-low",
+        "gemini-4-neon-xhigh",
+        "gemini-4-carbon-high",
+        "gemini-4-carbon-medium",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-argon-high",
+        "gemini-4-argon-medium",
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "claude-sonnet-5-5-high",
+        "claude-sonnet-5-5-medium",
+        "claude-opus-5-5-high",
+        "claude-opus-5-5-medium",
+        "gpt-oss-120b-medium",
+    }
+)
+
+_SUBAGENT_MODEL_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
+
+
+def validate_subagent_model_id(model_id: str) -> str:
+    """校验 Subagent 模型 ID：拦截常见拼写错误并给出标准候选建议。"""
+    cleaned = (model_id or "").strip()
+    if not cleaned:
+        raise ValueError("Subagent 模型 ID 不能为空")
+    if cleaned in KNOWN_SUBAGENT_MODELS:
+        return cleaned
+    if not _SUBAGENT_MODEL_SLUG_RE.match(cleaned):
+        raise ValueError(
+            f"非法 Subagent 模型 ID 格式: {cleaned!r}（仅允许字母/数字/点/下划线/短横线）"
+        )
+    close_matches = difflib.get_close_matches(
+        cleaned.lower(), sorted(KNOWN_SUBAGENT_MODELS), n=3, cutoff=0.75
+    )
+    if close_matches:
+        raise ValueError(
+            f"无效或疑似拼写错误的 Subagent 模型 ID: {cleaned!r}；"
+            f"您是否想使用: {', '.join(close_matches)}？"
+        )
+    return cleaned
+
+
+class SubagentConfig(BaseModel):
+    default_model: str = "gemini-4-neon-medium"
+    max_parallel_workers: int = Field(default=4, ge=1)
+    stage_models: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("default_model")
+    @classmethod
+    def _validate_default_model(cls, value: str) -> str:
+        return validate_subagent_model_id(value)
+
+    @field_validator("stage_models")
+    @classmethod
+    def _validate_stage_models(cls, value: dict[str, str]) -> dict[str, str]:
+        return {
+            str(k).strip(): validate_subagent_model_id(v)
+            for k, v in value.items()
+            if str(k).strip()
+        }
+
+
 class Settings(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
@@ -185,6 +253,26 @@ class Settings(BaseModel):
     composer: ComposerConfig = Field(default_factory=ComposerConfig)
     topology: TopologyConfig = Field(default_factory=TopologyConfig)
     human_mirror: HumanMirrorConfig = Field(default_factory=HumanMirrorConfig)
+    subagent: SubagentConfig = Field(default_factory=SubagentConfig)
+
+
+def resolve_subagent_model(
+    settings: Settings,
+    stage: str,
+    cli_override: str | None = None,
+) -> str:
+    """按 CLI 覆写 > stage_models[stage] > default_model 优先级解析并校验 Subagent 模型 ID。"""
+    if cli_override is not None and cli_override.strip():
+        return validate_subagent_model_id(cli_override)
+    stage_key = (stage or "").strip()
+    stage_models = settings.subagent.stage_models or {}
+    if stage_key in stage_models and stage_models[stage_key].strip():
+        return validate_subagent_model_id(stage_models[stage_key])
+    lowered = stage_key.lower()
+    for k, v in stage_models.items():
+        if k.strip().lower() == lowered and v.strip():
+            return validate_subagent_model_id(v)
+    return validate_subagent_model_id(settings.subagent.default_model)
 
 
 def load_settings(config_path: Path | str | None = None, env_path: Path | str | None = None) -> Settings:

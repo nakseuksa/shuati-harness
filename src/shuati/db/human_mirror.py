@@ -159,6 +159,81 @@ def _read_jsonl_items(fpath: Path) -> list[dict[str, Any]]:
     return out
 
 
+def _normalize_external_question_item(item: dict[str, Any]) -> dict[str, Any]:
+    """为旧版或手工裁剪的 external_questions.jsonl 记录补齐安全默认值。"""
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    uid = str(item["question_uid"])
+    raw_q = item.get("raw_question")
+    if raw_q is None:
+        raw_q = item.get("m_question_text") or ""
+    raw_q_str = str(raw_q)
+    cas_imgs = item.get("cas_images_json")
+    r_cas = item.get("r_cas_images")
+    if r_cas is None:
+        r_cas = cas_imgs if cas_imgs is not None else "[]"
+    if cas_imgs is None:
+        cas_imgs = r_cas
+
+    r_cap = item.get("r_captions")
+    q_cap = item.get("q_captions")
+    fallback_cap = item.get("image_captions_json")
+    if r_cap is None:
+        r_cap = fallback_cap if fallback_cap is not None else (q_cap if q_cap is not None else "[]")
+    if q_cap is None:
+        q_cap = fallback_cap if fallback_cap is not None else r_cap
+
+    ingested_at = item.get("ingested_at") or now_str
+    updated_at = item.get("updated_at") or ingested_at
+
+    m_q_text = item.get("m_question_text")
+    if m_q_text is None and not item.get("duplicate_of_uid"):
+        m_q_text = raw_q_str
+
+    return {
+        "question_uid": uid,
+        "grade_subject": str(item.get("grade_subject") or "小学奥数"),
+        "source_type": str(item.get("source_type") or "EXTERNAL_MISTAKE"),
+        "source_collection": str(item.get("source_collection") or "external_mistake"),
+        "source_file": item.get("source_file"),
+        "source_id": str(item.get("source_id") or uid.split(":")[-1]),
+        "raw_chapter": item.get("raw_chapter"),
+        "raw_question": raw_q_str,
+        "raw_images_json": str(item.get("raw_images_json") or "[]"),
+        "r_cas_images": str(r_cas),
+        "r_captions": str(r_cap),
+        "legacy_tags_json": str(item.get("legacy_tags_json") or "{}"),
+        "content_hash": str(
+            item.get("content_hash") or hashlib.sha256(raw_q_str.encode("utf-8")).hexdigest()
+        ),
+        "plain_fingerprint": str(item.get("plain_fingerprint") or ""),
+        "duplicate_of_uid": item.get("duplicate_of_uid"),
+        "ingested_at": str(ingested_at),
+        "updated_at": str(updated_at),
+        "m_question_text": m_q_text,
+        "m_options_json": str(item.get("m_options_json") or "{}"),
+        "m_format": str(item.get("m_format") or "解答题"),
+        "m_visual_facts": str(item.get("m_visual_facts") if item.get("m_visual_facts") is not None else ""),
+        "m_verification_status": str(item.get("m_verification_status") or "PENDING"),
+        "m_final_answers_json": str(item.get("m_final_answers_json") or "[]"),
+        "m_abstract_skeleton": str(
+            item.get("m_abstract_skeleton") if item.get("m_abstract_skeleton") is not None else ""
+        ),
+        "m_primary_l1_module": str(
+            item.get("m_primary_l1_module") if item.get("m_primary_l1_module") is not None else ""
+        ),
+        "m_secondary_l1_modules_json": str(item.get("m_secondary_l1_modules_json") or "[]"),
+        "m_c_score": item.get("m_c_score"),
+        "m_s_score": item.get("m_s_score"),
+        "m_t_score": item.get("m_t_score"),
+        "m_l_score": item.get("m_l_score"),
+        "has_images": int(item.get("has_images") or 0),
+        "cas_images_json": str(cas_imgs),
+        "q_captions": str(q_cap),
+        "is_retired": int(item.get("is_retired") or 0),
+        "review_reason": str(item.get("review_reason") if item.get("review_reason") is not None else ""),
+    }
+
+
 def restore_snapshot(
     conn: sqlite3.Connection,
     human_dir: Path | str = "human",
@@ -167,14 +242,14 @@ def restore_snapshot(
     backups_keep: int = 10,
     include_practice_log: bool = True,
     force_wipe_logs: bool = False,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """从 human/*.jsonl 恢复人工资产与外部错题（D-Audit-6：前置外部错题恢复 + 外键预检 + 日志防误删保护）。
 
     使用幂等 UPSERT (INSERT ... ON CONFLICT DO UPDATE SET)
     恢复后对涉及题目调用 effective.recompute。
     """
     h_dir = Path(human_dir)
-    counts: dict[str, int] = {
+    counts: dict[str, Any] = {
         "external_questions": 0,
         "learners": 0,
         "human_overrides": 0,
@@ -189,20 +264,7 @@ def restore_snapshot(
     pl_file = h_dir / "practice_log.jsonl"
     pl_items = _read_jsonl_items(pl_file) if include_practice_log else []
 
-    if dry_run:
-        counts["external_questions"] = len(ext_items)
-        counts["learners"] = len(learner_items)
-        counts["human_overrides"] = len(override_items)
-        counts["relation_overrides"] = len(rel_items)
-        counts["practice_log"] = len(pl_items)
-        return counts
-
-    # 若库内已有数据且提供了 backups_dir，恢复前先备份
-    has_data = conn.execute("SELECT 1 FROM learners LIMIT 1;").fetchone() is not None
-    if has_data and backups_dir:
-        vacuum_backup(conn, backups_dir, "human_restore", keep=backups_keep)
-
-    # 外键完整性前置预检：待恢复外键引用的 question_uid 必须已存在于库中或待恢复的 external_questions.jsonl 中
+    # 外键完整性前置预检（dry_run 与实执行共用）：待恢复外键引用的 question_uid 必须已存在于库中或待恢复的 external_questions.jsonl 中
     ext_uids = {str(it["question_uid"]) for it in ext_items}
     referenced_uids: set[str] = set()
     for it in override_items:
@@ -214,6 +276,7 @@ def restore_snapshot(
         referenced_uids.add(str(it["question_uid"]))
 
     unresolved_candidates = sorted(referenced_uids - ext_uids)
+    missing: list[str] = []
     if unresolved_candidates:
         ph = ",".join("?" for _ in unresolved_candidates)
         found = {
@@ -224,11 +287,27 @@ def restore_snapshot(
             ).fetchall()
         }
         missing = [u for u in unresolved_candidates if u not in found]
-        if missing:
-            raise PreconditionError(
-                f"PRECONDITION_FAILED: human restore 外键预检失败，缺少 {len(missing)} 道题目基础行"
-                f"（请先执行 shuati ingest 或补全 external_questions.jsonl）: {missing[:10]}"
-            )
+
+    if dry_run:
+        counts["external_questions"] = len(ext_items)
+        counts["learners"] = len(learner_items)
+        counts["human_overrides"] = len(override_items)
+        counts["relation_overrides"] = len(rel_items)
+        counts["practice_log"] = len(pl_items)
+        counts["fk_preflight_ok"] = len(missing) == 0
+        counts["missing_question_uids"] = missing
+        return counts
+
+    if missing:
+        raise PreconditionError(
+            f"PRECONDITION_FAILED: human restore 外键预检失败，缺少 {len(missing)} 道题目基础行"
+            f"（请先执行 shuati ingest 或补全 external_questions.jsonl）: {missing[:10]}"
+        )
+
+    # 若库内已有数据且提供了 backups_dir，恢复前先备份
+    has_data = conn.execute("SELECT 1 FROM learners LIMIT 1;").fetchone() is not None
+    if has_data and backups_dir:
+        vacuum_backup(conn, backups_dir, "human_restore", keep=backups_keep)
 
     affected_question_uids: set[str] = set(ext_uids)
     seen_learner_ids: set[str] = set()
@@ -238,7 +317,8 @@ def restore_snapshot(
 
     with conn:
         # 0. 先幂等恢复外部错题基础行（raw_questions + questions 机器列）
-        for item in ext_items:
+        for raw_item in ext_items:
+            item = _normalize_external_question_item(raw_item)
             conn.execute(
                 """
                 INSERT INTO raw_questions(

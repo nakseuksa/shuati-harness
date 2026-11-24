@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -54,6 +55,7 @@ class Stage0IngestReport:
     image_warnings: list[dict[str, Any]] = field(default_factory=list)
     report_json_path: str = ""
     report_md_path: str = ""
+    dry_run: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -216,6 +218,261 @@ def _question_has_refs(conn: sqlite3.Connection, question_uid: str) -> bool:
     return row is not None
 
 
+def _compute_cas_filename_readonly(src_path: Path) -> str:
+    h16 = hashlib.sha256(src_path.read_bytes()).hexdigest()[:16]
+    suffix = src_path.suffix.lower() or ".jpg"
+    return f"{h16}{suffix}"
+
+
+def _run_stage0_dry_run(
+    *,
+    db_p: Path,
+    assets_path: Path,
+    mapped_files: list[tuple[Path, str, str]],
+    dedup_near: bool,
+    apply_retire: bool,
+    report: Stage0IngestReport,
+) -> Stage0IngestReport:
+    """只读预览 Stage 0 入库变更：零写库、不持写锁、不拷贝 CAS 图片、不写磁盘报告。"""
+    conn: sqlite3.Connection | None = None
+    has_tables = False
+    if db_p.exists():
+        conn = get_connection(db_p, readonly=True)
+        has_tables = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='grade_subjects'"
+            ).fetchone()
+            is not None
+        )
+
+    try:
+        slug_map: dict[str, str] = {}
+        for _, _, gs in mapped_files:
+            if gs in slug_map:
+                continue
+            if conn is not None and has_tables:
+                row = conn.execute(
+                    "SELECT slug FROM grade_subjects WHERE grade_subject = ?", (gs,)
+                ).fetchone()
+                if not row:
+                    raise PreconditionError(
+                        f"学段学科 '{gs}' 未在数据库中注册，请先使用 'shuati grade-subject add' 注册"
+                    )
+                slug_map[gs] = str(row["slug"])
+            else:
+                slug_map[gs] = "primary_olympiad" if gs == "小学奥数" else re.sub(r"[^A-Za-z0-9_]+", "_", gs).strip("_") or "default"
+
+        existing_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        db_by_hash: dict[tuple[str, str], str] = {}
+        db_by_plain: dict[tuple[str, str], list[tuple[str, list[str]]]] = {}
+        existing_in_col: dict[tuple[str, str], set[str]] = {}
+
+        if conn is not None and has_tables:
+            for r in conn.execute(
+                """
+                SELECT question_uid, grade_subject, source_collection, source_id,
+                       content_hash, plain_fingerprint, cas_images_json,
+                       duplicate_of_uid, is_missing_from_source
+                FROM raw_questions
+                """
+            ).fetchall():
+                gs = str(r["grade_subject"])
+                col = str(r["source_collection"])
+                sid = str(r["source_id"])
+                uid = str(r["question_uid"])
+                chash = str(r["content_hash"])
+                pfp = str(r["plain_fingerprint"] or "")
+                cas = list(json.loads(r["cas_images_json"] or "[]"))
+                existing_by_key[(gs, col, sid)] = {
+                    "question_uid": uid,
+                    "content_hash": chash,
+                    "duplicate_of_uid": r["duplicate_of_uid"],
+                }
+                existing_in_col.setdefault((gs, col), set()).add(uid)
+                if r["is_missing_from_source"] == 0:
+                    master = str(r["duplicate_of_uid"] or uid)
+                    db_by_hash.setdefault((gs, chash), master)
+                    if r["duplicate_of_uid"] is None:
+                        db_by_plain.setdefault((gs, pfp), []).append((uid, cas))
+
+        batch_by_hash: dict[tuple[str, str], str] = {}
+        batch_by_plain: dict[tuple[str, str], list[tuple[str, list[int]]]] = {}
+        present_uids_by_col: dict[tuple[str, str], set[str]] = {}
+
+        for pf, source_collection, grade_subject in mapped_files:
+            slug = slug_map[grade_subject]
+            col_key = (grade_subject, source_collection)
+            present_uids_by_col.setdefault(col_key, set())
+
+            with open(pf, encoding="utf-8") as f:
+                for line_num, line in enumerate(f, start=1):
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    try:
+                        item = json.loads(line_str)
+                    except Exception as e:
+                        report.rejected_questions.append(
+                            {"file": str(pf), "line": str(line_num), "error": f"JSON_PARSE_ERROR: {e}"}
+                        )
+                        continue
+                    if not isinstance(item, dict):
+                        report.rejected_questions.append(
+                            {
+                                "file": str(pf),
+                                "line": str(line_num),
+                                "error": f"MALFORMED_ROW: 行内容不是 JSON 对象 (dict), 而是 {type(item).__name__}",
+                            }
+                        )
+                        continue
+                    source_id_raw = item.get("id")
+                    if source_id_raw is None or not str(source_id_raw).strip():
+                        report.rejected_questions.append(
+                            {"file": str(pf), "line": str(line_num), "error": "MISSING_ID: 题目缺少有效 id 字段"}
+                        )
+                        continue
+                    source_id = str(source_id_raw).strip()
+                    question_uid = f"{slug}:{source_collection}:{source_id}"
+                    present_uids_by_col[col_key].add(question_uid)
+
+                    raw_question_raw = item.get("question")
+                    if not isinstance(raw_question_raw, str) or not raw_question_raw.strip():
+                        report.rejected_questions.append(
+                            {
+                                "file": str(pf),
+                                "line": str(line_num),
+                                "question_id": source_id,
+                                "error": "INVALID_QUESTION: 题干 question 缺失、为 null 或非字符串",
+                            }
+                        )
+                        continue
+                    raw_images_raw = item.get("images", [])
+                    if not isinstance(raw_images_raw, list) or not all(
+                        isinstance(img, str) for img in raw_images_raw
+                    ):
+                        report.rejected_questions.append(
+                            {
+                                "file": str(pf),
+                                "line": str(line_num),
+                                "question_id": source_id,
+                                "error": "INVALID_IMAGES: images 字段必须为字符串列表",
+                            }
+                        )
+                        continue
+
+                    report.total_scanned += 1
+                    cas_images: list[str] = []
+                    dhashes: list[int] = []
+                    image_corrupted = False
+                    for img_rel in raw_images_raw:
+                        img_src = pf.parent / img_rel
+                        val_res = validate_image(img_src)
+                        if not val_res.is_valid:
+                            image_corrupted = True
+                            report.rejected_questions.append(
+                                {"question_uid": question_uid, "image": str(img_src), "error": val_res.error}
+                            )
+                            break
+                        for w in val_res.warnings:
+                            report.image_warnings.append({"question_uid": question_uid, "warning": w})
+                        cas_images.append(_compute_cas_filename_readonly(img_src))
+                        try:
+                            dhashes.append(compute_dhash(img_src))
+                        except Exception:
+                            pass
+
+                    if image_corrupted:
+                        continue
+
+                    norm_res = normalize_text(raw_question_raw, num_images=len(cas_images))
+                    m_question_text = norm_res.normalized_text
+                    image_captions = norm_res.image_captions
+                    content_hash = compute_content_hash(m_question_text, cas_images, image_captions)
+                    plain_fingerprint = compute_plain_fingerprint(m_question_text, len(cas_images))
+
+                    existing = existing_by_key.get((grade_subject, source_collection, source_id))
+                    if existing is not None:
+                        if existing["content_hash"] == content_hash:
+                            report.skipped_unchanged.append(existing["question_uid"])
+                        else:
+                            report.updated_source_changed.append(existing["question_uid"])
+                        continue
+
+                    dup_master = db_by_hash.get((grade_subject, content_hash)) or batch_by_hash.get(
+                        (grade_subject, content_hash)
+                    )
+                    if dup_master:
+                        report.exact_duplicates.append(
+                            {"question_uid": question_uid, "duplicate_of_uid": dup_master}
+                        )
+                        report.newly_ingested.append(question_uid)
+                        continue
+
+                    near_dup_target: str | None = None
+                    for cand_uid, cand_cas in db_by_plain.get((grade_subject, plain_fingerprint), []):
+                        if len(cas_images) == 0 and len(cand_cas) == 0:
+                            near_dup_target = cand_uid
+                            report.near_duplicate_candidates.append(
+                                {"question_uid": question_uid, "candidate_uid": cand_uid, "distance": 0}
+                            )
+                            break
+                        if len(cas_images) > 0 and len(cas_images) == len(cand_cas):
+                            cand_dhashes: list[int] = []
+                            for ci in cand_cas:
+                                try:
+                                    cand_dhashes.append(compute_dhash(assets_path / ci))
+                                except Exception:
+                                    pass
+                            if len(cand_dhashes) == len(dhashes) and dhashes:
+                                max_d = max(hamming_distance(d1, d2) for d1, d2 in zip(dhashes, cand_dhashes))
+                                if max_d <= 4:
+                                    near_dup_target = cand_uid
+                                    report.near_duplicate_candidates.append(
+                                        {"question_uid": question_uid, "candidate_uid": cand_uid, "distance": max_d}
+                                    )
+                                    break
+
+                    if near_dup_target is None:
+                        for cand_uid, cand_dhashes in batch_by_plain.get((grade_subject, plain_fingerprint), []):
+                            if len(dhashes) == 0 and len(cand_dhashes) == 0:
+                                near_dup_target = cand_uid
+                                report.near_duplicate_candidates.append(
+                                    {"question_uid": question_uid, "candidate_uid": cand_uid, "distance": 0}
+                                )
+                                break
+                            if len(dhashes) > 0 and len(dhashes) == len(cand_dhashes):
+                                max_d = max(hamming_distance(d1, d2) for d1, d2 in zip(dhashes, cand_dhashes))
+                                if max_d <= 4:
+                                    near_dup_target = cand_uid
+                                    report.near_duplicate_candidates.append(
+                                        {"question_uid": question_uid, "candidate_uid": cand_uid, "distance": max_d}
+                                    )
+                                    break
+
+                    if near_dup_target and dedup_near:
+                        report.merged_near_duplicates.append(
+                            {"question_uid": question_uid, "duplicate_of_uid": near_dup_target}
+                        )
+                        report.newly_ingested.append(question_uid)
+                        continue
+
+                    batch_by_hash[(grade_subject, content_hash)] = question_uid
+                    batch_by_plain.setdefault((grade_subject, plain_fingerprint), []).append((question_uid, dhashes))
+                    report.newly_ingested.append(question_uid)
+
+        for col_key, present_uids in present_uids_by_col.items():
+            for existing_uid in sorted(existing_in_col.get(col_key, set())):
+                if existing_uid not in present_uids:
+                    report.missing_from_source.append(existing_uid)
+                    if apply_retire:
+                        report.retired_questions.append(existing_uid)
+
+        return report
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def run_stage0_ingest(
     db_path: Path | str = "data/shuati.db",
     root_dir: Path | str = "题库",
@@ -226,6 +483,7 @@ def run_stage0_ingest(
     dedup_near: bool = False,
     apply_retire: bool = False,
     lock_path: Path | str | None = None,
+    dry_run: bool = False,
 ) -> Stage0IngestReport:
     """执行 Stage 0 数据入库、校验与体检。
 
@@ -259,8 +517,9 @@ def run_stage0_ingest(
     else:
         reports_path = Path(reports_dir)
 
-    reports_path.mkdir(parents=True, exist_ok=True)
-    assets_path.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        reports_path.mkdir(parents=True, exist_ok=True)
+        assets_path.mkdir(parents=True, exist_ok=True)
 
     # 生成高精度且带随机因子的唯一 scan_id 与时间戳（防冻结时钟碰撞）
     now_ns = time.time_ns()
@@ -271,7 +530,7 @@ def run_stage0_ingest(
         base_ts = "20260101_000000"
     scan_ts = f"{base_ts}_{now_ns % 1_000_000:06d}_{rand_suffix}"
     scan_id = f"scan_{scan_ts}"
-    report = Stage0IngestReport(scan_id=scan_id, timestamp=scan_ts)
+    report = Stage0IngestReport(scan_id=scan_id, timestamp=scan_ts, dry_run=dry_run)
 
     # 1. 递归发现 problems.jsonl
     if root_path.is_file():
@@ -340,6 +599,16 @@ def run_stage0_ingest(
                 report.unmapped_collections.append(sc)
             continue
         mapped_files.append((pf, sc, gs_match))
+
+    if dry_run:
+        return _run_stage0_dry_run(
+            db_p=db_p,
+            assets_path=assets_path,
+            mapped_files=mapped_files,
+            dedup_near=dedup_near,
+            apply_retire=apply_retire,
+            report=report,
+        )
 
     # 3. 校验学段注册与获取连接
     actual_lock_path = Path(lock_path) if lock_path else db_p.parent / ".compile.lock"

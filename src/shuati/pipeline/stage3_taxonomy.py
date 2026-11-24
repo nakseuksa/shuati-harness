@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import sqlite3
 import time
 from collections import Counter
@@ -13,9 +14,10 @@ from typing import Any, Literal
 
 import numpy as np
 
-from shuati.config import Settings
+from shuati.config import Settings, resolve_subagent_model
 from shuati.core import effective, refresh
 from shuati.core.knowledge_graph import (
+    apply_cluster_assignments,
     apply_merge_pairs,
     check_dag_and_break_cycles,
     recall_concept_merge_candidates,
@@ -42,14 +44,17 @@ from shuati.llm.prompt_builder import (
     build_merge_judge_messages,
     build_prerequisite_dag_messages,
     build_stage3c_mapping_messages,
+    build_stage3d_cluster_assign_messages,
     build_taxonomy_propose_messages,
 )
+from shuati.llm.seam_loader import load_prompt_seams
 from shuati.models.schemas import (
     MergeJudgeBatchOutput,
     MergeJudgeItem,
     PrerequisiteDagOutput,
     Stage3cBatchMappingOutput,
     Stage3cQuestionMapping,
+    Stage3dClusterAssignOutput,
     TaxonomyProposeOutput,
 )
 from shuati.pipeline.subagent_bridge import export_task_batches, load_and_validate_results
@@ -115,6 +120,20 @@ def _next_draft_version(current_version: str) -> str:
     return "draft-1"
 
 
+def _resolve_seam_meta(
+    config_dir: Path | str,
+    grade_subject: str,
+    version_key: str,
+    default_version: str,
+    prompt_profile: str | None = None,
+) -> tuple[str, str]:
+    cfg = Path(config_dir)
+    if not (cfg / "prompts" / "default.yaml").is_file() and prompt_profile is None:
+        return default_version, ""
+    bundle = load_prompt_seams(config_dir=cfg, grade_subject=grade_subject, profile=prompt_profile)
+    return bundle.prompt_versions.get(version_key, default_version), bundle.prompt_digest
+
+
 async def propose_taxonomy_async(
     conn: sqlite3.Connection,
     settings: Settings,
@@ -126,6 +145,9 @@ async def propose_taxonomy_async(
     config_dir: Path | str = Path("config"),
     use_mock: bool = False,
     n_clusters: int | None = None,
+    subagent_model: str | None = None,
+    prompt_profile: str | None = None,
+    overwrite_pending: bool = False,
 ) -> dict[str, Any]:
     """Stage 3a：对全量 S2='OK' 有效题的 (raw_l1, raw_l2) Embedding 聚类并涌现标准词表草案。"""
     gs_row = conn.execute(
@@ -148,6 +170,7 @@ async def propose_taxonomy_async(
         JOIN compile_state cs ON cs.question_uid = q.question_uid AND cs.stage = 'S2'
         WHERE q.grade_subject = ?
           AND q.is_retired = 0
+          AND q.eff_is_servable = 1
           AND cs.status = 'OK'
           AND (s.raw_l1 != '' OR s.raw_l2 != '')
         GROUP BY s.raw_l1, s.raw_l2
@@ -221,9 +244,15 @@ async def propose_taxonomy_async(
             grade_subject=grade_subject,
             clusters_summary=clusters_summary,
             top_pairs=top_pairs,
+            config_dir=Path(config_dir),
+            prompt_profile=prompt_profile,
         )
 
         if mode == "export":
+            resolved_model = resolve_subagent_model(settings, "propose", subagent_model)
+            p_ver, p_digest = _resolve_seam_meta(
+                config_dir, grade_subject, "stage3a", "s3a_v1", prompt_profile
+            )
             manifest = export_task_batches(
                 "propose",
                 [
@@ -236,6 +265,12 @@ async def propose_taxonomy_async(
                 {"grade_subject": grade_subject, "draft_version": draft_ver, "distinct_pairs": n_pairs},
                 tasks_dir,
                 schema_cls=TaxonomyProposeOutput,
+                subagent_model=resolved_model,
+                prompt_version=p_ver,
+                prompt_digest=p_digest,
+                prompt_profile=prompt_profile,
+                max_parallel_workers=settings.subagent.max_parallel_workers,
+                overwrite_pending=overwrite_pending,
             )
             return {
                 "mode": "export",
@@ -494,6 +529,10 @@ async def run_stage3c_async(
     tasks_dir: Path | str = Path("data/unified/stage3_4/3c"),
     results_path: Path | str | None = None,
     lock_path: Path | str = Path("data/.compile.lock"),
+    config_dir: Path | str = Path("config"),
+    subagent_model: str | None = None,
+    prompt_profile: str | None = None,
+    overwrite_pending: bool = False,
 ) -> dict[str, Any]:
     """Stage 3c：零成本精确/别名命中 + 脱敏逐题上下文批映射。"""
     slug, tax_ver, spec, lookup = _load_active_taxonomy(conn, grade_subject)
@@ -686,6 +725,8 @@ async def run_stage3c_async(
                     grade_subject=grade_subject,
                     taxonomy_enum_text=taxonomy_enum,
                     question_items=prompt_items,
+                    config_dir=Path(config_dir),
+                    prompt_profile=prompt_profile,
                 )
                 batches.append(
                     {
@@ -694,8 +735,22 @@ async def run_stage3c_async(
                         "task_item_ids": item_ids,
                     }
                 )
+            resolved_model = resolve_subagent_model(settings, "3c", subagent_model)
+            p_ver, p_digest = _resolve_seam_meta(
+                config_dir, grade_subject, "stage3c", STAGE3C_PROMPT_VERSION, prompt_profile
+            )
             manifest = export_task_batches(
-                "3c", batches, task_map, tasks_dir, schema_cls=Stage3cBatchMappingOutput
+                "3c",
+                batches,
+                task_map,
+                tasks_dir,
+                schema_cls=Stage3cBatchMappingOutput,
+                subagent_model=resolved_model,
+                prompt_version=p_ver,
+                prompt_digest=p_digest,
+                prompt_profile=prompt_profile,
+                max_parallel_workers=settings.subagent.max_parallel_workers,
+                overwrite_pending=overwrite_pending,
             )
             return {
                 "mode": "export",
@@ -1086,65 +1141,369 @@ def run_stage3d_mount(
     }
 
 
-async def run_compaction_async(
+def _partition_domain_items(
+    items: list[dict[str, Any]],
+    vec_map: dict[str, np.ndarray],
+    *,
+    max_items: int = 80,
+) -> list[list[dict[str, Any]]]:
+    """当域内去重项超过 max_items 时，用频次加权球面 K-Means 预聚为 <= max_items 的语义子簇。"""
+    if len(items) <= max_items:
+        return [items]
+
+    # 递归/逐级切分确保每个子簇 <= max_items
+    has_all_vecs = all(str(it["id"]) in vec_map for it in items)
+    if not has_all_vecs:
+        return [items[i : i + max_items] for i in range(0, len(items), max_items)]
+
+    k = max(2, math.ceil(len(items) / max_items))
+    vecs = np.stack([vec_map[str(it["id"])] for it in items], axis=0).astype(np.float32)
+    weights = np.asarray([float(max(1, int(it.get("freq", 1)))) for it in items], dtype=np.float32)
+    labels = _weighted_spherical_kmeans(vecs, weights, k)
+
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for it, cid in zip(items, labels.tolist(), strict=True):
+        buckets.setdefault(int(cid), []).append(it)
+
+    sub_clusters: list[list[dict[str, Any]]] = []
+    for cid in sorted(buckets.keys()):
+        grp = buckets[cid]
+        if len(grp) <= max_items:
+            sub_clusters.append(grp)
+        elif len(grp) < len(items):
+            sub_clusters.extend(_partition_domain_items(grp, vec_map, max_items=max_items))
+        else:
+            # 极端向量退化全聚一簇时兜底均匀切片
+            sub_clusters.extend(grp[i : i + max_items] for i in range(0, len(grp), max_items))
+
+    # 避免产生单条孤立子簇：若存在 len == 1 的子簇，尝试并入未满 max_items 的相邻子簇
+    merged: list[list[dict[str, Any]]] = []
+    singles: list[dict[str, Any]] = []
+    for sc in sub_clusters:
+        if len(sc) == 1:
+            singles.extend(sc)
+        else:
+            merged.append(sc)
+    for it in singles:
+        placed = False
+        for sc in merged:
+            if len(sc) < max_items:
+                sc.append(it)
+                placed = True
+                break
+        if not placed:
+            merged.append([it])
+    return merged
+
+
+async def _run_compaction_cluster_async(
     conn: sqlite3.Connection,
     settings: Settings,
     vector_store: VectorStore,
     *,
     grade_subject: str,
-    target: Literal["all", "l3", "concepts"] = "all",
-    mode: Literal["api", "export", "import"] = "api",
-    batch_size: int = 40,
-    tasks_dir: Path | str = Path("data/unified/stage3_4/compact"),
-    results_path: Path | str | None = None,
-    use_mock: bool = False,
-    lock_path: Path | str = Path("data/.compile.lock"),
+    slug: str,
+    tax_ver: str,
+    target: Literal["all", "l3", "concepts"],
+    mode: Literal["api", "export", "import"],
+    tasks_dir: Path | str,
+    results_path: Path | str | None,
+    lock_path: Path | str,
+    config_dir: Path | str,
+    subagent_model: str | None,
+    prompt_profile: str | None,
+    overwrite_pending: bool,
+    max_cluster_items: int,
 ) -> dict[str, Any]:
-    """Stage 3d 同域无预筛全量召回并查集归并（L3 节点 + METHOD/MOTIF 全局概念）。"""
-    slug, tax_ver, _, _ = _load_active_taxonomy(conn, grade_subject)
-    embed_client = EmbeddingClient(settings, conn=conn, use_mock=use_mock)
+    """Stage 3d 新范式（D-Audit-2）：同 L2 域 & 全局概念 Cluster-then-Assign 标准算子归纳。"""
+    domain_groups: list[tuple[str, dict[str, Any], str, str, list[dict[str, Any]], dict[str, np.ndarray]]] = []
 
-    try:
-        # 1. 增量同步待归并实体的向量库
-        if target in ("all", "l3"):
-            l3_rows = conn.execute(
-                """
-                SELECT node_id, l1_module, l2_entity, l3_operator
-                FROM knowledge_nodes
-                WHERE grade_subject = ? AND taxonomy_version = ? AND node_level = 'L3' AND redirect_to_id IS NULL
-                ORDER BY node_id;
-                """,
-                (grade_subject, tax_ver),
-            ).fetchall()
-            await vector_store.sync_vectors(
-                "l3_nodes",
-                [(str(r["node_id"]), f"{r['l1_module']}/{r['l2_entity']}/{r['l3_operator']}") for r in l3_rows],
-                embed_client,
-                scope_slug=slug,
-                stage="STAGE3D_EMBED_L3",
+    if target in ("all", "l3"):
+        l3_rows = conn.execute(
+            """
+            SELECT kn.node_id, kn.l1_module, kn.l2_entity, kn.l3_operator,
+                   COUNT(CASE WHEN q.is_retired = 0 AND q.eff_is_excluded = 0 THEN s.step_id END) AS freq
+            FROM knowledge_nodes kn
+            LEFT JOIN question_steps s ON s.m_knowledge_node_id = kn.node_id
+            LEFT JOIN questions q ON q.question_uid = s.question_uid
+            WHERE kn.grade_subject = ?
+              AND kn.taxonomy_version = ?
+              AND kn.node_level = 'L3'
+              AND kn.redirect_to_id IS NULL
+            GROUP BY kn.node_id
+            ORDER BY kn.l1_module, kn.l2_entity, freq DESC, kn.node_id;
+            """,
+            (grade_subject, tax_ver),
+        ).fetchall()
+        l3_ids, l3_vecs = vector_store.load_vectors("l3_nodes", scope_slug=slug)
+        l3_vec_map = {l3_ids[i]: l3_vecs[i] for i in range(len(l3_ids))} if len(l3_ids) == len(l3_vecs) else {}
+
+        by_l2: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for r in l3_rows:
+            key = (str(r["l1_module"]), str(r["l2_entity"]))
+            by_l2.setdefault(key, []).append(
+                {
+                    "id": str(r["node_id"]),
+                    "name": str(r["l3_operator"]),
+                    "freq": max(1, int(r["freq"])),
+                }
+            )
+        for (l1m, l2e), items in sorted(by_l2.items()):
+            if len(items) < 2:
+                continue
+            domain_groups.append(
+                (
+                    "KNOWLEDGE_NODE",
+                    {
+                        "grade_subject": grade_subject,
+                        "taxonomy_version": tax_ver,
+                        "l1_module": l1m,
+                        "l2_entity": l2e,
+                    },
+                    l1m,
+                    l2e,
+                    items,
+                    l3_vec_map,
+                )
             )
 
-        if target in ("all", "concepts"):
-            for kind_name, ns in (("METHOD", "concepts_method"), ("MOTIF", "concepts_motif")):
-                c_rows = conn.execute(
-                    """
-                    SELECT concept_id, name
-                    FROM concepts
-                    WHERE kind = ? AND is_seed = 0 AND redirect_to_id IS NULL
-                    ORDER BY concept_id;
-                    """,
-                    (kind_name,),
-                ).fetchall()
-                await vector_store.sync_vectors(
-                    ns,  # type: ignore[arg-type]
-                    [(str(r["concept_id"]), str(r["name"])) for r in c_rows],
-                    embed_client,
-                    stage=f"STAGE3D_EMBED_{kind_name}",
-                )
-    finally:
-        await embed_client.aclose()
+    if target in ("all", "concepts"):
+        for ckind, ns in (("METHOD", "concepts_method"), ("MOTIF", "concepts_motif")):
+            c_rows = conn.execute(
+                """
+                SELECT c.concept_id, c.name,
+                       COUNT(CASE WHEN q.is_retired = 0 AND q.eff_is_excluded = 0 THEN qc.question_uid END) AS freq
+                FROM concepts c
+                LEFT JOIN question_concepts qc ON qc.concept_id = c.concept_id
+                LEFT JOIN questions q ON q.question_uid = qc.question_uid
+                WHERE c.kind = ? AND c.is_seed = 0 AND c.redirect_to_id IS NULL
+                GROUP BY c.concept_id
+                ORDER BY freq DESC, c.concept_id;
+                """,
+                (ckind,),
+            ).fetchall()
+            items = [
+                {"id": str(r["concept_id"]), "name": str(r["name"]), "freq": max(1, int(r["freq"]))}
+                for r in c_rows
+            ]
+            if len(items) < 2:
+                continue
+            c_ids, c_vecs = vector_store.load_vectors(ns)  # type: ignore[arg-type]
+            c_vec_map = {c_ids[i]: c_vecs[i] for i in range(len(c_ids))} if len(c_ids) == len(c_vecs) else {}
+            domain_groups.append(
+                ("CONCEPT", {"kind": ckind}, "全局概念", ckind, items, c_vec_map)
+            )
 
-    # 2. 按作用域分组构造全量无预筛候选对
+    all_batches: list[dict[str, Any]] = []
+    task_map: dict[str, Any] = {
+        "strategy": "cluster",
+        "grade_subject": grade_subject,
+        "taxonomy_version": tax_ver,
+        "batches": {},
+    }
+    batch_counter = 0
+    total_items = 0
+    max_per = max(2, int(max_cluster_items))
+
+    for t_kind, scope_dict, l1_label, l2_label, items, vec_map in domain_groups:
+        sub_clusters = _partition_domain_items(items, vec_map, max_items=max_per)
+        for chunk in sub_clusters:
+            if not chunk:
+                continue
+            batch_counter += 1
+            total_items += len(chunk)
+            bid = f"compact_batch_{batch_counter:04d}"
+            raw_l3_items = [{"raw_l3": it["name"], "freq": it["freq"]} for it in chunk]
+            task_item_ids = [str(it["name"]) for it in chunk]
+            lo_cnt = min(5, max(1, len(chunk)))
+            hi_cnt = min(15, max(lo_cnt, len(chunk)))
+            msgs = build_stage3d_cluster_assign_messages(
+                grade_subject=grade_subject,
+                l1_module=l1_label,
+                l2_entity=l2_label,
+                raw_l3_items=raw_l3_items,
+                taxonomy_version=tax_ver,
+                target_canonical_range=(lo_cnt, hi_cnt),
+                config_dir=Path(config_dir),
+                prompt_profile=prompt_profile,
+            )
+            item_id_map = {str(it["name"]): str(it["id"]) for it in chunk}
+            task_map["batches"][bid] = {
+                "target_kind": t_kind,
+                "scope_dict": scope_dict,
+                "items": item_id_map,
+            }
+            all_batches.append(
+                {
+                    "batch_id": bid,
+                    "target_kind": t_kind,
+                    "scope_dict": scope_dict,
+                    "item_id_map": item_id_map,
+                    "messages": msgs,
+                    "task_item_ids": task_item_ids,
+                }
+            )
+
+    if mode == "export":
+        resolved_model = resolve_subagent_model(settings, "3d", subagent_model)
+        p_ver, p_digest = _resolve_seam_meta(
+            config_dir, grade_subject, "stage3d", "s3d_cluster_v1", prompt_profile
+        )
+        manifest = export_task_batches(
+            "compact",
+            all_batches,
+            task_map,
+            tasks_dir,
+            schema_cls=Stage3dClusterAssignOutput,
+            subagent_model=resolved_model,
+            prompt_version=p_ver,
+            prompt_digest=p_digest,
+            prompt_profile=prompt_profile,
+            max_parallel_workers=settings.subagent.max_parallel_workers,
+            overwrite_pending=overwrite_pending,
+        )
+        return {
+            "mode": "export",
+            "strategy": "cluster",
+            "grade_subject": grade_subject,
+            "candidate_items": total_items,
+            "candidate_pairs": total_items,
+            "batch_count": len(all_batches),
+            "manifest": manifest,
+        }
+
+    batch_outputs: list[tuple[str, dict[str, Any], dict[str, str], Stage3dClusterAssignOutput]] = []
+    errs: list[dict[str, Any]] = []
+    if mode == "import":
+        if results_path is None:
+            raise PreconditionError("PRECONDITION_FAILED: --mode import 必须提供 --results")
+        task_map_file = Path(tasks_dir) / "compact_task_map.json"
+        valid_by_batch, loaded_map, errs = load_and_validate_results(
+            "compact", results_path, task_map_file, Stage3dClusterAssignOutput
+        )
+        batches_meta = loaded_map.get("batches", {})
+        for bid, out_model in valid_by_batch.items():
+            bmeta = batches_meta.get(bid)
+            if bmeta is None and bid == "compact_single" and len(batches_meta) == 1:
+                bmeta = next(iter(batches_meta.values()))
+            if not bmeta:
+                continue
+            batch_outputs.append(
+                (
+                    str(bmeta["target_kind"]),
+                    dict(bmeta["scope_dict"]),
+                    {str(k): str(v) for k, v in (bmeta.get("items") or {}).items()},
+                    out_model,
+                )
+            )
+    else:
+        if all_batches:
+            gateway = LLMGateway(settings, conn=conn)
+
+            async def _cluster_one(b: dict[str, Any]) -> Stage3dClusterAssignOutput:
+                res = await gateway.call_structured(
+                    slot="judge_llm",
+                    stage="STAGE3D_COMPACT",
+                    messages=b["messages"],
+                    schema=Stage3dClusterAssignOutput,
+                    prompt_version="s3d_cluster_v1",
+                )
+                return res.parsed
+
+            try:
+                cluster_outs = await asyncio.gather(*(_cluster_one(b) for b in all_batches))
+            finally:
+                await gateway.aclose()
+
+            for b, out_model in zip(all_batches, cluster_outs, strict=True):
+                batch_outputs.append(
+                    (
+                        str(b["target_kind"]),
+                        dict(b["scope_dict"]),
+                        dict(b["item_id_map"]),
+                        out_model,
+                    )
+                )
+
+    batch_id = f"compact_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}"
+    total_applied = 0
+    total_skipped = 0
+    total_created = 0
+    total_assignments = 0
+
+    with CompileLock(lock_path):
+        for tk, sc_dict, id_map, out_model in batch_outputs:
+            if not out_model.assignments:
+                continue
+            resolved_assignments: list[dict[str, Any]] = []
+            valid_ids = set(id_map.values())
+            for a in out_model.assignments:
+                explicit_id = a.item_id.strip()
+                mapped_id = (
+                    explicit_id
+                    if explicit_id in valid_ids
+                    else id_map.get(a.raw_l3.strip(), id_map.get(a.raw_l3, ""))
+                )
+                resolved_assignments.append(
+                    {
+                        "item_id": mapped_id,
+                        "raw_l3": a.raw_l3,
+                        "canonical_name": a.canonical_name,
+                        "reason": a.reason,
+                    }
+                )
+            total_assignments += len(resolved_assignments)
+            stat = apply_cluster_assignments(
+                conn,
+                target_kind=tk,  # type: ignore[arg-type]
+                scope_dict=sc_dict,
+                canonical_operators=out_model.canonical_operators,
+                assignments=resolved_assignments,
+                batch_id=batch_id,
+                slug=slug,
+                grade_subject=grade_subject,
+                taxonomy_version=tax_ver,
+            )
+            total_applied += int(stat["applied"])
+            total_skipped += int(stat["skipped"])
+            total_created += int(stat["canonical_nodes_created"])
+
+    return {
+        "mode": mode,
+        "strategy": "cluster",
+        "grade_subject": grade_subject,
+        "batch_id": batch_id if total_applied > 0 else "",
+        "candidate_items": total_items,
+        "candidate_pairs": total_items,
+        "batch_count": len(all_batches),
+        "accepted_merges": total_assignments,
+        "applied_merges": total_applied,
+        "skipped_merges": total_skipped,
+        "canonical_nodes_created": total_created,
+        "batch_errors": len(errs),
+    }
+
+
+async def _run_compaction_pairwise_async(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    vector_store: VectorStore,
+    *,
+    grade_subject: str,
+    slug: str,
+    tax_ver: str,
+    target: Literal["all", "l3", "concepts"],
+    mode: Literal["api", "export", "import"],
+    batch_size: int,
+    tasks_dir: Path | str,
+    results_path: Path | str | None,
+    lock_path: Path | str,
+    config_dir: Path | str,
+    subagent_model: str | None,
+    prompt_profile: str | None,
+    overwrite_pending: bool,
+) -> dict[str, Any]:
+    """兼容旧版两两同义裁判归并模式（strategy='pairwise'）。"""
     grouped_candidates: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]] = []
     if target in ("all", "l3"):
         l3_cands = recall_l3_merge_candidates(
@@ -1207,7 +1566,12 @@ async def run_compaction_async(
                     "name_b": p["name_b"],
                 }
             msgs = build_merge_judge_messages(
-                target_kind=t_kind, scope_desc=scope_desc, candidate_pairs=p_msgs_in
+                target_kind=t_kind,
+                scope_desc=scope_desc,
+                candidate_pairs=p_msgs_in,
+                grade_subject=grade_subject,
+                config_dir=Path(config_dir),
+                prompt_profile=prompt_profile,
             )
             all_batches.append(
                 {
@@ -1220,11 +1584,26 @@ async def run_compaction_async(
             )
 
     if mode == "export":
+        resolved_model = resolve_subagent_model(settings, "3d", subagent_model)
+        p_ver, p_digest = _resolve_seam_meta(
+            config_dir, grade_subject, "stage3d", "s3d_compact_v1", prompt_profile
+        )
         manifest = export_task_batches(
-            "compact", all_batches, task_map, tasks_dir, schema_cls=MergeJudgeBatchOutput
+            "compact",
+            all_batches,
+            task_map,
+            tasks_dir,
+            schema_cls=MergeJudgeBatchOutput,
+            subagent_model=resolved_model,
+            prompt_version=p_ver,
+            prompt_digest=p_digest,
+            prompt_profile=prompt_profile,
+            max_parallel_workers=settings.subagent.max_parallel_workers,
+            overwrite_pending=overwrite_pending,
         )
         return {
             "mode": "export",
+            "strategy": "pairwise",
             "grade_subject": grade_subject,
             "candidate_pairs": total_pairs,
             "batch_count": len(all_batches),
@@ -1305,6 +1684,7 @@ async def run_compaction_async(
             {
                 "from_id": from_id,
                 "to_id": to_id,
+                "canonical_name": dec.canonical_name,
                 "evidence": f"{dec.canonical_name}: {dec.reason}".strip(": "),
             }
         )
@@ -1326,6 +1706,7 @@ async def run_compaction_async(
 
     return {
         "mode": mode,
+        "strategy": "pairwise",
         "grade_subject": grade_subject,
         "batch_id": batch_id if total_applied > 0 else "",
         "candidate_pairs": total_pairs,
@@ -1334,6 +1715,110 @@ async def run_compaction_async(
         "skipped_merges": total_skipped,
         "batch_errors": len(errs),
     }
+
+
+async def run_compaction_async(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    vector_store: VectorStore,
+    *,
+    grade_subject: str,
+    target: Literal["all", "l3", "concepts"] = "all",
+    mode: Literal["api", "export", "import"] = "api",
+    batch_size: int = 40,
+    tasks_dir: Path | str = Path("data/unified/stage3_4/compact"),
+    results_path: Path | str | None = None,
+    use_mock: bool = False,
+    lock_path: Path | str = Path("data/.compile.lock"),
+    config_dir: Path | str = Path("config"),
+    subagent_model: str | None = None,
+    prompt_profile: str | None = None,
+    overwrite_pending: bool = False,
+    strategy: Literal["cluster", "pairwise"] = "cluster",
+    max_cluster_items: int = 80,
+) -> dict[str, Any]:
+    """Stage 3d 归并：默认走同 L2 域 Cluster-then-Assign 标准算子归纳，兼容旧两两模式。"""
+    slug, tax_ver, _, _ = _load_active_taxonomy(conn, grade_subject)
+    embed_client = EmbeddingClient(settings, conn=conn, use_mock=use_mock)
+
+    try:
+        # 1. 增量同步待归并实体的向量库
+        if target in ("all", "l3"):
+            l3_rows = conn.execute(
+                """
+                SELECT node_id, l1_module, l2_entity, l3_operator
+                FROM knowledge_nodes
+                WHERE grade_subject = ? AND taxonomy_version = ? AND node_level = 'L3' AND redirect_to_id IS NULL
+                ORDER BY node_id;
+                """,
+                (grade_subject, tax_ver),
+            ).fetchall()
+            await vector_store.sync_vectors(
+                "l3_nodes",
+                [(str(r["node_id"]), f"{r['l1_module']}/{r['l2_entity']}/{r['l3_operator']}") for r in l3_rows],
+                embed_client,
+                scope_slug=slug,
+                stage="STAGE3D_EMBED_L3",
+            )
+
+        if target in ("all", "concepts"):
+            for kind_name, ns in (("METHOD", "concepts_method"), ("MOTIF", "concepts_motif")):
+                c_rows = conn.execute(
+                    """
+                    SELECT concept_id, name
+                    FROM concepts
+                    WHERE kind = ? AND is_seed = 0 AND redirect_to_id IS NULL
+                    ORDER BY concept_id;
+                    """,
+                    (kind_name,),
+                ).fetchall()
+                await vector_store.sync_vectors(
+                    ns,  # type: ignore[arg-type]
+                    [(str(r["concept_id"]), str(r["name"])) for r in c_rows],
+                    embed_client,
+                    stage=f"STAGE3D_EMBED_{kind_name}",
+                )
+    finally:
+        await embed_client.aclose()
+
+    if strategy == "pairwise":
+        return await _run_compaction_pairwise_async(
+            conn,
+            settings,
+            vector_store,
+            grade_subject=grade_subject,
+            slug=slug,
+            tax_ver=tax_ver,
+            target=target,
+            mode=mode,
+            batch_size=batch_size,
+            tasks_dir=tasks_dir,
+            results_path=results_path,
+            lock_path=lock_path,
+            config_dir=config_dir,
+            subagent_model=subagent_model,
+            prompt_profile=prompt_profile,
+            overwrite_pending=overwrite_pending,
+        )
+
+    return await _run_compaction_cluster_async(
+        conn,
+        settings,
+        vector_store,
+        grade_subject=grade_subject,
+        slug=slug,
+        tax_ver=tax_ver,
+        target=target,
+        mode=mode,
+        tasks_dir=tasks_dir,
+        results_path=results_path,
+        lock_path=lock_path,
+        config_dir=config_dir,
+        subagent_model=subagent_model,
+        prompt_profile=prompt_profile,
+        overwrite_pending=overwrite_pending,
+        max_cluster_items=max_cluster_items,
+    )
 
 
 async def run_stage3e_async(
@@ -1345,6 +1830,10 @@ async def run_stage3e_async(
     tasks_dir: Path | str = Path("data/unified/stage3_4/3e"),
     results_path: Path | str | None = None,
     lock_path: Path | str = Path("data/.compile.lock"),
+    config_dir: Path | str = Path("config"),
+    subagent_model: str | None = None,
+    prompt_profile: str | None = None,
+    overwrite_pending: bool = False,
 ) -> dict[str, Any]:
     """Stage 3e：构建 L2 先修 DAG（Kahn 破环）与跨模块共现知识边。"""
     slug, tax_ver, spec, lookup = _load_active_taxonomy(conn, grade_subject)
@@ -1364,7 +1853,7 @@ async def run_stage3e_async(
         FROM question_steps s
         JOIN questions q ON q.question_uid = s.question_uid
         JOIN compile_state cs ON cs.question_uid = q.question_uid AND cs.stage = 'S3C'
-        WHERE q.grade_subject = ? AND q.is_retired = 0 AND cs.status = 'OK'
+        WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_servable = 1 AND cs.status = 'OK'
           AND s.m_l1 != '' AND s.m_l2 != ''
         ORDER BY s.question_uid, s.branch_id, s.step_index;
         """,
@@ -1413,6 +1902,12 @@ async def run_stage3e_async(
             grade_subject=grade_subject,
             taxonomy_enum_text=taxonomy_enum,
             ordered_transitions=ordered_transitions,
+            config_dir=Path(config_dir),
+            prompt_profile=prompt_profile,
+        )
+        resolved_model = resolve_subagent_model(settings, "3e", subagent_model)
+        p_ver, p_digest = _resolve_seam_meta(
+            config_dir, grade_subject, "stage3e", "s3e_v1", prompt_profile
         )
         manifest = export_task_batches(
             "3e",
@@ -1420,6 +1915,12 @@ async def run_stage3e_async(
             {"grade_subject": grade_subject, "taxonomy_version": tax_ver},
             tasks_dir,
             schema_cls=PrerequisiteDagOutput,
+            subagent_model=resolved_model,
+            prompt_version=p_ver,
+            prompt_digest=p_digest,
+            prompt_profile=prompt_profile,
+            max_parallel_workers=settings.subagent.max_parallel_workers,
+            overwrite_pending=overwrite_pending,
         )
         return {
             "mode": "export",

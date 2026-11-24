@@ -9,10 +9,11 @@ from typing import Any, Literal
 
 import yaml
 
-from shuati.config import Settings
+from shuati.config import Settings, resolve_subagent_model
 from shuati.core.topology import (
     RELATION_TYPES,
     CandidateEdge,
+    QuestionFeature,
     apply_degree_caps,
     generate_candidate_edges,
     load_question_features,
@@ -24,9 +25,39 @@ from shuati.db.connection import CompileLock, PreconditionError
 from shuati.llm.embeddings import EmbeddingClient
 from shuati.llm.gateway import LLMGateway
 from shuati.llm.prompt_builder import build_stage4_refine_messages
+from shuati.llm.seam_loader import load_prompt_seams
 from shuati.models.schemas import Stage4RefineBatchOutput, Stage4RefineItem
 from shuati.pipeline.subagent_bridge import export_task_batches, load_and_validate_results
 from shuati.vectors.store import VectorStore
+
+
+def _build_surface_text(question_text: str | None, visual_facts: str | None) -> str:
+    """构造 Stage 4 表皮向量拼接文本：eff_question_text + ('\\n' + eff_visual_facts if non-empty)。"""
+    qt = str(question_text or "")
+    vf = str(visual_facts or "")
+    return qt + ("\n" + vf if vf.strip() else "")
+
+
+def _build_refine_pair_payload(
+    pid: str,
+    edge: CandidateEdge,
+    fa: QuestionFeature,
+    fb: QuestionFeature,
+) -> dict[str, Any]:
+    return {
+        "pair_id": pid,
+        "relation_type": edge.relation_type,
+        "source_text": fa.eff_text,
+        "source_skeleton": fa.eff_skeleton,
+        "source_tags": fa.tag_labels,
+        "target_text": fb.eff_text,
+        "target_skeleton": fb.eff_skeleton,
+        "target_tags": fb.tag_labels,
+        "surface_pct": edge.surface_pct,
+        "skeleton_pct": edge.skeleton_pct,
+        "k_jaccard": edge.k_jaccard,
+        "containment": edge.containment_score,
+    }
 
 
 async def reindex_vectors_and_quantiles_async(
@@ -37,6 +68,7 @@ async def reindex_vectors_and_quantiles_async(
     rebuild_vectors: bool = True,
     rebuild_quantiles: bool = True,
     force_rebuild: bool = False,
+    include_unservable: bool = False,
     use_mock: bool = False,
     vectors_dir: Path | str = Path("data/vectors"),
 ) -> dict[str, Any]:
@@ -62,6 +94,7 @@ async def reindex_vectors_and_quantiles_async(
     quantile_stats: dict[str, Any] = {}
 
     if rebuild_vectors:
+        where_serve = "" if include_unservable else "AND q.eff_is_servable = 1"
         client = EmbeddingClient(settings, conn=conn, use_mock=use_mock)
         try:
             for gsr in gs_rows:
@@ -69,18 +102,21 @@ async def reindex_vectors_and_quantiles_async(
                 slug = str(gsr["slug"])
                 tax_ver = str(gsr["taxonomy_version"] or "")
                 q_rows = conn.execute(
-                    """
-                    SELECT q.question_uid, q.eff_question_text, q.eff_abstract_skeleton
+                    f"""
+                    SELECT q.question_uid, q.eff_question_text, q.eff_visual_facts, q.eff_abstract_skeleton
                     FROM questions q
                     JOIN compile_state cs ON cs.question_uid = q.question_uid AND cs.stage = 'S2'
-                    WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_excluded = 0 AND cs.status = 'OK'
+                    WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_excluded = 0 {where_serve} AND cs.status = 'OK'
                     ORDER BY q.question_uid;
                     """,
                     (gs,),
                 ).fetchall()
                 vector_stats[f"surface_{slug}"] = await store.sync_vectors(
                     "surface",
-                    [(str(r["question_uid"]), str(r["eff_question_text"] or "")) for r in q_rows],
+                    [
+                        (str(r["question_uid"]), _build_surface_text(r["eff_question_text"], r["eff_visual_facts"]))
+                        for r in q_rows
+                    ],
                     client,
                     scope_slug=slug,
                     force_rebuild=force_rebuild,
@@ -170,6 +206,10 @@ async def run_stage4_weave_async(
     vectors_dir: Path | str = Path("data/vectors"),
     use_mock: bool = False,
     lock_path: Path | str = Path("data/.compile.lock"),
+    config_dir: Path | str = Path("config"),
+    subagent_model: str | None = None,
+    prompt_profile: str | None = None,
+    overwrite_pending: bool = False,
 ) -> dict[str, Any]:
     """Stage 4 四通道五边拓扑织网（规则矩阵 + 边界带/CONTRASTIVE 精裁 + 度数截断 + relation_overrides 合并）。"""
     gs_row = conn.execute(
@@ -214,19 +254,23 @@ async def run_stage4_weave_async(
         embed_client = EmbeddingClient(settings, conn=conn, use_mock=use_mock)
         try:
             store.validate_model_match(embed_client.model_name, allow_empty=True)
+            where_serve = "" if include_unservable else "AND q.eff_is_servable = 1"
             all_active_rows = conn.execute(
-                """
-                SELECT q.question_uid, q.eff_question_text, q.eff_abstract_skeleton
+                f"""
+                SELECT q.question_uid, q.eff_question_text, q.eff_visual_facts, q.eff_abstract_skeleton
                 FROM questions q
                 JOIN compile_state cs ON cs.question_uid = q.question_uid AND cs.stage = 'S2'
-                WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_excluded = 0 AND cs.status = 'OK'
+                WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_excluded = 0 {where_serve} AND cs.status = 'OK'
                 ORDER BY q.question_uid;
                 """,
                 (grade_subject,),
             ).fetchall()
             await store.sync_vectors(
                 "surface",
-                [(str(r["question_uid"]), str(r["eff_question_text"] or "")) for r in all_active_rows],
+                [
+                    (str(r["question_uid"]), _build_surface_text(r["eff_question_text"], r["eff_visual_facts"]))
+                    for r in all_active_rows
+                ],
                 embed_client,
                 scope_slug=slug,
                 stage="STAGE4_EMBED",
@@ -285,32 +329,44 @@ async def run_stage4_weave_async(
                 tids.append(pid)
                 fa = features[e.source_uid]
                 fb = features[e.target_uid]
-                p_items.append(
-                    {
-                        "pair_id": pid,
-                        "relation_type": e.relation_type,
-                        "source_text": fa.eff_text,
-                        "source_skeleton": fa.eff_skeleton,
-                        "source_tags": fa.tag_labels,
-                        "target_text": fb.eff_text,
-                        "target_skeleton": fb.eff_skeleton,
-                        "target_tags": fb.tag_labels,
-                        "surface_pct": e.surface_pct,
-                        "skeleton_pct": e.skeleton_pct,
-                        "k_jaccard": e.k_jaccard,
-                        "containment": e.containment_score,
-                    }
-                )
+                p_items.append(_build_refine_pair_payload(pid, e, fa, fb))
                 task_map["pairs"][pid] = {
                     "source_uid": e.source_uid,
                     "target_uid": e.target_uid,
                     "relation_type": e.relation_type,
                 }
-            msgs = build_stage4_refine_messages(candidate_pairs=p_items)
+            msgs = build_stage4_refine_messages(
+                candidate_pairs=p_items,
+                grade_subject=grade_subject,
+                config_dir=Path(config_dir),
+                prompt_profile=prompt_profile,
+            )
             batches.append({"batch_id": f"stage4_batch_{b_idx:04d}", "messages": msgs, "task_item_ids": tids})
 
+        resolved_model = resolve_subagent_model(settings, "stage4", subagent_model)
+        cfg_p = Path(config_dir)
+        if (cfg_p / "prompts" / "default.yaml").is_file() or prompt_profile is not None:
+            bundle = load_prompt_seams(
+                config_dir=cfg_p, grade_subject=grade_subject, profile=prompt_profile
+            )
+            p_ver = bundle.prompt_versions.get("stage4", "s4_refine_v1")
+            p_digest = bundle.prompt_digest
+        else:
+            p_ver = "s4_refine_v1"
+            p_digest = ""
+
         manifest = export_task_batches(
-            "stage4", batches, task_map, tasks_dir, schema_cls=Stage4RefineBatchOutput
+            "stage4",
+            batches,
+            task_map,
+            tasks_dir,
+            schema_cls=Stage4RefineBatchOutput,
+            subagent_model=resolved_model,
+            prompt_version=p_ver,
+            prompt_digest=p_digest,
+            prompt_profile=prompt_profile,
+            max_parallel_workers=settings.subagent.max_parallel_workers,
+            overwrite_pending=overwrite_pending,
         )
         return {
             "mode": "export",
@@ -364,23 +420,13 @@ async def run_stage4_weave_async(
                 pid_to_edge[pid] = e
                 fa = features[e.source_uid]
                 fb = features[e.target_uid]
-                p_items.append(
-                    {
-                        "pair_id": pid,
-                        "relation_type": e.relation_type,
-                        "source_text": fa.eff_text,
-                        "source_skeleton": fa.eff_skeleton,
-                        "source_tags": fa.tag_labels,
-                        "target_text": fb.eff_text,
-                        "target_skeleton": fb.eff_skeleton,
-                        "target_tags": fb.tag_labels,
-                        "surface_pct": e.surface_pct,
-                        "skeleton_pct": e.skeleton_pct,
-                        "k_jaccard": e.k_jaccard,
-                        "containment": e.containment_score,
-                    }
-                )
-            msgs = build_stage4_refine_messages(candidate_pairs=p_items)
+                p_items.append(_build_refine_pair_payload(pid, e, fa, fb))
+            msgs = build_stage4_refine_messages(
+                candidate_pairs=p_items,
+                grade_subject=grade_subject,
+                config_dir=Path(config_dir),
+                prompt_profile=prompt_profile,
+            )
             res = await gateway.call_structured(
                 slot="judge_llm",
                 stage="STAGE4_REFINE",

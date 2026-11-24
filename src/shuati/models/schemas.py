@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -200,6 +200,41 @@ class MergeJudgeItem(BaseModel):
 
 class MergeJudgeBatchOutput(BaseModel):
     decisions: list[MergeJudgeItem]
+
+
+class Stage3dCanonicalOperator(BaseModel):
+    """Stage 3d 同 L2 域归纳出的标准原子转化算子。"""
+
+    canonical_name: str = Field(min_length=2)
+    description: str = ""
+
+
+class Stage3dClusterAssignment(BaseModel):
+    """Stage 3d 单条 raw_l3 / 概念到标准算子的归并映射。"""
+
+    item_id: str = ""
+    raw_l3: str = Field(min_length=1)
+    canonical_name: str = Field(min_length=2)
+    reason: str = ""
+
+
+class Stage3dClusterAssignOutput(BaseModel):
+    """Stage 3d 同 L2 域 Cluster-then-Assign 归纳输出（D-Audit-2）。"""
+
+    canonical_operators: list[Stage3dCanonicalOperator] = Field(default_factory=list)
+    assignments: list[Stage3dClusterAssignment] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_dict_assignments(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("assignments"), dict):
+            coerced = [
+                {"raw_l3": str(k), "canonical_name": str(v)}
+                for k, v in data["assignments"].items()
+                if str(k).strip() and str(v).strip()
+            ]
+            return {**data, "assignments": coerced}
+        return data
 
 
 class PrerequisiteEdgeCandidate(BaseModel):

@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 
 from shuati.core import effective
+from shuati.core.taxonomy import make_node_id, normalize_label
 from shuati.db import human_mirror
 from shuati.db.connection import CompileLock, PreconditionError
 from shuati.vectors.store import VectorStore
@@ -295,6 +298,341 @@ def recall_concept_merge_candidates(
     )
 
 
+def _resolve_scope_slug(conn: sqlite3.Connection, grade_subject: str, slug: str = "") -> str:
+    if slug.strip():
+        return slug.strip()
+    if grade_subject.strip():
+        row = conn.execute(
+            "SELECT slug FROM grade_subjects WHERE grade_subject = ?;",
+            (grade_subject.strip(),),
+        ).fetchone()
+        if row is not None and str(row["slug"]).strip():
+            return str(row["slug"]).strip()
+    return "scope"
+
+
+def _ensure_canonical_l3_node(
+    conn: sqlite3.Connection,
+    *,
+    grade_subject: str,
+    slug: str,
+    taxonomy_version: str,
+    l1_module: str,
+    l2_entity: str,
+    canonical_name: str,
+) -> tuple[str, bool]:
+    """复用或新建同 (grade_subject, taxonomy_version, L1, L2) 活跃标准 L3 主节点。"""
+    cname = canonical_name.strip()
+    existing = conn.execute(
+        """
+        SELECT node_id
+        FROM knowledge_nodes
+        WHERE grade_subject = ?
+          AND taxonomy_version = ?
+          AND node_level = 'L3'
+          AND l1_module = ?
+          AND l2_entity = ?
+          AND l3_operator = ?
+          AND redirect_to_id IS NULL;
+        """,
+        (grade_subject, taxonomy_version, l1_module, l2_entity, cname),
+    ).fetchone()
+    if existing is not None:
+        return str(existing["node_id"]), False
+
+    eff_slug = _resolve_scope_slug(conn, grade_subject, slug)
+    l2_id = make_node_id(eff_slug, taxonomy_version, "L2", l1_module, l2_entity, "")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO knowledge_nodes(
+            node_id, grade_subject, taxonomy_version, node_level,
+            l1_module, l2_entity, l3_operator, aliases_json, redirect_to_id
+        )
+        VALUES (?, ?, ?, 'L2', ?, ?, '', '[]', NULL);
+        """,
+        (l2_id, grade_subject, taxonomy_version, l1_module, l2_entity),
+    )
+
+    base_nid = make_node_id(eff_slug, taxonomy_version, "L3", l1_module, l2_entity, cname)
+    nid = base_nid
+    seq = 1
+    while conn.execute("SELECT 1 FROM knowledge_nodes WHERE node_id = ?;", (nid,)).fetchone() is not None:
+        nid = f"{base_nid}_c{seq}"
+        seq += 1
+
+    conn.execute(
+        """
+        INSERT INTO knowledge_nodes(
+            node_id, grade_subject, taxonomy_version, node_level,
+            l1_module, l2_entity, l3_operator, aliases_json, redirect_to_id
+        )
+        VALUES (?, ?, ?, 'L3', ?, ?, ?, '[]', NULL);
+        """,
+        (nid, grade_subject, taxonomy_version, l1_module, l2_entity, cname),
+    )
+    return nid, True
+
+
+def _ensure_canonical_concept(
+    conn: sqlite3.Connection,
+    *,
+    kind: Literal["METHOD", "MOTIF"],
+    canonical_name: str,
+    description: str = "",
+) -> tuple[str, bool]:
+    """复用或新建非种子标准 METHOD/MOTIF 概念主节点。"""
+    if kind not in ("METHOD", "MOTIF"):
+        raise PreconditionError(f"PRECONDITION_FAILED: 禁止归并概念类型 {kind!r}（TRAP 永不自动归并）")
+    cname = canonical_name.strip()
+    existing = conn.execute(
+        """
+        SELECT concept_id, is_seed
+        FROM concepts
+        WHERE kind = ? AND name = ? AND redirect_to_id IS NULL;
+        """,
+        (kind, cname),
+    ).fetchone()
+    if existing is not None:
+        if int(existing["is_seed"]) == 1:
+            raise PreconditionError("PRECONDITION_FAILED: 严禁合并 is_seed=1 概念")
+        return str(existing["concept_id"]), False
+
+    base_cid = f"{kind}:{cname}"
+    cid = base_cid
+    seq = 1
+    digest = hashlib.sha1(f"{kind}:{cname}".encode()).hexdigest()[:6]
+    while conn.execute("SELECT 1 FROM concepts WHERE concept_id = ?;", (cid,)).fetchone() is not None:
+        cid = f"{kind}:{cname}:{digest}_{seq}"
+        seq += 1
+
+    conn.execute(
+        """
+        INSERT INTO concepts(concept_id, kind, name, aliases_json, description, redirect_to_id, is_seed)
+        VALUES (?, ?, ?, '[]', ?, NULL, 0);
+        """,
+        (cid, kind, cname, description.strip()),
+    )
+    return cid, True
+
+
+def _merge_single_knowledge_node(
+    conn: sqlite3.Connection,
+    *,
+    from_id: str,
+    to_id: str,
+    evidence: str,
+    batch_id: str,
+    scope_dict: dict[str, Any],
+    affected_uids: set[str],
+    sp_name: str,
+) -> bool:
+    """在 SAVEPOINT 内执行单对 L3 知识节点可逆路径压缩归并。"""
+    conn.execute(f"SAVEPOINT {sp_name};")
+    try:
+        row_from = conn.execute(
+            "SELECT node_id, grade_subject, taxonomy_version, node_level, l1_module, l2_entity, l3_operator, aliases_json FROM knowledge_nodes WHERE node_id = ?;",
+            (from_id,),
+        ).fetchone()
+        row_to = conn.execute(
+            "SELECT node_id, grade_subject, taxonomy_version, node_level, l1_module, l2_entity, l3_operator, aliases_json FROM knowledge_nodes WHERE node_id = ?;",
+            (to_id,),
+        ).fetchone()
+        if row_from is None or row_to is None:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+            conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+            return False
+        if row_from["node_level"] != "L3" or row_to["node_level"] != "L3":
+            raise PreconditionError("PRECONDITION_FAILED: 严禁合并 L2 汇总节点")
+        same_scope = (
+            row_from["grade_subject"] == row_to["grade_subject"]
+            and row_from["taxonomy_version"] == row_to["taxonomy_version"]
+            and row_from["l1_module"] == row_to["l1_module"]
+            and row_from["l2_entity"] == row_to["l2_entity"]
+        )
+        if not same_scope:
+            raise PreconditionError(
+                f"PRECONDITION_FAILED: 严禁跨作用域合并知识节点: {from_id} vs {to_id}"
+            )
+
+        prev_aliases = json.loads(row_to["aliases_json"] or "[]")
+        from_aliases = json.loads(row_from["aliases_json"] or "[]")
+        merged_aliases = list(dict.fromkeys([*prev_aliases, row_from["l3_operator"], *from_aliases]))
+        merged_aliases = [a for a in merged_aliases if a and a != row_to["l3_operator"]][:32]
+
+        child_rows = conn.execute(
+            "SELECT node_id FROM knowledge_nodes WHERE redirect_to_id = ?;",
+            (from_id,),
+        ).fetchall()
+        child_ids = [str(r["node_id"]) for r in child_rows]
+
+        # 路径压缩：将 from 及所有直属子节点一次指向 to
+        conn.execute(
+            "UPDATE knowledge_nodes SET redirect_to_id = ? WHERE node_id = ?;",
+            (to_id, from_id),
+        )
+        if child_ids:
+            ph = ",".join("?" for _ in child_ids)
+            conn.execute(
+                f"UPDATE knowledge_nodes SET redirect_to_id = ? WHERE node_id IN ({ph});",
+                [to_id, *child_ids],
+            )
+        conn.execute(
+            "UPDATE knowledge_nodes SET aliases_json = ? WHERE node_id = ?;",
+            (json.dumps(merged_aliases, ensure_ascii=False), to_id),
+        )
+
+        # 记录受影响题目（step 绑定了 from 或其子节点）
+        ref_ids = [from_id, *child_ids]
+        ph = ",".join("?" for _ in ref_ids)
+        step_qs = conn.execute(
+            f"SELECT DISTINCT question_uid FROM question_steps WHERE m_knowledge_node_id IN ({ph});",
+            ref_ids,
+        ).fetchall()
+        affected_uids.update(str(r["question_uid"]) for r in step_qs)
+
+        node_scope = {
+            **scope_dict,
+            "grade_subject": row_to["grade_subject"],
+            "taxonomy_version": row_to["taxonomy_version"],
+            "l1_module": row_to["l1_module"],
+            "l2_entity": row_to["l2_entity"],
+        }
+        conn.execute(
+            """
+            INSERT INTO compaction_audit_ledger(
+                batch_id, target_kind, scope_json, from_id, to_id,
+                ai_judge_evidence, previous_aliases_to_json, affected_child_ids_json
+            )
+            VALUES (?, 'KNOWLEDGE_NODE', ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                batch_id,
+                json.dumps(node_scope, ensure_ascii=False),
+                from_id,
+                to_id,
+                evidence,
+                json.dumps(prev_aliases, ensure_ascii=False),
+                json.dumps(child_ids, ensure_ascii=False),
+            ),
+        )
+        conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+        return True
+    except BaseException:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+        conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+        raise
+
+
+def _merge_single_concept(
+    conn: sqlite3.Connection,
+    *,
+    from_id: str,
+    to_id: str,
+    evidence: str,
+    batch_id: str,
+    scope_dict: dict[str, Any],
+    affected_uids: set[str],
+    sp_name: str,
+) -> bool:
+    """在 SAVEPOINT 内执行单对全局非种子概念（METHOD/MOTIF）可逆路径压缩归并。"""
+    conn.execute(f"SAVEPOINT {sp_name};")
+    try:
+        row_from = conn.execute(
+            "SELECT concept_id, kind, name, aliases_json, is_seed FROM concepts WHERE concept_id = ?;",
+            (from_id,),
+        ).fetchone()
+        row_to = conn.execute(
+            "SELECT concept_id, kind, name, aliases_json, is_seed FROM concepts WHERE concept_id = ?;",
+            (to_id,),
+        ).fetchone()
+        if row_from is None or row_to is None:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+            conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+            return False
+        if row_from["is_seed"] == 1 or row_to["is_seed"] == 1:
+            raise PreconditionError("PRECONDITION_FAILED: 严禁合并 is_seed=1 概念")
+        if row_from["kind"] != row_to["kind"] or row_from["kind"] not in ("METHOD", "MOTIF"):
+            raise PreconditionError(
+                f"PRECONDITION_FAILED: 严禁跨 kind 或对 TRAP 合并概念: {row_from['kind']} vs {row_to['kind']}"
+            )
+
+        prev_aliases = json.loads(row_to["aliases_json"] or "[]")
+        from_aliases = json.loads(row_from["aliases_json"] or "[]")
+        merged_aliases = list(dict.fromkeys([*prev_aliases, row_from["name"], *from_aliases]))
+        merged_aliases = [a for a in merged_aliases if a and a != row_to["name"]][:32]
+
+        child_rows = conn.execute(
+            "SELECT concept_id FROM concepts WHERE redirect_to_id = ?;",
+            (from_id,),
+        ).fetchall()
+        child_ids = [str(r["concept_id"]) for r in child_rows]
+
+        conn.execute(
+            "UPDATE concepts SET redirect_to_id = ? WHERE concept_id = ?;",
+            (to_id, from_id),
+        )
+        if child_ids:
+            ph = ",".join("?" for _ in child_ids)
+            conn.execute(
+                f"UPDATE concepts SET redirect_to_id = ? WHERE concept_id IN ({ph});",
+                [to_id, *child_ids],
+            )
+        conn.execute(
+            "UPDATE concepts SET aliases_json = ? WHERE concept_id = ?;",
+            (json.dumps(merged_aliases, ensure_ascii=False), to_id),
+        )
+
+        # 去重迁移 question_concepts 避免主键冲突，优先保留 HUMAN 来源
+        ref_ids = [from_id, *child_ids]
+        ph = ",".join("?" for _ in ref_ids)
+        qc_rows = conn.execute(
+            f"SELECT question_uid, concept_id, kind, origin FROM question_concepts WHERE concept_id IN ({ph});",
+            ref_ids,
+        ).fetchall()
+        for qcr in qc_rows:
+            quid = str(qcr["question_uid"])
+            affected_uids.add(quid)
+            conn.execute(
+                """
+                INSERT INTO question_concepts(question_uid, concept_id, kind, origin)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(question_uid, concept_id) DO UPDATE SET
+                    origin = CASE WHEN question_concepts.origin = 'HUMAN' OR excluded.origin = 'HUMAN' THEN 'HUMAN' ELSE 'MACHINE' END;
+                """,
+                (quid, to_id, row_to["kind"], qcr["origin"]),
+            )
+            conn.execute(
+                "DELETE FROM question_concepts WHERE question_uid = ? AND concept_id = ?;",
+                (quid, qcr["concept_id"]),
+            )
+
+        c_scope = {**scope_dict, "kind": row_to["kind"]}
+        conn.execute(
+            """
+            INSERT INTO compaction_audit_ledger(
+                batch_id, target_kind, scope_json, from_id, to_id,
+                ai_judge_evidence, previous_aliases_to_json, affected_child_ids_json
+            )
+            VALUES (?, 'CONCEPT', ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                batch_id,
+                json.dumps(c_scope, ensure_ascii=False),
+                from_id,
+                to_id,
+                evidence,
+                json.dumps(prev_aliases, ensure_ascii=False),
+                json.dumps(child_ids, ensure_ascii=False),
+            ),
+        )
+        conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+        return True
+    except BaseException:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+        conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+        raise
+
+
 def apply_merge_pairs(
     conn: sqlite3.Connection,
     *,
@@ -312,6 +650,7 @@ def apply_merge_pairs(
         raw_from = str(item["from_id"])
         raw_to = str(item["to_id"])
         evidence = str(item.get("evidence") or "")
+        canonical_name = str(item.get("canonical_name") or "").strip()
 
         if target_kind == "KNOWLEDGE_NODE":
             for raw_chk in (raw_from, raw_to):
@@ -331,109 +670,71 @@ def apply_merge_pairs(
             skipped += 1
             continue
 
-        sp_name = f"sp_merge_{idx}"
-        conn.execute(f"SAVEPOINT {sp_name};")
-        try:
+        if canonical_name:
             if target_kind == "KNOWLEDGE_NODE":
-                row_from = conn.execute(
-                    "SELECT node_id, grade_subject, taxonomy_version, node_level, l1_module, l2_entity, l3_operator, aliases_json FROM knowledge_nodes WHERE node_id = ?;",
-                    (from_id,),
-                ).fetchone()
                 row_to = conn.execute(
-                    "SELECT node_id, grade_subject, taxonomy_version, node_level, l1_module, l2_entity, l3_operator, aliases_json FROM knowledge_nodes WHERE node_id = ?;",
+                    "SELECT grade_subject, taxonomy_version, node_level, l1_module, l2_entity, l3_operator FROM knowledge_nodes WHERE node_id = ?;",
                     (to_id,),
                 ).fetchone()
-                if row_from is None or row_to is None:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-                    conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+                row_from = conn.execute(
+                    "SELECT grade_subject, taxonomy_version, node_level, l1_module, l2_entity FROM knowledge_nodes WHERE node_id = ?;",
+                    (from_id,),
+                ).fetchone()
+                if row_to is None or row_from is None:
                     skipped += 1
                     continue
                 if row_from["node_level"] != "L3" or row_to["node_level"] != "L3":
                     raise PreconditionError("PRECONDITION_FAILED: 严禁合并 L2 汇总节点")
-                same_scope = (
-                    row_from["grade_subject"] == row_to["grade_subject"]
-                    and row_from["taxonomy_version"] == row_to["taxonomy_version"]
-                    and row_from["l1_module"] == row_to["l1_module"]
-                    and row_from["l2_entity"] == row_to["l2_entity"]
-                )
-                if not same_scope:
+                if (
+                    row_from["grade_subject"] != row_to["grade_subject"]
+                    or row_from["taxonomy_version"] != row_to["taxonomy_version"]
+                    or row_from["l1_module"] != row_to["l1_module"]
+                    or row_from["l2_entity"] != row_to["l2_entity"]
+                ):
                     raise PreconditionError(
                         f"PRECONDITION_FAILED: 严禁跨作用域合并知识节点: {from_id} vs {to_id}"
                     )
-
-                prev_aliases = json.loads(row_to["aliases_json"] or "[]")
-                from_aliases = json.loads(row_from["aliases_json"] or "[]")
-                merged_aliases = list(dict.fromkeys([*prev_aliases, row_from["l3_operator"], *from_aliases]))
-                merged_aliases = [a for a in merged_aliases if a and a != row_to["l3_operator"]][:12]
-
-                child_rows = conn.execute(
-                    "SELECT node_id FROM knowledge_nodes WHERE redirect_to_id = ?;",
-                    (from_id,),
-                ).fetchall()
-                child_ids = [str(r["node_id"]) for r in child_rows]
-
-                # 路径压缩：将 from 及所有直属子节点一次指向 to
-                conn.execute(
-                    "UPDATE knowledge_nodes SET redirect_to_id = ? WHERE node_id = ?;",
-                    (to_id, from_id),
+                canon_id, canon_created = _ensure_canonical_l3_node(
+                    conn,
+                    grade_subject=str(row_to["grade_subject"]),
+                    slug=str(scope_dict.get("slug") or ""),
+                    taxonomy_version=str(row_to["taxonomy_version"]),
+                    l1_module=str(row_to["l1_module"]),
+                    l2_entity=str(row_to["l2_entity"]),
+                    canonical_name=canonical_name,
                 )
-                if child_ids:
-                    ph = ",".join("?" for _ in child_ids)
-                    conn.execute(
-                        f"UPDATE knowledge_nodes SET redirect_to_id = ? WHERE node_id IN ({ph});",
-                        [to_id, *child_ids],
-                    )
-                conn.execute(
-                    "UPDATE knowledge_nodes SET aliases_json = ? WHERE node_id = ?;",
-                    (json.dumps(merged_aliases, ensure_ascii=False), to_id),
+                row_scope = {**scope_dict, "created_master_id": canon_id} if canon_created else scope_dict
+                targets = (
+                    [(to_id, from_id)]
+                    if canon_id == from_id
+                    else ([(from_id, to_id)] if canon_id == to_id else [(from_id, canon_id), (to_id, canon_id)])
                 )
-
-                # 记录受影响题目（step 绑定了 from 或其子节点）
-                ref_ids = [from_id, *child_ids]
-                ph = ",".join("?" for _ in ref_ids)
-                step_qs = conn.execute(
-                    f"SELECT DISTINCT question_uid FROM question_steps WHERE m_knowledge_node_id IN ({ph});",
-                    ref_ids,
-                ).fetchall()
-                affected_uids.update(str(r["question_uid"]) for r in step_qs)
-
-                node_scope = {
-                    **scope_dict,
-                    "grade_subject": row_to["grade_subject"],
-                    "taxonomy_version": row_to["taxonomy_version"],
-                    "l1_module": row_to["l1_module"],
-                    "l2_entity": row_to["l2_entity"],
-                }
-                conn.execute(
-                    """
-                    INSERT INTO compaction_audit_ledger(
-                        batch_id, target_kind, scope_json, from_id, to_id,
-                        ai_judge_evidence, previous_aliases_to_json, affected_child_ids_json
-                    )
-                    VALUES (?, 'KNOWLEDGE_NODE', ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        batch_id,
-                        json.dumps(node_scope, ensure_ascii=False),
-                        from_id,
-                        to_id,
-                        evidence,
-                        json.dumps(prev_aliases, ensure_ascii=False),
-                        json.dumps(child_ids, ensure_ascii=False),
-                    ),
-                )
+                did_apply = False
+                for sub_i, (src_id, dst_id) in enumerate(targets):
+                    if _merge_single_knowledge_node(
+                        conn,
+                        from_id=src_id,
+                        to_id=dst_id,
+                        evidence=evidence,
+                        batch_id=batch_id,
+                        scope_dict=row_scope,
+                        affected_uids=affected_uids,
+                        sp_name=f"sp_merge_{idx}_{sub_i}",
+                    ):
+                        did_apply = True
+                        applied += 1
+                if not did_apply:
+                    skipped += 1
             else:
-                row_from = conn.execute(
-                    "SELECT concept_id, kind, name, aliases_json, is_seed FROM concepts WHERE concept_id = ?;",
-                    (from_id,),
-                ).fetchone()
                 row_to = conn.execute(
-                    "SELECT concept_id, kind, name, aliases_json, is_seed FROM concepts WHERE concept_id = ?;",
+                    "SELECT kind, is_seed FROM concepts WHERE concept_id = ?;",
                     (to_id,),
                 ).fetchone()
-                if row_from is None or row_to is None:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-                    conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+                row_from = conn.execute(
+                    "SELECT kind, is_seed FROM concepts WHERE concept_id = ?;",
+                    (from_id,),
+                ).fetchone()
+                if row_to is None or row_from is None:
                     skipped += 1
                     continue
                 if row_from["is_seed"] == 1 or row_to["is_seed"] == 1:
@@ -442,83 +743,61 @@ def apply_merge_pairs(
                     raise PreconditionError(
                         f"PRECONDITION_FAILED: 严禁跨 kind 或对 TRAP 合并概念: {row_from['kind']} vs {row_to['kind']}"
                     )
-
-                prev_aliases = json.loads(row_to["aliases_json"] or "[]")
-                from_aliases = json.loads(row_from["aliases_json"] or "[]")
-                merged_aliases = list(dict.fromkeys([*prev_aliases, row_from["name"], *from_aliases]))
-                merged_aliases = [a for a in merged_aliases if a and a != row_to["name"]][:12]
-
-                child_rows = conn.execute(
-                    "SELECT concept_id FROM concepts WHERE redirect_to_id = ?;",
-                    (from_id,),
-                ).fetchall()
-                child_ids = [str(r["concept_id"]) for r in child_rows]
-
-                conn.execute(
-                    "UPDATE concepts SET redirect_to_id = ? WHERE concept_id = ?;",
-                    (to_id, from_id),
+                canon_id, canon_created = _ensure_canonical_concept(
+                    conn,
+                    kind=str(row_to["kind"]),  # type: ignore[arg-type]
+                    canonical_name=canonical_name,
                 )
-                if child_ids:
-                    ph = ",".join("?" for _ in child_ids)
-                    conn.execute(
-                        f"UPDATE concepts SET redirect_to_id = ? WHERE concept_id IN ({ph});",
-                        [to_id, *child_ids],
-                    )
-                conn.execute(
-                    "UPDATE concepts SET aliases_json = ? WHERE concept_id = ?;",
-                    (json.dumps(merged_aliases, ensure_ascii=False), to_id),
+                row_scope = {**scope_dict, "created_master_id": canon_id} if canon_created else scope_dict
+                targets = (
+                    [(to_id, from_id)]
+                    if canon_id == from_id
+                    else ([(from_id, to_id)] if canon_id == to_id else [(from_id, canon_id), (to_id, canon_id)])
                 )
+                did_apply = False
+                for sub_i, (src_id, dst_id) in enumerate(targets):
+                    if _merge_single_concept(
+                        conn,
+                        from_id=src_id,
+                        to_id=dst_id,
+                        evidence=evidence,
+                        batch_id=batch_id,
+                        scope_dict=row_scope,
+                        affected_uids=affected_uids,
+                        sp_name=f"sp_merge_{idx}_{sub_i}",
+                    ):
+                        did_apply = True
+                        applied += 1
+                if not did_apply:
+                    skipped += 1
+            continue
 
-                # 去重迁移 question_concepts 避免主键冲突，优先保留 HUMAN 来源
-                ref_ids = [from_id, *child_ids]
-                ph = ",".join("?" for _ in ref_ids)
-                qc_rows = conn.execute(
-                    f"SELECT question_uid, concept_id, kind, origin FROM question_concepts WHERE concept_id IN ({ph});",
-                    ref_ids,
-                ).fetchall()
-                for qcr in qc_rows:
-                    quid = str(qcr["question_uid"])
-                    affected_uids.add(quid)
-                    conn.execute(
-                        """
-                        INSERT INTO question_concepts(question_uid, concept_id, kind, origin)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(question_uid, concept_id) DO UPDATE SET
-                            origin = CASE WHEN question_concepts.origin = 'HUMAN' OR excluded.origin = 'HUMAN' THEN 'HUMAN' ELSE 'MACHINE' END;
-                        """,
-                        (quid, to_id, row_to["kind"], qcr["origin"]),
-                    )
-                    conn.execute(
-                        "DELETE FROM question_concepts WHERE question_uid = ? AND concept_id = ?;",
-                        (quid, qcr["concept_id"]),
-                    )
-
-                c_scope = {**scope_dict, "kind": row_to["kind"]}
-                conn.execute(
-                    """
-                    INSERT INTO compaction_audit_ledger(
-                        batch_id, target_kind, scope_json, from_id, to_id,
-                        ai_judge_evidence, previous_aliases_to_json, affected_child_ids_json
-                    )
-                    VALUES (?, 'CONCEPT', ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        batch_id,
-                        json.dumps(c_scope, ensure_ascii=False),
-                        from_id,
-                        to_id,
-                        evidence,
-                        json.dumps(prev_aliases, ensure_ascii=False),
-                        json.dumps(child_ids, ensure_ascii=False),
-                    ),
-                )
-
-            conn.execute(f"RELEASE SAVEPOINT {sp_name};")
+        if target_kind == "KNOWLEDGE_NODE":
+            ok = _merge_single_knowledge_node(
+                conn,
+                from_id=from_id,
+                to_id=to_id,
+                evidence=evidence,
+                batch_id=batch_id,
+                scope_dict=scope_dict,
+                affected_uids=affected_uids,
+                sp_name=f"sp_merge_{idx}",
+            )
+        else:
+            ok = _merge_single_concept(
+                conn,
+                from_id=from_id,
+                to_id=to_id,
+                evidence=evidence,
+                batch_id=batch_id,
+                scope_dict=scope_dict,
+                affected_uids=affected_uids,
+                sp_name=f"sp_merge_{idx}",
+            )
+        if ok:
             applied += 1
-        except BaseException:
-            conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-            conn.execute(f"RELEASE SAVEPOINT {sp_name};")
-            raise
+        else:
+            skipped += 1
 
     conn.commit()
 
@@ -531,6 +810,265 @@ def apply_merge_pairs(
     return {
         "batch_id": batch_id,
         "target_kind": target_kind,
+        "applied": applied,
+        "skipped": skipped,
+        "affected_questions": len(affected_uids),
+    }
+
+
+def _attr_or_key(obj: Any, key: str, default: Any = "") -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def apply_cluster_assignments(
+    conn: sqlite3.Connection,
+    *,
+    target_kind: Literal["KNOWLEDGE_NODE", "CONCEPT"],
+    scope_dict: dict[str, Any],
+    canonical_operators: Sequence[dict[str, Any] | Any],
+    assignments: Sequence[dict[str, Any] | Any],
+    batch_id: str,
+    slug: str = "",
+    grade_subject: str = "",
+    taxonomy_version: str = "",
+) -> dict[str, Any]:
+    """将同 L2 域或全局概念 Cluster-then-Assign 结果落库并写入可逆审计账本。"""
+    op_desc: dict[str, str] = {}
+    for op in canonical_operators:
+        cname = str(_attr_or_key(op, "canonical_name", "") or "").strip()
+        if cname:
+            op_desc[cname] = str(_attr_or_key(op, "description", "") or "").strip()
+
+    applied = 0
+    skipped = 0
+    created_canonical = 0
+    affected_uids: set[str] = set()
+
+    if target_kind == "KNOWLEDGE_NODE":
+        eff_gs = (grade_subject or str(scope_dict.get("grade_subject") or "")).strip()
+        eff_tv = (taxonomy_version or str(scope_dict.get("taxonomy_version") or "")).strip()
+        l1_module = str(scope_dict.get("l1_module") or "").strip()
+        l2_entity = str(scope_dict.get("l2_entity") or "").strip()
+        if not eff_gs or not eff_tv or not l1_module or not l2_entity:
+            raise PreconditionError(
+                "PRECONDITION_FAILED: KNOWLEDGE_NODE 聚类归并必须提供完整的 (grade_subject, taxonomy_version, l1_module, l2_entity)"
+            )
+        eff_slug = _resolve_scope_slug(conn, eff_gs, slug)
+
+        active_rows = conn.execute(
+            """
+            SELECT node_id, l3_operator
+            FROM knowledge_nodes
+            WHERE grade_subject = ?
+              AND taxonomy_version = ?
+              AND node_level = 'L3'
+              AND l1_module = ?
+              AND l2_entity = ?
+              AND redirect_to_id IS NULL
+            ORDER BY node_id;
+            """,
+            (eff_gs, eff_tv, l1_module, l2_entity),
+        ).fetchall()
+        by_exact = {str(r["l3_operator"]): str(r["node_id"]) for r in active_rows}
+        by_norm: dict[str, str] = {}
+        for r in active_rows:
+            nk = normalize_label(str(r["l3_operator"]))
+            if nk:
+                by_norm.setdefault(nk, str(r["node_id"]))
+
+        master_cache: dict[str, str] = {}
+        created_masters: set[str] = set()
+        for idx, item in enumerate(assignments):
+            item_id = str(_attr_or_key(item, "item_id", "") or "").strip()
+            raw_l3 = str(_attr_or_key(item, "raw_l3", "") or "").strip()
+            canonical_name = str(_attr_or_key(item, "canonical_name", "") or "").strip()
+            reason = str(_attr_or_key(item, "reason", "") or "").strip()
+            if not canonical_name:
+                skipped += 1
+                continue
+
+            raw_from: str | None = None
+            if item_id:
+                chk = conn.execute(
+                    "SELECT node_id, grade_subject, taxonomy_version, node_level, l1_module, l2_entity FROM knowledge_nodes WHERE node_id = ?;",
+                    (item_id,),
+                ).fetchone()
+                if chk is not None:
+                    if chk["node_level"] != "L3":
+                        raise PreconditionError("PRECONDITION_FAILED: 严禁合并 L2 汇总节点")
+                    if (
+                        chk["grade_subject"] != eff_gs
+                        or chk["taxonomy_version"] != eff_tv
+                        or chk["l1_module"] != l1_module
+                        or chk["l2_entity"] != l2_entity
+                    ):
+                        raise PreconditionError(
+                            f"PRECONDITION_FAILED: 严禁跨作用域归并知识节点: {item_id}"
+                        )
+                    raw_from = str(chk["node_id"])
+            if raw_from is None and raw_l3:
+                raw_from = by_exact.get(raw_l3) or by_norm.get(normalize_label(raw_l3))
+            if raw_from is None:
+                skipped += 1
+                continue
+
+            from_id = find_canonical_node_id(conn, raw_from)
+            if from_id is None:
+                skipped += 1
+                continue
+
+            resolved_to: str | None = None
+            if canonical_name in master_cache:
+                resolved_to = find_canonical_node_id(conn, master_cache[canonical_name])
+                if resolved_to is not None:
+                    master_cache[canonical_name] = resolved_to
+            if resolved_to is None:
+                to_id, created = _ensure_canonical_l3_node(
+                    conn,
+                    grade_subject=eff_gs,
+                    slug=eff_slug,
+                    taxonomy_version=eff_tv,
+                    l1_module=l1_module,
+                    l2_entity=l2_entity,
+                    canonical_name=canonical_name,
+                )
+                master_cache[canonical_name] = to_id
+                if created:
+                    created_masters.add(to_id)
+                    created_canonical += 1
+            else:
+                to_id = resolved_to
+
+            if from_id == to_id:
+                skipped += 1
+                continue
+
+            row_scope = {**scope_dict, "created_master_id": to_id} if to_id in created_masters else scope_dict
+            evidence = f"cluster_assign({canonical_name}): {reason}".strip(": ")
+            ok = _merge_single_knowledge_node(
+                conn,
+                from_id=from_id,
+                to_id=to_id,
+                evidence=evidence,
+                batch_id=batch_id,
+                scope_dict=row_scope,
+                affected_uids=affected_uids,
+                sp_name=f"sp_ca_{idx}",
+            )
+            if ok:
+                applied += 1
+            else:
+                skipped += 1
+    else:
+        kind = str(scope_dict.get("kind") or "").strip().upper()
+        if kind not in ("METHOD", "MOTIF"):
+            raise PreconditionError(f"PRECONDITION_FAILED: 禁止归并概念类型 {kind!r}（TRAP 永不自动归并）")
+
+        active_c = conn.execute(
+            """
+            SELECT concept_id, name
+            FROM concepts
+            WHERE kind = ? AND is_seed = 0 AND redirect_to_id IS NULL
+            ORDER BY concept_id;
+            """,
+            (kind,),
+        ).fetchall()
+        by_exact = {str(r["name"]): str(r["concept_id"]) for r in active_c}
+        by_norm = {}
+        for r in active_c:
+            nk = normalize_label(str(r["name"]))
+            if nk:
+                by_norm.setdefault(nk, str(r["concept_id"]))
+
+        master_cache = {}
+        created_masters = set()
+        for idx, item in enumerate(assignments):
+            item_id = str(_attr_or_key(item, "item_id", "") or "").strip()
+            raw_l3 = str(_attr_or_key(item, "raw_l3", "") or "").strip()
+            canonical_name = str(_attr_or_key(item, "canonical_name", "") or "").strip()
+            reason = str(_attr_or_key(item, "reason", "") or "").strip()
+            if not canonical_name:
+                skipped += 1
+                continue
+
+            raw_from = None
+            if item_id:
+                chk = conn.execute(
+                    "SELECT concept_id, kind, is_seed FROM concepts WHERE concept_id = ?;",
+                    (item_id,),
+                ).fetchone()
+                if chk is not None:
+                    if int(chk["is_seed"]) == 1:
+                        raise PreconditionError("PRECONDITION_FAILED: 严禁合并 is_seed=1 概念")
+                    if str(chk["kind"]) != kind:
+                        raise PreconditionError(
+                            f"PRECONDITION_FAILED: 严禁跨 kind 或对 TRAP 合并概念: {chk['kind']} vs {kind}"
+                        )
+                    raw_from = str(chk["concept_id"])
+            if raw_from is None and raw_l3:
+                raw_from = by_exact.get(raw_l3) or by_norm.get(normalize_label(raw_l3))
+            if raw_from is None:
+                skipped += 1
+                continue
+
+            from_id = find_canonical_concept_id(conn, raw_from)
+            if from_id is None:
+                skipped += 1
+                continue
+
+            resolved_to = None
+            if canonical_name in master_cache:
+                resolved_to = find_canonical_concept_id(conn, master_cache[canonical_name])
+                if resolved_to is not None:
+                    master_cache[canonical_name] = resolved_to
+            if resolved_to is None:
+                to_id, created = _ensure_canonical_concept(
+                    conn,
+                    kind=kind,  # type: ignore[arg-type]
+                    canonical_name=canonical_name,
+                    description=op_desc.get(canonical_name, ""),
+                )
+                master_cache[canonical_name] = to_id
+                if created:
+                    created_masters.add(to_id)
+                    created_canonical += 1
+            else:
+                to_id = resolved_to
+
+            if from_id == to_id:
+                skipped += 1
+                continue
+
+            row_scope = {**scope_dict, "created_master_id": to_id} if to_id in created_masters else scope_dict
+            evidence = f"cluster_assign({canonical_name}): {reason}".strip(": ")
+            ok = _merge_single_concept(
+                conn,
+                from_id=from_id,
+                to_id=to_id,
+                evidence=evidence,
+                batch_id=batch_id,
+                scope_dict=row_scope,
+                affected_uids=affected_uids,
+                sp_name=f"sp_ca_{idx}",
+            )
+            if ok:
+                applied += 1
+            else:
+                skipped += 1
+
+    conn.commit()
+
+    if target_kind == "KNOWLEDGE_NODE" and affected_uids:
+        for uid in sorted(affected_uids):
+            effective.recompute(conn, uid)
+        conn.commit()
+
+    return {
+        "batch_id": batch_id,
+        "target_kind": target_kind,
+        "canonical_nodes_created": created_canonical,
         "applied": applied,
         "skipped": skipped,
         "affected_questions": len(affected_uids),
@@ -594,12 +1132,19 @@ def revert_merge_batch(
     with CompileLock(lock_path):
         conn.execute("BEGIN IMMEDIATE;")
         try:
+            created_masters_to_check: dict[tuple[str, str], None] = {}
             for r in batch_rows:
                 kind = str(r["target_kind"])
                 from_id = str(r["from_id"])
                 to_id = str(r["to_id"])
                 prev_aliases = str(r["previous_aliases_to_json"] or "[]")
                 child_ids: list[str] = list(json.loads(r["affected_child_ids_json"] or "[]"))
+                try:
+                    sc_obj = json.loads(r["scope_json"] or "{}")
+                    if isinstance(sc_obj, dict) and sc_obj.get("created_master_id"):
+                        created_masters_to_check[(kind, str(sc_obj["created_master_id"]))] = None
+                except ValueError:
+                    pass
 
                 if kind == "KNOWLEDGE_NODE":
                     conn.execute(
@@ -643,6 +1188,57 @@ def revert_merge_batch(
                     "UPDATE compaction_audit_ledger SET is_reverted = 1, reverted_at = datetime('now') WHERE merge_id = ?;",
                     (r["merge_id"],),
                 )
+
+            # 清理本批新建且已无任何引用/子节点悬挂的规范主节点，确保回滚 100% 无损
+            for kind, mid in created_masters_to_check:
+                if kind == "KNOWLEDGE_NODE":
+                    m_row = conn.execute(
+                        "SELECT node_level, redirect_to_id FROM knowledge_nodes WHERE node_id = ?;",
+                        (mid,),
+                    ).fetchone()
+                    if m_row is None or m_row["node_level"] != "L3" or m_row["redirect_to_id"] is not None:
+                        continue
+                    has_ref = (
+                        conn.execute("SELECT 1 FROM question_steps WHERE m_knowledge_node_id = ? LIMIT 1;", (mid,)).fetchone()
+                        is not None
+                        or conn.execute("SELECT 1 FROM knowledge_nodes WHERE redirect_to_id = ? LIMIT 1;", (mid,)).fetchone()
+                        is not None
+                        or conn.execute(
+                            "SELECT 1 FROM knowledge_edges WHERE source_node_id = ? OR target_node_id = ? LIMIT 1;",
+                            (mid, mid),
+                        ).fetchone()
+                        is not None
+                        or conn.execute("SELECT 1 FROM practice_log WHERE stuck_node_id = ? LIMIT 1;", (mid,)).fetchone()
+                        is not None
+                        or conn.execute(
+                            "SELECT 1 FROM human_overrides WHERE is_active = 1 AND override_value LIKE ? LIMIT 1;",
+                            (f"%{mid}%",),
+                        ).fetchone()
+                        is not None
+                    )
+                    if not has_ref:
+                        conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?;", (mid,))
+                else:
+                    c_row = conn.execute(
+                        "SELECT is_seed, redirect_to_id FROM concepts WHERE concept_id = ?;",
+                        (mid,),
+                    ).fetchone()
+                    if c_row is None or int(c_row["is_seed"]) == 1 or c_row["redirect_to_id"] is not None:
+                        continue
+                    has_ref = (
+                        conn.execute("SELECT 1 FROM question_concepts WHERE concept_id = ? LIMIT 1;", (mid,)).fetchone()
+                        is not None
+                        or conn.execute("SELECT 1 FROM concepts WHERE redirect_to_id = ? LIMIT 1;", (mid,)).fetchone()
+                        is not None
+                        or conn.execute(
+                            "SELECT 1 FROM human_overrides WHERE is_active = 1 AND override_value LIKE ? LIMIT 1;",
+                            (f"%{mid}%",),
+                        ).fetchone()
+                        is not None
+                    )
+                    if not has_ref:
+                        conn.execute("DELETE FROM concepts WHERE concept_id = ?;", (mid,))
+
             conn.commit()
         except BaseException:
             conn.rollback()
