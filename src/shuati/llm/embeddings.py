@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import sqlite3
 import time
+import urllib.parse
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,16 @@ class _AsyncRPMBucket:
                     return
                 wait_sec = (1.0 - self.tokens) / self.rate
             await sleep_fn(min(wait_sec, 1.0))
+
+
+def _is_loopback_base_url(base_url: str) -> bool:
+    """判断 Embedding base_url 是否指向本机回环地址（localhost / 127.0.0.1 / ::1）。"""
+    try:
+        parsed = urllib.parse.urlparse((base_url or "").strip())
+        host = (parsed.hostname or "").strip().lower()
+    except ValueError:
+        return False
+    return host in {"localhost", "127.0.0.1", "::1"}
 
 
 def _l2_normalize_rows(arr: np.ndarray) -> np.ndarray:
@@ -214,15 +225,15 @@ class EmbeddingClient:
                 _insert(self.conn)
 
     async def _embed_openai_batch(self, batch: list[str], stage: str) -> np.ndarray:
-        if not self.cfg.api_key:
+        api_key = (self.cfg.api_key or "").strip()
+        if not api_key and not _is_loopback_base_url(self.cfg.base_url):
             raise PreconditionError(
                 "未配置 EMBEDDING_API_KEY（或 llm.embedding.api_key），请先配置后再执行向量化，或传 --mock。"
             )
         url = f"{self.cfg.base_url.rstrip('/')}/embeddings"
-        headers = {
-            "Authorization": f"Bearer {self.cfg.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         body = {"model": self.cfg.model, "input": batch}
         client = await self._get_client()
         max_retries = max(0, int(self.cfg.max_retries))

@@ -34,7 +34,10 @@ from shuati.models.domain import (
     Envelope,
     ErrorDetail,
 )
-from shuati.pipeline.stage0_ingest import run_stage0_ingest
+from shuati.pipeline.stage0_ingest import (
+    run_stage0_ingest,
+    sync_cold_start_learners_if_seeded,
+)
 from shuati.pipeline.stage1_solve import run_stage1_compile
 from shuati.review.server import serve_review
 
@@ -123,12 +126,18 @@ def version(
 
 @app.command()
 def ingest(
-    root: Path = typer.Option(Path("题库"), "--root", help="原始题库根目录"),
+    root: list[Path] | None = typer.Option(
+        None,
+        "--root",
+        help="原始题库根目录（可多次传参；省略时读取 settings.yaml 的 ingest.roots）",
+    ),
     grade_subject: str | None = typer.Option(
         None, "--grade-subject", help="显式指定学段学科（仅限单集合导入）"
     ),
-    dedup_near: bool = typer.Option(
-        False, "--dedup-near", help="开启 plain_fingerprint+dHash 近重复归并"
+    dedup_near: bool | None = typer.Option(
+        None,
+        "--dedup-near/--no-dedup-near",
+        help="开启/关闭 plain_fingerprint+dHash 近重复归并（默认读取 settings.yaml 的 ingest.dedup_near_default）",
     ),
     apply_retire: bool = typer.Option(
         False, "--apply-retire", help="下架源端已消失的题目 (is_retired=1)"
@@ -145,14 +154,22 @@ def ingest(
     """Stage 0：数据入库体检与清洗。"""
     t0 = time.time()
     try:
+        settings = load_settings(config_dir / "settings.yaml")
+        resolved_roots: list[Path | str] = (
+            list(root) if root else list(settings.ingest.roots or ["题库"])
+        )
+        resolved_dedup_near = (
+            bool(dedup_near) if dedup_near is not None else bool(settings.ingest.dedup_near_default)
+        )
         report = run_stage0_ingest(
             db_path=db,
-            root_dir=root,
+            root_dir=resolved_roots[0],
+            root_dirs=resolved_roots,
             config_dir=config_dir,
             assets_dir=assets_dir,
             reports_dir=reports_dir,
             grade_subject_override=grade_subject,
-            dedup_near=dedup_near,
+            dedup_near=resolved_dedup_near,
             apply_retire=apply_retire,
             dry_run=dry_run,
         )
@@ -205,6 +222,7 @@ def grade_subject_add(
         repository.add_grade_subject(
             conn, name=name, slug=slug, family=family, display_name=display_name
         )
+        sync_cold_start_learners_if_seeded(conn, config_dir)
         duration_ms = int((time.time() - t0) * 1000)
         output_envelope(
             "grade-subject.add",
@@ -406,6 +424,39 @@ def human_verify(
             conn.close()
 
 
+@human_app.command(name="reset")
+def human_reset(
+    learner_id: str = typer.Option("default", "--learner-id", help="重置后的默认学习者 ID"),
+    learner_name: str = typer.Option("默认学习者", "--learner-name", help="重置后的默认学习者名称"),
+    subject: str = typer.Option("小学奥数", "--subject", help="默认学段学科"),
+    archive_dir: Path = typer.Option(Path("data/backups"), "--archive-dir", help="旧资产无损归档目录"),
+    human_dir: Path | None = typer.Option(
+        None, "--human-dir", help="人工镜像目录（省略时读取 settings.yaml 的 human_mirror.dir）"
+    ),
+    db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+    config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="仅预览归档与清理范围，不写磁盘与数据库"),
+    json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+) -> None:
+    """无损归档既有 human/*.jsonl 并重置为干净单学习者起跑态。"""
+    from shuati.services.compiler_tools import reset_human_workspace
+
+    _run_cli_action(
+        "human.reset",
+        json,
+        lambda: reset_human_workspace(
+            learner_id=learner_id,
+            learner_name=learner_name,
+            subject=subject,
+            archive_dir=archive_dir,
+            human_dir=human_dir,
+            db_path=db,
+            config_dir=config_dir,
+            dry_run=dry_run,
+        ),
+    )
+
+
 @app.command()
 def reindex(
     fts: bool = typer.Option(False, "--fts", help="全量重建 FTS5 全文索引"),
@@ -580,6 +631,13 @@ def compile_stage(
                     force=force,
                     include_human_verified=include_human_verified,
                     use_mock=mock,
+                    mode=norm_mode,  # type: ignore[arg-type]
+                    tasks_dir=tasks_dir or Path("data/unified/stage3_4/stage1"),
+                    results_path=results,
+                    batch_size=batch_size or 10,
+                    subagent_model=subagent_model,
+                    prompt_profile=prompt_profile,
+                    overwrite_pending=overwrite_pending,
                 )
             )
             data_out: dict[str, Any] = asdict(res)

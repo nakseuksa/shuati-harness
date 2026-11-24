@@ -51,6 +51,18 @@ class Stage1SecondaryOutput(BaseModel):
     final_answers: list[AnswerPart] = Field(min_length=1)
 
 
+class Stage1SubagentItem(Stage1PrimaryOutput):
+    """Subagent 脱敏批处理 Stage 1 单题输出（继承 Stage1PrimaryOutput，保持 visual_facts 首位）。"""
+
+    task_item_id: str = Field(min_length=1)
+
+
+class Stage1SubagentBatchOutput(BaseModel):
+    """Subagent 脱敏批处理 Stage 1 批输出容器（用于 export/import 破除锚点冷启动死锁）。"""
+
+    items: list[Stage1SubagentItem] = Field(default_factory=list)
+
+
 class QualitativeJudgeOutput(BaseModel):
     """定性/作图小问等价裁判输出。"""
 

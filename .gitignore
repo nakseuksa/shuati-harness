@@ -11,5 +11,5 @@ data/
 htmlcov/
 .env
 题库/
-.agents/
+.agents/teamwork/
 .pi/

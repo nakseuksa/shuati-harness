@@ -178,6 +178,11 @@ class HumanMirrorConfig(BaseModel):
     backups_keep: int = 10
 
 
+class IngestConfig(BaseModel):
+    roots: list[str] = Field(default_factory=lambda: ["题库"])
+    dedup_near_default: bool = True
+
+
 KNOWN_SUBAGENT_MODELS: frozenset[str] = frozenset(
     {
         "gemini-4-neon-medium",
@@ -253,6 +258,7 @@ class Settings(BaseModel):
     composer: ComposerConfig = Field(default_factory=ComposerConfig)
     topology: TopologyConfig = Field(default_factory=TopologyConfig)
     human_mirror: HumanMirrorConfig = Field(default_factory=HumanMirrorConfig)
+    ingest: IngestConfig = Field(default_factory=IngestConfig)
     subagent: SubagentConfig = Field(default_factory=SubagentConfig)
 
 

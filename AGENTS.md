@@ -21,3 +21,13 @@
      3. `*_report.md`（汇报/验收报告）：面向用户 Review 的高密度结论视图（交付概览、验收矩阵 PASS/FAIL、非阻断建议与待拍板项），细节通过链接指向同批 `decisions` 与 `execution`。
    - **与内部协作目录衔接**: `.agents/teamwork/<role>/` 继续承载多智能体内部协作契约、Handoff 与 Repro 审查过程稿（多轮审查只增不删历史轮次），最终通过三件套汇总向用户交付。
 6. **批处理编排与 Windows 工程经验沉淀**: 详见 [.agents/rules/shuati_ops_lessons.md](.agents/rules/shuati_ops_lessons.md)（每次批编译、数据源扩充与测试环境排障均须遵守）。
+
+## 内置三套 Skill 职责路由表
+
+项目通过 `.agents/skills.json`（AGY 开箱自动发现）与 `shuati skill install --all`（`pi` 同步挂载）提供三套分工明确的内置 Skill：
+
+| Skill | 路径 | 职责边界与触发时机 |
+| :--- | :--- | :--- |
+| **`shuati-init`** | [skills/shuati-init/SKILL.md](skills/shuati-init/SKILL.md) | 首次 `git clone` 冷启动初始化（`.venv`、净仓/换机恢复分流、外部只读 `problems.jsonl` 挂载、`shuati doctor` 体检、新学段提示词与黄金锚点一屏定标、20～25 题烟测及首轮 `DRAFT` 全图谱编译） |
+| **`shuati-compiler`** | [skills/shuati-compiler/SKILL.md](skills/shuati-compiler/SKILL.md) | 日常四路增量编译与词表演进（`status` + `ingest --dry-run` 开场双检、同学段加题与向量漂移重算、源题勘误局部重编、新学段桥接 `shuati-init` 定标、`DRAFT → LOCKED 1.0` 锁表、Swarm 精确锁模编排与批诊断预检） |
+| **`shuati`** | [skills/shuati/SKILL.md](skills/shuati/SKILL.md) | 日常自适应刷题与诊断（学习者画像、知识树浏览、ZPD 梯度组卷、离线 HTML 双模式练习单、防剧透苏格拉底式讲题、`check` 判题与新错题诊断入库） |

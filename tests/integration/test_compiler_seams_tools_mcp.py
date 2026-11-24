@@ -682,6 +682,8 @@ def test_mcp_roles_and_worker_physical_isolation(tmp_path: Path) -> None:
         "pipeline_status",
         "diagnose_preflight",
         "ingest_dry_run",
+        "doctor",
+        "anchors_sample",
     ]
     assert practice_tools == [
         "learner_list",

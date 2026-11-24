@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json as json_lib
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -63,13 +64,15 @@ def _parse_optional_json_dict(raw: str | None) -> dict[str, Any] | None:
 
 
 def register_compiler_commands(app: typer.Typer, run_cli_action: Any) -> None:
-    """向主 Typer CLI 注册 prompt / tool / status / diagnose-preflight / mcp 命令。"""
+    """向主 Typer CLI 注册 prompt / tool / status / doctor / anchors / diagnose-preflight / mcp 命令。"""
     prompt_app = typer.Typer(name="prompt", help="三层提示词接缝治理（list / render / lint）")
     tool_app = typer.Typer(name="tool", help="零 DB 无状态自检核工具（verify-sympy / validate-draft）")
+    anchors_app = typer.Typer(name="anchors", help="黄金难度锚点抽样与辅助工具")
     mcp_app = typer.Typer(name="mcp", help="角色物理隔离 stdio MCP 服务")
 
     app.add_typer(prompt_app)
     app.add_typer(tool_app)
+    app.add_typer(anchors_app)
     app.add_typer(mcp_app)
 
     # 1. shuati prompt list / render / lint
@@ -295,3 +298,82 @@ def register_compiler_commands(app: typer.Typer, run_cli_action: Any) -> None:
         )
         if code != 0:
             raise typer.Exit(code=code)
+
+    # 6. shuati doctor
+    @app.command(name="doctor")
+    def doctor_cmd(
+        check_llm_api: bool = typer.Option(
+            False, "--check-llm-api", help="是否探测 LLM API 槽位连通性（Swarm 免 Key 模式可跳过）"
+        ),
+        mock: bool | None = typer.Option(None, "--mock/--no-mock", help="使用离线 Mock Embedding / LLM 探针"),
+        db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+        config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
+        json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+    ) -> None:
+        """冷启动与环境健康自检（无需已存在数据库；实测 SymPy 沙盒与真实 Embedding 维度）。"""
+        from shuati.cli.main import output_envelope
+        from shuati.models.domain import EXIT_INTERNAL, EXIT_OK, EXIT_PRECONDITION, ErrorDetail
+        from shuati.services.compiler_tools import run_doctor
+
+        t0 = time.time()
+        try:
+            res = run_doctor(
+                db_path=db,
+                config_dir=config_dir,
+                check_llm_api=check_llm_api,
+                use_mock=mock,
+            )
+            duration_ms = int((time.time() - t0) * 1000)
+            warnings = [str(w) for w in res.get("warnings", [])]
+            if res.get("ok"):
+                output_envelope(
+                    "doctor",
+                    data=res,
+                    warnings=warnings,
+                    meta={"duration_ms": duration_ms},
+                    as_json=json,
+                    exit_code=EXIT_OK,
+                )
+            else:
+                err_msg = "; ".join(str(e) for e in res.get("errors", [])) or "环境健康自检未通过"
+                output_envelope(
+                    "doctor",
+                    data=res,
+                    warnings=warnings,
+                    error=ErrorDetail(code="PRECONDITION_FAILED", message=err_msg),
+                    meta={"duration_ms": duration_ms},
+                    as_json=json,
+                    exit_code=EXIT_PRECONDITION,
+                )
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            duration_ms = int((time.time() - t0) * 1000)
+            output_envelope(
+                "doctor",
+                error=ErrorDetail(code="INTERNAL_ERROR", message=str(exc)),
+                meta={"duration_ms": duration_ms},
+                as_json=json,
+                exit_code=EXIT_INTERNAL,
+            )
+
+    # 7. shuati anchors sample
+    @anchors_app.command(name="sample")
+    def anchors_sample_cmd(
+        grade_subject: str = typer.Option(..., "--grade-subject", help="目标学段学科"),
+        count: int = typer.Option(6, "--count", min=1, help="分层抽样候选锚点题数"),
+        db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
+        json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
+    ) -> None:
+        """只读分层抽样候选黄金难度锚点题目（跨长度分位与有图/无图，严禁泄露章节）。"""
+        from shuati.services.compiler_tools import sample_anchor_candidates
+
+        run_cli_action(
+            "anchors.sample",
+            json,
+            lambda: sample_anchor_candidates(
+                db_path=db,
+                grade_subject=grade_subject,
+                count=count,
+            ),
+        )

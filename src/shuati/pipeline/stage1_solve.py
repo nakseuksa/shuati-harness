@@ -10,11 +10,16 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
-from shuati.config import Settings, load_settings
+from shuati.config import (
+    Settings,
+    load_settings,
+    resolve_subagent_model,
+    validate_subagent_model_id,
+)
 from shuati.core import effective, refresh
 from shuati.db import repository
 from shuati.db.connection import (
@@ -31,6 +36,7 @@ from shuati.llm.prompt_builder import (
     build_qualitative_judge_messages,
     build_stage1_messages,
 )
+from shuati.llm.seam_loader import load_prompt_seams
 from shuati.models.domain import AnswerPart
 from shuati.models.schemas import (
     MultiSolutionJudgeOutput,
@@ -38,6 +44,12 @@ from shuati.models.schemas import (
     Stage1Input,
     Stage1PrimaryOutput,
     Stage1SecondaryOutput,
+    Stage1SubagentBatchOutput,
+)
+from shuati.pipeline.subagent_bridge import (
+    _atomic_write_text,
+    export_task_batches,
+    load_and_validate_results,
 )
 from shuati.verify.answer_parts import normalize_answer_parts
 from shuati.verify.equivalence import EquivalenceSummary, compare_answer_parts
@@ -57,6 +69,16 @@ class Stage1BatchResult:
     failed: int
     multi_solution_count: int
     errors: list[dict[str, Any]] = field(default_factory=list)
+    mode: str = "api"
+    exported_questions: int = 0
+    batch_count: int = 0
+    subagent_model: str = ""
+    manifest: dict[str, Any] | None = None
+    ingested: int = 0
+    skipped_locked: int = 0
+    batch_errors: int = 0
+    manifest_status: str = ""
+    retry_file: str | None = None
 
 
 def compute_stage1_input_hash(
@@ -429,6 +451,641 @@ async def _run_sympy_for_parts(
     )
 
 
+def _resolve_stage1_seam_meta(
+    config_dir: Path,
+    grade_subject: str,
+    prompt_profile: str | None,
+) -> tuple[str, str]:
+    if (config_dir / "prompts" / "default.yaml").is_file() or (
+        prompt_profile is not None and prompt_profile.strip()
+    ):
+        bundle = load_prompt_seams(
+            config_dir=config_dir,
+            grade_subject=grade_subject,
+            profile=prompt_profile,
+        )
+        return (
+            bundle.prompt_versions.get("stage1", STAGE1_PROMPT_VERSION),
+            bundle.prompt_digest,
+        )
+    return STAGE1_PROMPT_VERSION, ""
+
+
+def _build_stage1_batch_messages(
+    chunk_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """将同批 Stage 1 题目组装为 Stage1SubagentBatchOutput 脱敏批处理消息。"""
+    base_system = str(chunk_items[0]["messages"][0]["content"])
+    batch_system = (
+        f"{base_system}\n\n"
+        "【批处理包装要求（Stage1SubagentBatchOutput）】\n"
+        "本批次包含一道或多道独立题目（每题以 `task_item_id` 唯一标识）。\n"
+        '请严格输出单个合法 JSON 对象：`{"items": [ <每题对应的 Stage1SubagentItem 对象，原样回填 task_item_id，且 visual_facts 必须排在每题对象首位> ]}`，'
+        "确保本批次全部 `task_item_id` 100% 覆盖且无任何遗漏。"
+    )
+
+    has_images = any(isinstance(it["messages"][1]["content"], list) for it in chunk_items)
+    if not has_images:
+        blocks = [
+            f"### 批次题目 {idx}（task_item_id={it['task_item_id']}）\n\n{it['messages'][1]['content']}"
+            for idx, it in enumerate(chunk_items, start=1)
+        ]
+        return [
+            {"role": "system", "content": batch_system},
+            {"role": "user", "content": "\n\n========================================\n\n".join(blocks)},
+        ]
+
+    merged_parts: list[dict[str, Any]] = []
+    for idx, it in enumerate(chunk_items, start=1):
+        merged_parts.append(
+            {
+                "type": "text",
+                "text": f"### 批次题目 {idx}（task_item_id={it['task_item_id']}）",
+            }
+        )
+        content = it["messages"][1]["content"]
+        if isinstance(content, list):
+            merged_parts.extend(content)
+        else:
+            merged_parts.append({"type": "text", "text": str(content)})
+
+    return [
+        {"role": "system", "content": batch_system},
+        {"role": "user", "content": merged_parts},
+    ]
+
+
+async def _run_stage1_export(
+    *,
+    db_p: Path,
+    cfg_dir: Path,
+    assets_path: Path,
+    settings: Settings,
+    grade_subject: str | None,
+    only_uids: list[str] | None,
+    stress_test_25: bool,
+    force: bool,
+    include_human_verified: bool,
+    tasks_dir: Path | str,
+    batch_size: int,
+    subagent_model: str | None,
+    prompt_profile: str | None,
+    overwrite_pending: bool,
+) -> Stage1BatchResult:
+    if not db_p.exists():
+        raise PreconditionError(f"PRECONDITION_FAILED: 数据库不存在: {db_p}")
+    try:
+        resolved_model = resolve_subagent_model(settings, "stage1", subagent_model)
+    except ValueError as exc:
+        raise PreconditionError(f"PRECONDITION_FAILED: {exc}") from exc
+
+    with closing(get_connection(db_p, readonly=True)) as conn:
+        target_uids: list[str] | None = None
+        if stress_test_25:
+            target_uids = _load_stress_test_25_uids(cfg_dir)
+        if only_uids:
+            resolved_only = _dedupe_preserve_order(
+                [repository.resolve_question_uid(conn, u) for u in only_uids]
+            )
+            if target_uids is not None:
+                allowed_set = set(resolved_only)
+                target_uids = [u for u in target_uids if u in allowed_set]
+            else:
+                target_uids = resolved_only
+
+        where_clauses = ["q.is_retired = 0", "q.eff_is_excluded = 0"]
+        params: list[Any] = []
+        if grade_subject:
+            where_clauses.append("q.grade_subject = ?")
+            params.append(grade_subject)
+        if target_uids is not None:
+            if not target_uids:
+                return Stage1BatchResult(
+                    0, 0, 0, 0, 0, 0, 0, 0, [],
+                    mode="export", subagent_model=resolved_model,
+                )
+            placeholders = ",".join("?" for _ in target_uids)
+            where_clauses.append(f"q.question_uid IN ({placeholders})")
+            params.extend(target_uids)
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                q.question_uid, q.grade_subject, q.cas_images_json, q.image_captions_json,
+                q.has_images, q.eff_question_text, q.eff_options_json, q.eff_format,
+                q.eff_verification_status,
+                rq.content_hash AS rq_content_hash,
+                cs.status AS cs_status, cs.input_hash AS cs_input_hash,
+                cs.model_name AS cs_model_name
+            FROM questions q
+            JOIN raw_questions rq ON rq.question_uid = q.question_uid
+            LEFT JOIN compile_state cs
+                ON q.question_uid = cs.question_uid AND cs.stage = 'S1'
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY q.question_uid ASC
+            """,
+            params,
+        ).fetchall()
+
+    res_export = Stage1BatchResult(
+        total_candidates=len(rows),
+        processed=0,
+        skipped_ok=0,
+        skipped_human_verified=0,
+        verified_consensus=0,
+        needs_review=0,
+        failed=0,
+        multi_solution_count=0,
+        errors=[],
+        mode="export",
+        subagent_model=resolved_model,
+    )
+
+    export_items: list[dict[str, Any]] = []
+    task_items_meta: dict[str, dict[str, Any]] = {}
+    seam_ver = STAGE1_PROMPT_VERSION
+    seam_digest = ""
+
+    for row in rows:
+        uid = str(row["question_uid"])
+        if row["eff_verification_status"] == "HUMAN_VERIFIED" and not include_human_verified:
+            res_export.skipped_human_verified += 1
+            continue
+
+        cs_status = str(row["cs_status"] or "PENDING")
+        cs_hash = str(row["cs_input_hash"] or "")
+        cs_model = str(row["cs_model_name"] or "")
+        rq_hash = str(row["rq_content_hash"] or "")
+        is_subagent_locked = (
+            cs_status == "OK"
+            and (cs_model == "subagent-unified" or cs_model.startswith("subagent:"))
+            and cs_hash == rq_hash
+        )
+        already_verified_ok = (
+            cs_status == "OK" and row["eff_verification_status"] == "VERIFIED_CONSENSUS"
+        )
+        if not force and (is_subagent_locked or already_verified_ok):
+            res_export.skipped_ok += 1
+            res_export.skipped_locked += 1
+            continue
+
+        cas_images = [str(x) for x in (json.loads(row["cas_images_json"] or "[]") or [])]
+        image_captions = [str(x) for x in (json.loads(row["image_captions_json"] or "[]") or [])]
+        options: dict[str, str] = {}
+        if row["eff_format"] == "选择题":
+            try:
+                parsed_opts = json.loads(row["eff_options_json"] or "{}")
+                if isinstance(parsed_opts, dict):
+                    options = {str(k): str(v) for k, v in parsed_opts.items()}
+            except Exception:
+                options = {}
+
+        inp = Stage1Input(
+            question_uid=uid,
+            grade_subject=str(row["grade_subject"]),
+            question_text=str(row["eff_question_text"]),
+            cas_images=cas_images,
+            image_captions=image_captions,
+            options=options,
+            has_images=bool(row["has_images"] or len(cas_images) > 0),
+        )
+        inp_text_only = inp.model_copy(
+            update={"cas_images": [], "image_captions": [], "has_images": False}
+        )
+        base_msgs = build_stage1_messages(
+            inp_text_only,
+            role="PRIMARY",
+            assets_dir=assets_path,
+            config_dir=cfg_dir,
+            prompt_profile=prompt_profile,
+        )
+        seam_ver, seam_digest = _resolve_stage1_seam_meta(
+            cfg_dir, inp.grade_subject, prompt_profile
+        )
+        if cas_images:
+            user_text = str(base_msgs[1]["content"])
+            user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+            for idx, cas_img in enumerate(cas_images, start=1):
+                cap = image_captions[idx - 1].strip() if idx - 1 < len(image_captions) else ""
+                label_text = f"【配图 {idx}（{cap}）】" if cap else f"【配图 {idx}】"
+                user_parts.append({"type": "text", "text": label_text})
+                img_path_str = (
+                    (assets_path / cas_img).as_posix()
+                    if "/" not in cas_img and "\\" not in cas_img
+                    else cas_img
+                )
+                user_parts.append(
+                    {
+                        "type": "image_path",
+                        "image_path": img_path_str,
+                        "index": idx,
+                        "caption": cap,
+                    }
+                )
+            base_msgs[1]["content"] = user_parts
+
+        task_item_id = f"s1_{len(export_items) + 1:04d}"
+        export_items.append({"task_item_id": task_item_id, "messages": base_msgs})
+        task_items_meta[task_item_id] = {
+            "question_uid": uid,
+            "content_hash": rq_hash,
+            "grade_subject": inp.grade_subject,
+            "question_text": inp.question_text,
+            "options": options,
+            "has_images": inp.has_images,
+        }
+
+    eff_bs = max(1, int(batch_size))
+    batches: list[dict[str, Any]] = []
+    for b_idx, start in enumerate(range(0, len(export_items), eff_bs), start=1):
+        chunk = export_items[start : start + eff_bs]
+        batches.append(
+            {
+                "batch_id": f"stage1_batch_{b_idx:04d}",
+                "messages": _build_stage1_batch_messages(chunk),
+                "task_item_ids": [item["task_item_id"] for item in chunk],
+            }
+        )
+
+    task_map = {
+        "grade_subject": grade_subject or "",
+        "prompt_version": seam_ver,
+        "subagent_model": resolved_model,
+        "items": task_items_meta,
+    }
+    manifest = export_task_batches(
+        "stage1",
+        batches,
+        task_map,
+        tasks_dir,
+        schema_cls=Stage1SubagentBatchOutput,
+        subagent_model=resolved_model,
+        prompt_version=seam_ver,
+        prompt_digest=seam_digest,
+        prompt_profile=prompt_profile,
+        max_parallel_workers=settings.subagent.max_parallel_workers,
+        overwrite_pending=overwrite_pending,
+    )
+    res_export.exported_questions = len(export_items)
+    res_export.batch_count = len(batches)
+    res_export.manifest = manifest
+    res_export.manifest_status = str(manifest.get("status") or "")
+    return res_export
+
+
+async def _run_stage1_import(
+    *,
+    db_p: Path,
+    cfg_dir: Path,
+    lock_path: Path,
+    writer: SingleWriterExecutor,
+    settings: Settings,
+    force: bool,
+    include_human_verified: bool,
+    tasks_dir: Path | str,
+    results_path: Path | str | None,
+    subagent_model: str | None,
+) -> Stage1BatchResult:
+    if results_path is None:
+        raise PreconditionError("PRECONDITION_FAILED: --mode import 必须提供 --results")
+    tasks_base = Path(tasks_dir)
+    task_map_file = tasks_base / "stage1_task_map.json"
+    manifest_file = tasks_base / "stage1_manifest.json"
+
+    valid_by_batch, loaded_map, bridge_errs = load_and_validate_results(
+        "stage1",
+        results_path,
+        task_map_file,
+        Stage1SubagentBatchOutput,
+        retry_dir=tasks_base,
+        verify_item_completeness=True,
+        id_extractor=lambda out: {it.task_item_id for it in out.items},
+    )
+
+    manifest_data: dict[str, Any] = {}
+    if manifest_file.is_file():
+        try:
+            loaded_mf = json.loads(manifest_file.read_text(encoding="utf-8"))
+            if isinstance(loaded_mf, dict):
+                manifest_data = loaded_mf
+        except Exception:
+            manifest_data = {}
+
+    if subagent_model is not None and subagent_model.strip():
+        try:
+            resolved_model = validate_subagent_model_id(subagent_model)
+        except ValueError as exc:
+            raise PreconditionError(f"PRECONDITION_FAILED: {exc}") from exc
+    elif str(manifest_data.get("subagent_model") or "").strip():
+        try:
+            resolved_model = validate_subagent_model_id(str(manifest_data["subagent_model"]))
+        except ValueError as exc:
+            raise PreconditionError(f"PRECONDITION_FAILED: {exc}") from exc
+    else:
+        resolved_model = resolve_subagent_model(settings, "stage1", None)
+
+    model_name_to_write = f"subagent:{resolved_model}"
+    prompt_version_to_write = str(manifest_data.get("prompt_version") or STAGE1_PROMPT_VERSION)
+    items_meta = loaded_map.get("items") or {}
+
+    res_import = Stage1BatchResult(
+        total_candidates=len(items_meta) if isinstance(items_meta, dict) else 0,
+        processed=0,
+        skipped_ok=0,
+        skipped_human_verified=0,
+        verified_consensus=0,
+        needs_review=0,
+        failed=0,
+        multi_solution_count=0,
+        errors=[],
+        mode="import",
+        subagent_model=resolved_model,
+    )
+    item_errors: list[dict[str, Any]] = []
+
+    with CompileLock(lock_path), closing(get_connection(db_p)) as conn:
+        init_db(conn, config_dir=cfg_dir)
+        effective.install_eff_write_guard(conn)
+
+        for batch_id, batch_out in valid_by_batch.items():
+            for out_item in batch_out.items:
+                meta = items_meta.get(out_item.task_item_id)
+                if not isinstance(meta, dict):
+                    item_errors.append(
+                        {
+                            "batch_id": batch_id,
+                            "task_item_id": out_item.task_item_id,
+                            "error_code": "UNKNOWN_TASK_ID",
+                            "error": f"task_map 中不存在 task_item_id={out_item.task_item_id!r}",
+                        }
+                    )
+                    continue
+
+                uid = str(meta["question_uid"])
+                expected_hash = str(meta.get("content_hash") or "")
+                db_row = conn.execute(
+                    """
+                    SELECT rq.content_hash,
+                           q.is_retired, q.eff_is_excluded, q.eff_verification_status,
+                           q.grade_subject, q.eff_options_json,
+                           cs.status AS cs_status, cs.model_name AS cs_model, cs.input_hash AS cs_hash
+                    FROM raw_questions rq
+                    JOIN questions q ON q.question_uid = rq.question_uid
+                    LEFT JOIN compile_state cs ON cs.question_uid = rq.question_uid AND cs.stage = 'S1'
+                    WHERE rq.question_uid = ?
+                    """,
+                    (uid,),
+                ).fetchone()
+                if db_row is None:
+                    item_errors.append(
+                        {
+                            "batch_id": batch_id,
+                            "task_item_id": out_item.task_item_id,
+                            "question_uid": uid,
+                            "error_code": "QUESTION_NOT_FOUND",
+                            "error": f"题目不存在: {uid}",
+                        }
+                    )
+                    continue
+
+                if int(db_row["is_retired"]) != 0 or int(db_row["eff_is_excluded"]) != 0:
+                    item_errors.append(
+                        {
+                            "batch_id": batch_id,
+                            "task_item_id": out_item.task_item_id,
+                            "question_uid": uid,
+                            "error_code": "INELIGIBLE_POST_EXPORT",
+                            "error": "导出后题目已退库或被排除",
+                        }
+                    )
+                    continue
+
+                if db_row["eff_verification_status"] == "HUMAN_VERIFIED" and not include_human_verified:
+                    res_import.skipped_human_verified += 1
+                    continue
+
+                current_hash = str(db_row["content_hash"] or "")
+                if expected_hash and current_hash != expected_hash:
+                    item_errors.append(
+                        {
+                            "batch_id": batch_id,
+                            "task_item_id": out_item.task_item_id,
+                            "question_uid": uid,
+                            "error_code": "STALE_CONTENT_HASH",
+                            "error": "源题指纹已变化，请重新导出",
+                        }
+                    )
+                    continue
+
+                cs_status = str(db_row["cs_status"] or "")
+                cs_model = str(db_row["cs_model"] or "")
+                cs_hash = str(db_row["cs_hash"] or "")
+                if (
+                    not force
+                    and cs_status == "OK"
+                    and (cs_model == "subagent-unified" or cs_model.startswith("subagent:"))
+                    and cs_hash == current_hash
+                ):
+                    res_import.skipped_ok += 1
+                    res_import.skipped_locked += 1
+                    continue
+
+                try:
+                    primary_parts = normalize_answer_parts(out_item.final_answers)
+                except ValueError as exc:
+                    item_errors.append(
+                        {
+                            "batch_id": batch_id,
+                            "task_item_id": out_item.task_item_id,
+                            "question_uid": uid,
+                            "error_code": "ANSWER_PART_NORMALIZE_ERROR",
+                            "error": f"ANSWER_PART_NORMALIZE_ERROR: {exc}",
+                        }
+                    )
+                    continue
+
+                raw_opts = meta.get("options")
+                item_options: dict[str, str] = (
+                    {str(k): str(v) for k, v in raw_opts.items()}
+                    if isinstance(raw_opts, dict)
+                    else {}
+                )
+                gs_val = str(db_row["grade_subject"] or meta.get("grade_subject") or "小学奥数")
+                sympy_result = await _run_sympy_for_parts(
+                    primary_parts,
+                    out_item.sympy_code,
+                    timeout_seconds=settings.pipeline.sympy_timeout_seconds,
+                    memory_limit_mb=settings.pipeline.sympy_memory_limit_mb,
+                )
+                equiv = await compare_answer_parts(
+                    primary_parts,
+                    None,
+                    grade_subject=gs_val,
+                    allow_pi_314_subjects=settings.pipeline.allow_pi_314_subjects,
+                    options=item_options or None,
+                    sympy_result=sympy_result,
+                    qualitative_judge=None,
+                    timeout_seconds=settings.pipeline.sympy_timeout_seconds,
+                    memory_limit_mb=settings.pipeline.sympy_memory_limit_mb,
+                )
+
+                reasons: list[str] = []
+                if not equiv.all_sympy_ok:
+                    reasons.extend(equiv.review_reasons or ["SYMPY_FAILED"])
+                if sympy_result is not None and sympy_result.status == "TIMEOUT":
+                    reasons.append("SYMPY_TIMEOUT")
+                if out_item.visual_ambiguity_flag:
+                    reasons.append("VISUAL_AMBIGUITY")
+                if any(p.verify_mode == "QUALITATIVE" for p in primary_parts):
+                    reasons.append("SINGLE_RUN_ONLY")
+                reasons = _dedupe_preserve_order(reasons)
+                m_status = "NEEDS_REVIEW" if reasons else "VERIFIED_CONSENSUS"
+
+                p_answers_json = json.dumps(
+                    [p.model_dump() for p in primary_parts], ensure_ascii=False
+                )
+                p_sympy_out_json = json.dumps(equiv.sympy_output, ensure_ascii=False)
+                raw_resp_json = json.dumps(out_item.model_dump(), ensure_ascii=False)
+                usage_json = json.dumps({"source": "subagent-stage1"}, ensure_ascii=False)
+
+                async with writer.async_transaction(conn):
+                    conn.execute(
+                        """
+                        INSERT INTO stage1_vlm_runs(
+                            question_uid, role, model_name, prompt_version, input_hash,
+                            run_status, visual_facts, visual_ambiguity_flag, visual_ambiguity_note,
+                            method_summary, solution_markdown, final_answers_json,
+                            sympy_code, sympy_status, sympy_output_json, raw_response,
+                            token_usage_json, latency_ms
+                        ) VALUES (?, 'PRIMARY', ?, ?, ?, 'OK', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        """,
+                        (
+                            uid,
+                            model_name_to_write,
+                            prompt_version_to_write,
+                            current_hash,
+                            out_item.visual_facts,
+                            1 if out_item.visual_ambiguity_flag else 0,
+                            out_item.visual_ambiguity_note,
+                            out_item.method_summary,
+                            out_item.solution_markdown,
+                            p_answers_json,
+                            out_item.sympy_code,
+                            equiv.sympy_status,
+                            p_sympy_out_json,
+                            raw_resp_json,
+                            usage_json,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE questions
+                        SET m_visual_facts = ?,
+                            m_verification_status = ?,
+                            m_final_answers_json = ?,
+                            review_reason = ?,
+                            part_verdicts_json = ?,
+                            updated_at = datetime('now')
+                        WHERE question_uid = ?
+                        """,
+                        (
+                            out_item.visual_facts,
+                            m_status,
+                            p_answers_json,
+                            ",".join(reasons),
+                            json.dumps(
+                                [asdict(pv) for pv in equiv.part_verdicts], ensure_ascii=False
+                            ),
+                            uid,
+                        ),
+                    )
+                    effective.recompute(conn, uid)
+                    materialize_solutions(
+                        conn,
+                        uid,
+                        allow_pi_314_subjects=settings.pipeline.allow_pi_314_subjects,
+                    )
+                    effective.recompute(conn, uid)
+
+                    conn.execute(
+                        """
+                        INSERT INTO compile_state(
+                            question_uid, stage, status, input_hash, prompt_version,
+                            model_name, attempts, last_error, updated_at
+                        ) VALUES (?, 'S1', 'OK', ?, ?, ?, 1, '', datetime('now'))
+                        ON CONFLICT(question_uid, stage) DO UPDATE SET
+                            status = 'OK',
+                            input_hash = excluded.input_hash,
+                            prompt_version = excluded.prompt_version,
+                            model_name = excluded.model_name,
+                            attempts = compile_state.attempts + 1,
+                            last_error = '',
+                            updated_at = datetime('now')
+                        """,
+                        (uid, current_hash, prompt_version_to_write, model_name_to_write),
+                    )
+                    refresh.propagate_stage_stale(conn, uid, "S1")
+                    eff_row = conn.execute(
+                        "SELECT eff_verification_status FROM questions WHERE question_uid = ?",
+                        (uid,),
+                    ).fetchone()
+                    if eff_row and eff_row["eff_verification_status"] == "NEEDS_REVIEW":
+                        conn.execute(
+                            """
+                            INSERT INTO compile_state(question_uid, stage, status, updated_at)
+                            VALUES (?, 'S2', 'BLOCKED', datetime('now'))
+                            ON CONFLICT(question_uid, stage) DO UPDATE SET
+                                status = 'BLOCKED',
+                                updated_at = datetime('now')
+                            """,
+                            (uid,),
+                        )
+
+                res_import.processed += 1
+                res_import.ingested += 1
+                if m_status == "VERIFIED_CONSENSUS":
+                    res_import.verified_consensus += 1
+                else:
+                    res_import.needs_review += 1
+
+    retry_path = tasks_base / "retry_tasks.jsonl"
+    if item_errors:
+        # 仅保留本次 load_and_validate_results 写入的 bridge_errs 行；绝不累加历史旧轮次残留错误
+        existing_lines = (
+            [ln for ln in retry_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            if bridge_errs and retry_path.is_file()
+            else []
+        )
+        extra_lines = [
+            json.dumps({"step_kind": "stage1", **e}, ensure_ascii=False) for e in item_errors
+        ]
+        _atomic_write_text(retry_path, "\n".join([*existing_lines, *extra_lines]) + "\n")
+        if manifest_data:
+            manifest_data["status"] = "PENDING_IMPORT"
+            manifest_data.pop("imported_at", None)
+            _atomic_write_text(
+                manifest_file, json.dumps(manifest_data, ensure_ascii=False, indent=2)
+            )
+    elif not bridge_errs and retry_path.is_file():
+        retry_path.unlink(missing_ok=True)
+
+    final_manifest_status = ""
+    if manifest_file.is_file():
+        try:
+            final_manifest_status = str(
+                json.loads(manifest_file.read_text(encoding="utf-8")).get("status") or ""
+            )
+        except Exception:
+            final_manifest_status = ""
+
+    res_import.failed = len(item_errors)
+    res_import.batch_errors = len(bridge_errs)
+    res_import.errors = [*bridge_errs, *item_errors]
+    res_import.manifest_status = final_manifest_status
+    res_import.retry_file = retry_path.as_posix() if retry_path.is_file() else None
+    return res_import
+
+
 async def run_stage1_compile(
     *,
     db_path: Path,
@@ -440,8 +1097,19 @@ async def run_stage1_compile(
     force: bool = False,
     include_human_verified: bool = False,
     use_mock: bool | None = None,
+    mode: Literal["api", "export", "import"] = "api",
+    tasks_dir: Path | str = Path("data/unified/stage3_4/stage1"),
+    results_path: Path | str | None = None,
+    batch_size: int = 10,
+    subagent_model: str | None = None,
+    prompt_profile: str | None = None,
+    overwrite_pending: bool = False,
 ) -> Stage1BatchResult:
-    """Stage 1 断点续跑编译引擎。"""
+    """Stage 1 断点续跑编译引擎（支持 api / export / import 三通道）。"""
+    norm_mode = mode.strip().lower()
+    if norm_mode not in ("api", "export", "import"):
+        raise PreconditionError(f"PRECONDITION_FAILED: 不支持的 Stage 1 执行模式: {mode!r}")
+
     db_p = Path(db_path)
     cfg_dir = Path(config_dir)
     settings: Settings = load_settings(cfg_dir / "settings.yaml")
@@ -451,6 +1119,40 @@ async def run_stage1_compile(
     assets_path, llm_raw_dir = _resolve_paths(db_p, assets_dir)
     lock_path = db_p.parent / ".compile.lock"
     writer = SingleWriterExecutor()
+
+    if norm_mode == "export":
+        return await _run_stage1_export(
+            db_p=db_p,
+            cfg_dir=cfg_dir,
+            assets_path=assets_path,
+            settings=settings,
+            grade_subject=grade_subject,
+            only_uids=only_uids,
+            stress_test_25=stress_test_25,
+            force=force,
+            include_human_verified=include_human_verified,
+            tasks_dir=tasks_dir,
+            batch_size=batch_size,
+            subagent_model=subagent_model,
+            prompt_profile=prompt_profile,
+            overwrite_pending=overwrite_pending,
+        )
+
+    if norm_mode == "import":
+        return await _run_stage1_import(
+            db_p=db_p,
+            cfg_dir=cfg_dir,
+            lock_path=lock_path,
+            writer=writer,
+            settings=settings,
+            force=force,
+            include_human_verified=include_human_verified,
+            tasks_dir=tasks_dir,
+            results_path=results_path,
+            subagent_model=subagent_model,
+        )
+
+    # mode == "api"
 
     with CompileLock(lock_path), closing(get_connection(db_p)) as conn:
         init_db(conn, config_dir=cfg_dir)

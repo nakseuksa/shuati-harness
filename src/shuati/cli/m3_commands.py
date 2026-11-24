@@ -765,18 +765,49 @@ def register_m3_commands(
     # 13. shuati skill install
     @skill_app.command(name="install")
     def skill_install_cmd(
-        target: Path = typer.Option(Path(".pi/skills/shuati"), "--target", help="pi Skill 安装目标路径"),
-        source: Path = typer.Option(Path("skills/shuati"), "--source", help="权威 Skill 源目录"),
-        symlink: bool = typer.Option(True, "--symlink/--copy", help="优先创建目录软链（Windows 无权限时自动降级复制）"),
+        skill: str | None = typer.Option(
+            None,
+            "--skill",
+            help="要安装的 Skill 名称：all / shuati / shuati-init / shuati-compiler",
+        ),
+        all_skills: bool = typer.Option(
+            False,
+            "--all",
+            help="一键安装全部内置 Skill（shuati / shuati-init / shuati-compiler）",
+        ),
+        target: Path | None = typer.Option(
+            None,
+            "--target",
+            help="单 Skill 安装目标路径（兼容旧用法，默认 .pi/skills/shuati）",
+        ),
+        target_dir: Path = typer.Option(
+            Path(".pi/skills"),
+            "--target-dir",
+            help="多 Skill 安装根目录（默认 .pi/skills）",
+        ),
+        source: Path | None = typer.Option(
+            None,
+            "--source",
+            help="权威 Skill 源目录（兼容单 Skill 用法，默认 skills/shuati）",
+        ),
+        source_dir: Path = typer.Option(
+            Path("skills"),
+            "--source-dir",
+            help="内置 Skill 源根目录（默认 skills）",
+        ),
+        symlink: bool = typer.Option(
+            True, "--symlink/--copy", help="优先创建目录软链（Windows 无权限时自动降级复制）"
+        ),
         json: bool = typer.Option(False, "--json", help="输出 JSON 格式信封"),
     ) -> None:
-        """将 skills/shuati/ 软链或同步安装到 pi 自动发现目录。"""
+        """将内置 Skill（shuati / shuati-init / shuati-compiler）软链或同步安装到 pi 自动发现目录。"""
+        builtin_skills = ("shuati", "shuati-init", "shuati-compiler")
 
-        def _work() -> dict[str, Any]:
-            src_abs = source.resolve()
+        def _install_one(src_path: Path, dst_path: Path) -> dict[str, Any]:
+            src_abs = src_path.resolve()
             if not src_abs.exists():
                 raise PreconditionError(f"Skill 源目录不存在: {src_abs}")
-            dst_abs = target.resolve()
+            dst_abs = dst_path.resolve()
             dst_abs.parent.mkdir(parents=True, exist_ok=True)
             if dst_abs.is_symlink() or dst_abs.is_file():
                 dst_abs.unlink()
@@ -799,6 +830,46 @@ def register_m3_commands(
                 "target": str(dst_abs),
                 "mode": installed_mode,
                 "skill_md_exists": (dst_abs / "SKILL.md").exists(),
+            }
+
+        def _work() -> dict[str, Any]:
+            if all_skills and skill is not None and skill.strip().lower() != "all":
+                raise PreconditionError("--all 与指定单个 --skill 不能冲突传参")
+
+            # 旧调用方式 100% 向后兼容：未传 --all / --skill
+            if not all_skills and skill is None:
+                src_p = source if source is not None else (source_dir / "shuati")
+                dst_p = target if target is not None else (target_dir / "shuati")
+                return _install_one(src_p, dst_p)
+
+            if all_skills or (skill is not None and skill.strip().lower() == "all"):
+                if target is not None:
+                    raise PreconditionError("--all / --skill all 请使用 --target-dir 指定根目录，而非 --target")
+                installed: list[dict[str, Any]] = []
+                for sk_name in builtin_skills:
+                    info = _install_one(source_dir / sk_name, target_dir / sk_name)
+                    installed.append({"skill": sk_name, **info})
+                return {
+                    "target_dir": str(target_dir.resolve()),
+                    "count": len(installed),
+                    "installed": installed,
+                    "all_skill_md_exists": all(it["skill_md_exists"] for it in installed),
+                }
+
+            assert skill is not None
+            sk_norm = skill.strip()
+            if sk_norm not in builtin_skills:
+                raise PreconditionError(
+                    f"不支持的 --skill: {skill!r}（仅支持 all / {' / '.join(builtin_skills)}）"
+                )
+            src_p = source if source is not None else (source_dir / sk_norm)
+            dst_p = target if target is not None else (target_dir / sk_norm)
+            info = _install_one(src_p, dst_p)
+            return {
+                "skill": sk_norm,
+                "count": 1,
+                "installed": [{"skill": sk_norm, **info}],
+                **info,
             }
 
         run_cli_action("skill.install", json, _work)

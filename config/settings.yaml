@@ -126,6 +126,11 @@ human_mirror:
   include_practice_log: true
   backups_keep: 10
 
+ingest:
+  roots:
+    - "题库"
+  dedup_near_default: true
+
 subagent:
   default_model: "${SUBAGENT_DEFAULT_MODEL:-gemini-4-neon-medium}"
   max_parallel_workers: 4

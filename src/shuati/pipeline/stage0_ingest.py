@@ -8,6 +8,7 @@ import re
 import sqlite3
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -222,6 +223,106 @@ def _compute_cas_filename_readonly(src_path: Path) -> str:
     h16 = hashlib.sha256(src_path.read_bytes()).hexdigest()[:16]
     suffix = src_path.suffix.lower() or ".jpg"
     return f"{h16}{suffix}"
+
+
+def sync_cold_start_learners_if_seeded(
+    conn: sqlite3.Connection,
+    config_dir: Path | str = "config",
+) -> bool:
+    """冷启动保真同步：若库内仅含默认种子 'default' 且无做题/覆写记录，将磁盘 human/learners.jsonl 同步入库。
+
+    仅在满足全部守卫条件时触发（防止误覆盖正常使用中的库或换机恢复场景）：
+    1. 库内 learners 仅含单一 'default' 种子行；
+    2. practice_log、quiz_batches、human_overrides 均为空；
+    3. human_mirror.dir 下的其他 4 份快照文件为空或不存在，且 learners.jsonl 非空；
+    4. learners.jsonl 中每条记录的 default_grade_subject 均已在 grade_subjects 注册，且至少有 1 条 is_current == 1。
+    """
+    from shuati.config import load_settings
+
+    cfg_dir = Path(config_dir)
+    settings = load_settings(cfg_dir / "settings.yaml")
+    h_dir = Path(settings.human_mirror.dir)
+    learners_file = h_dir / "learners.jsonl"
+    if not learners_file.is_file():
+        return False
+
+    for other_name in (
+        "external_questions.jsonl",
+        "overrides.jsonl",
+        "relation_overrides.jsonl",
+        "practice_log.jsonl",
+    ):
+        other_path = h_dir / other_name
+        if other_path.is_file() and other_path.stat().st_size > 0:
+            return False
+
+    learner_rows = conn.execute("SELECT learner_id FROM learners;").fetchall()
+    if [str(r["learner_id"]) for r in learner_rows] != ["default"]:
+        return False
+
+    if int(conn.execute("SELECT COUNT(*) FROM practice_log;").fetchone()[0]) > 0:
+        return False
+    if int(conn.execute("SELECT COUNT(*) FROM quiz_batches;").fetchone()[0]) > 0:
+        return False
+    if int(conn.execute("SELECT COUNT(*) FROM human_overrides;").fetchone()[0]) > 0:
+        return False
+
+    parsed_items: list[dict[str, Any]] = []
+    try:
+        for line in learners_file.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            obj = json.loads(s)
+            if not isinstance(obj, dict) or not str(obj.get("learner_id") or "").strip():
+                return False
+            parsed_items.append(obj)
+    except Exception:
+        return False
+
+    if not parsed_items:
+        return False
+
+    registered_gs = {
+        str(r["grade_subject"])
+        for r in conn.execute("SELECT grade_subject FROM grade_subjects;").fetchall()
+    }
+    for item in parsed_items:
+        gs = str(item.get("default_grade_subject") or "小学奥数")
+        if gs not in registered_gs:
+            return False
+
+    # 校验至多 1 条 is_current == 1
+    current_count = sum(1 for it in parsed_items if int(it.get("is_current") or 0) == 1)
+    if current_count > 1:
+        return False
+
+    with conn:
+        conn.execute("DELETE FROM learners WHERE learner_id = 'default';")
+        for idx, item in enumerate(parsed_items):
+            lid = str(item["learner_id"]).strip()
+            dname = str(item.get("display_name") or lid)
+            gs = str(item.get("default_grade_subject") or "小学奥数")
+            is_cur = int(item.get("is_current") or (1 if idx == 0 and current_count == 0 else 0))
+            notes = str(item.get("notes") or "")
+            created_at = item.get("created_at")
+            if created_at:
+                conn.execute(
+                    """
+                    INSERT INTO learners(learner_id, display_name, default_grade_subject, is_current, notes, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (lid, dname, gs, is_cur, notes, str(created_at)),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO learners(learner_id, display_name, default_grade_subject, is_current, notes)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (lid, dname, gs, is_cur, notes),
+                )
+    return True
 
 
 def _run_stage0_dry_run(
@@ -484,10 +585,11 @@ def run_stage0_ingest(
     apply_retire: bool = False,
     lock_path: Path | str | None = None,
     dry_run: bool = False,
+    root_dirs: Sequence[Path | str] | None = None,
 ) -> Stage0IngestReport:
     """执行 Stage 0 数据入库、校验与体检。
 
-    1. Path.rglob("problems.jsonl") 递归发现；
+    1. Path.rglob("problems.jsonl") 递归发现（支持单目录 root_dir 或多目录 root_dirs）；
     2. collections.yaml 映射 grade_subject（未匹配拒入，--grade-subject 显式覆盖仅限单集合）；
     3. 校验学段注册（未注册抛 PreconditionError）；
     4. normalize_text 规范化与多图题注绑定；
@@ -497,7 +599,13 @@ def run_stage0_ingest(
     8. 源题消失检测与 --apply-retire；
     9. 输出体检报告。
     """
-    root_path = Path(root_dir)
+    if root_dirs is not None:
+        cleaned_roots = [Path(r) for r in root_dirs if str(r).strip()]
+        if not cleaned_roots:
+            raise PreconditionError("题库根目录列表 root_dirs 不能为空")
+        roots_to_scan = cleaned_roots
+    else:
+        roots_to_scan = [Path(root_dir)]
     cfg_dir = Path(config_dir)
     db_p = Path(db_path)
 
@@ -532,19 +640,46 @@ def run_stage0_ingest(
     scan_id = f"scan_{scan_ts}"
     report = Stage0IngestReport(scan_id=scan_id, timestamp=scan_ts, dry_run=dry_run)
 
-    # 1. 递归发现 problems.jsonl
-    if root_path.is_file():
-        problems_files = [root_path]
-    else:
-        if not root_path.exists():
-            raise PreconditionError(f"题库根目录 '{root_path}' 不存在")
-        problems_files = sorted(
-            list(root_path.rglob("problems.jsonl")),
-            key=lambda p: str(p).replace("\\", "/"),
-        )
+    # 1. 递归发现 problems.jsonl 并计算每个文件的 source_collection
+    file_collections: list[tuple[Path, str]] = []
+    seen_files: set[Path] = set()
+    for rp in roots_to_scan:
+        if rp.is_file():
+            rp_files = [rp]
+        else:
+            if not rp.exists():
+                raise PreconditionError(f"题库根目录 '{rp}' 不存在")
+            rp_files = sorted(
+                list(rp.rglob("problems.jsonl")),
+                key=lambda p: str(p).replace("\\", "/"),
+            )
 
-    if not problems_files:
-        raise PreconditionError(f"未在 '{root_path}' 下发现任何 problems.jsonl 文件")
+        for pf in rp_files:
+            resolved_pf = pf.resolve()
+            if resolved_pf in seen_files:
+                continue
+            seen_files.add(resolved_pf)
+            try:
+                rel = pf.parent.relative_to(rp).as_posix()
+                if rel != ".":
+                    source_col = rel
+                else:
+                    col_found = None
+                    curr_p = pf.parent.resolve()
+                    for ancestor in [curr_p, *curr_p.parents]:
+                        if ancestor.name == "题库":
+                            col_found = curr_p.relative_to(ancestor).as_posix()
+                            break
+                    source_col = col_found if col_found and col_found != "." else pf.parent.name
+            except Exception:
+                source_col = pf.parent.name
+            file_collections.append((pf, source_col))
+
+    if not file_collections:
+        if len(roots_to_scan) == 1:
+            raise PreconditionError(f"未在 '{roots_to_scan[0]}' 下发现任何 problems.jsonl 文件")
+        roots_desc = ", ".join(str(r) for r in roots_to_scan)
+        raise PreconditionError(f"未在 [{roots_desc}] 下发现任何 problems.jsonl 文件")
 
     # 2. 读取 collections.yaml
     collections_yaml = cfg_dir / "collections.yaml"
@@ -556,25 +691,6 @@ def run_stage0_ingest(
                 rules = data["rules"]
         except Exception:
             pass
-
-    # 计算每个文件的 source_collection
-    file_collections: list[tuple[Path, str]] = []
-    for pf in problems_files:
-        try:
-            rel = pf.parent.relative_to(root_path).as_posix()
-            if rel != ".":
-                source_col = rel
-            else:
-                col_found = None
-                curr_p = pf.parent.resolve()
-                for ancestor in [curr_p, *curr_p.parents]:
-                    if ancestor.name == "题库":
-                        col_found = curr_p.relative_to(ancestor).as_posix()
-                        break
-                source_col = col_found if col_found and col_found != "." else pf.parent.name
-        except Exception:
-            source_col = pf.parent.name
-        file_collections.append((pf, source_col))
 
     unique_collections = sorted(list({sc for _, sc in file_collections}))
 
@@ -621,6 +737,7 @@ def run_stage0_ingest(
         with writer.transaction(conn):
             init_db(conn, config_dir=cfg_dir)
 
+        sync_cold_start_learners_if_seeded(conn, cfg_dir)
         effective.install_eff_write_guard(conn)
 
         # 检查各学科是否已在 grade_subjects 注册

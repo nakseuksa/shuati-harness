@@ -198,13 +198,22 @@ def _tool_diagnose_preflight(args: dict[str, Any], cfg: McpServerConfig) -> dict
 
 
 def _tool_ingest_dry_run(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
+    from shuati.config import load_settings
     from shuati.pipeline.stage0_ingest import run_stage0_ingest
 
-    root_dir = Path(str(args.get("root_dir") or "题库"))
+    raw_roots = args.get("root_dirs")
+    if isinstance(raw_roots, list) and raw_roots:
+        resolved_roots = [Path(str(r)) for r in raw_roots if str(r).strip()]
+    elif args.get("root_dir"):
+        resolved_roots = [Path(str(args["root_dir"]))]
+    else:
+        settings = load_settings(cfg.config_dir / "settings.yaml")
+        resolved_roots = [Path(r) for r in (settings.ingest.roots or ["题库"])]
     gs = args.get("grade_subject")
     report = run_stage0_ingest(
         db_path=cfg.db_path,
-        root_dir=root_dir,
+        root_dir=resolved_roots[0] if resolved_roots else Path("题库"),
+        root_dirs=resolved_roots,
         config_dir=cfg.config_dir,
         assets_dir=cfg.assets_dir,
         grade_subject_override=str(gs) if gs is not None else None,
@@ -213,6 +222,28 @@ def _tool_ingest_dry_run(args: dict[str, Any], cfg: McpServerConfig) -> dict[str
         dry_run=True,
     )
     return report.to_dict()
+
+
+def _tool_doctor(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
+    from shuati.services.compiler_tools import run_doctor
+
+    raw_mock = args.get("mock")
+    return run_doctor(
+        db_path=cfg.db_path,
+        config_dir=cfg.config_dir,
+        check_llm_api=bool(args.get("check_llm_api", False)),
+        use_mock=bool(raw_mock) if raw_mock is not None else None,
+    )
+
+
+def _tool_anchors_sample(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
+    from shuati.services.compiler_tools import sample_anchor_candidates
+
+    return sample_anchor_candidates(
+        db_path=cfg.db_path,
+        grade_subject=str(args.get("grade_subject") or "小学奥数"),
+        count=int(args.get("count", 6)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -564,12 +595,37 @@ _COMPILER_EXTRA_TOOLS: tuple[_ToolSpec, ...] = (
             "type": "object",
             "properties": {
                 "root_dir": {"type": "string", "default": "题库"},
+                "root_dirs": {"type": ["array", "null"], "items": {"type": "string"}},
                 "grade_subject": {"type": ["string", "null"]},
                 "dedup_near": {"type": "boolean", "default": False},
                 "apply_retire": {"type": "boolean", "default": False},
             },
         },
         handler=_tool_ingest_dry_run,
+    ),
+    _ToolSpec(
+        name="doctor",
+        description="冷启动与环境健康自检（无需 SQLite 库；实测 SymPy 沙盒、提示词接缝、题库根目录与 Embedding 维度）。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "check_llm_api": {"type": "boolean", "default": False},
+                "mock": {"type": ["boolean", "null"]},
+            },
+        },
+        handler=_tool_doctor,
+    ),
+    _ToolSpec(
+        name="anchors_sample",
+        description="只读分层抽样候选黄金难度锚点题目（跨长度分位与有图/无图，严禁泄露章节）。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "grade_subject": {"type": "string", "default": "小学奥数"},
+                "count": {"type": "integer", "default": 6},
+            },
+        },
+        handler=_tool_anchors_sample,
     ),
 )
 
