@@ -192,6 +192,72 @@ def _append_review_reason(conn: sqlite3.Connection, question_uid: str, code: str
     )
 
 
+def _sync_question_solutions(
+    conn: sqlite3.Connection,
+    question_uid: str,
+    desired_branches: list[dict[str, Any]],
+) -> None:
+    """按 branch_id 原地 UPSERT 更新解法分支并仅清理多余分支，防止 ON DELETE CASCADE 误删 question_steps。"""
+    if not desired_branches:
+        conn.execute("DELETE FROM question_solutions WHERE question_uid = ?", (question_uid,))
+        return
+
+    deduped: list[dict[str, Any]] = []
+    seen_bids: set[str] = set()
+    for b in desired_branches:
+        bid = str(b["branch_id"])
+        if bid not in seen_bids:
+            seen_bids.add(bid)
+            deduped.append(b)
+
+    keep_bids = [str(b["branch_id"]) for b in deduped]
+    placeholders = ",".join("?" for _ in keep_bids)
+    conn.execute(
+        f"DELETE FROM question_solutions WHERE question_uid = ? AND branch_id NOT IN ({placeholders})",
+        (question_uid, *keep_bids),
+    )
+
+    existing_ids = {
+        str(r["branch_id"]): str(r["solution_id"])
+        for r in conn.execute(
+            "SELECT branch_id, solution_id FROM question_solutions WHERE question_uid = ?",
+            (question_uid,),
+        ).fetchall()
+    }
+
+    for b in deduped:
+        bid = str(b["branch_id"])
+        sol_id = existing_ids.get(bid) or str(b.get("solution_id") or f"{question_uid}::{bid}")
+        conn.execute(
+            """
+            INSERT INTO question_solutions(
+                solution_id, question_uid, branch_id, is_optimal, source_origin,
+                origin_run_id, method_summary, solution_markdown, sympy_code, sympy_verified
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(question_uid, branch_id) DO UPDATE SET
+                is_optimal = excluded.is_optimal,
+                source_origin = excluded.source_origin,
+                origin_run_id = excluded.origin_run_id,
+                method_summary = excluded.method_summary,
+                solution_markdown = excluded.solution_markdown,
+                sympy_code = excluded.sympy_code,
+                sympy_verified = excluded.sympy_verified
+            """,
+            (
+                sol_id,
+                question_uid,
+                bid,
+                int(b["is_optimal"]),
+                str(b["source_origin"]),
+                b.get("origin_run_id"),
+                str(b.get("method_summary") or ""),
+                str(b.get("solution_markdown") or ""),
+                b.get("sympy_code"),
+                int(b.get("sympy_verified", 0)),
+            ),
+        )
+
+
 def materialize_solutions(
     conn: sqlite3.Connection,
     question_uid: str,
@@ -231,8 +297,6 @@ def materialize_solutions(
         (question_uid,),
     ).fetchone()
 
-    conn.execute("DELETE FROM question_solutions WHERE question_uid = ?", (question_uid,))
-
     if (
         ov_row is not None
         and ov_row["is_suspended"] == 0
@@ -240,35 +304,25 @@ def materialize_solutions(
     ):
         payload = json.loads(ov_row["override_value"] or "{}")
         branches = payload.get("branches", []) if isinstance(payload, dict) else []
+        desired_human: list[dict[str, Any]] = []
         for idx, branch in enumerate(branches):
             if not isinstance(branch, dict):
                 continue
             branch_id = str(branch.get("branch_id") or f"branch_{idx + 1}")
-            is_optimal = int(branch.get("is_optimal", 1 if idx == 0 else 0))
-            origin_run_id = branch.get("origin_run_id")
-            method_summary = str(branch.get("method_summary") or "")
-            solution_markdown = str(branch.get("solution_markdown") or "")
-            sympy_code = branch.get("sympy_code")
-            sympy_verified = int(bool(branch.get("sympy_verified", 0)))
-            conn.execute(
-                """
-                INSERT INTO question_solutions(
-                    solution_id, question_uid, branch_id, is_optimal, source_origin,
-                    origin_run_id, method_summary, solution_markdown, sympy_code, sympy_verified
-                ) VALUES (?, ?, ?, ?, 'HUMAN', ?, ?, ?, ?, ?)
-                """,
-                (
-                    f"{question_uid}::{branch_id}",
-                    question_uid,
-                    branch_id,
-                    is_optimal,
-                    origin_run_id,
-                    method_summary,
-                    solution_markdown,
-                    sympy_code,
-                    sympy_verified,
-                ),
+            desired_human.append(
+                {
+                    "solution_id": f"{question_uid}::{branch_id}",
+                    "branch_id": branch_id,
+                    "is_optimal": int(branch.get("is_optimal", 1 if idx == 0 else 0)),
+                    "source_origin": "HUMAN",
+                    "origin_run_id": branch.get("origin_run_id"),
+                    "method_summary": str(branch.get("method_summary") or ""),
+                    "solution_markdown": str(branch.get("solution_markdown") or ""),
+                    "sympy_code": branch.get("sympy_code"),
+                    "sympy_verified": int(bool(branch.get("sympy_verified", 0))),
+                }
             )
+        _sync_question_solutions(conn, question_uid, desired_human)
         return
 
     p_run = conn.execute(
@@ -284,25 +338,22 @@ def materialize_solutions(
     ).fetchone()
 
     if p_run is None:
+        _sync_question_solutions(conn, question_uid, [])
         return
 
-    conn.execute(
-        """
-        INSERT INTO question_solutions(
-            solution_id, question_uid, branch_id, is_optimal, source_origin,
-            origin_run_id, method_summary, solution_markdown, sympy_code, sympy_verified
-        ) VALUES (?, ?, 'branch_1', 1, 'PRIMARY_VLM', ?, ?, ?, ?, ?)
-        """,
-        (
-            f"{question_uid}::branch_1",
-            question_uid,
-            p_run["run_id"],
-            p_run["method_summary"],
-            p_run["solution_markdown"],
-            p_run["sympy_code"],
-            1 if p_run["sympy_status"] == "PASSED" else 0,
-        ),
-    )
+    desired_machine: list[dict[str, Any]] = [
+        {
+            "solution_id": f"{question_uid}::branch_1",
+            "branch_id": "branch_1",
+            "is_optimal": 1,
+            "source_origin": "PRIMARY_VLM",
+            "origin_run_id": p_run["run_id"],
+            "method_summary": p_run["method_summary"],
+            "solution_markdown": p_run["solution_markdown"],
+            "sympy_code": p_run["sympy_code"],
+            "sympy_verified": 1 if p_run["sympy_status"] == "PASSED" else 0,
+        }
+    ]
 
     s_run = conn.execute(
         """
@@ -325,21 +376,21 @@ def materialize_solutions(
             and meta.get("is_distinct_method") is True
             and meta.get("primary_run_id") == p_run["run_id"]
         ):
-            conn.execute(
-                """
-                INSERT INTO question_solutions(
-                    solution_id, question_uid, branch_id, is_optimal, source_origin,
-                    origin_run_id, method_summary, solution_markdown, sympy_code, sympy_verified
-                ) VALUES (?, ?, 'branch_2', 0, 'SECONDARY_VLM', ?, ?, ?, NULL, 0)
-                """,
-                (
-                    f"{question_uid}::branch_2",
-                    question_uid,
-                    s_run["run_id"],
-                    s_run["method_summary"],
-                    s_run["solution_markdown"],
-                ),
+            desired_machine.append(
+                {
+                    "solution_id": f"{question_uid}::branch_2",
+                    "branch_id": "branch_2",
+                    "is_optimal": 0,
+                    "source_origin": "SECONDARY_VLM",
+                    "origin_run_id": s_run["run_id"],
+                    "method_summary": s_run["method_summary"],
+                    "solution_markdown": s_run["solution_markdown"],
+                    "sympy_code": None,
+                    "sympy_verified": 0,
+                }
             )
+
+    _sync_question_solutions(conn, question_uid, desired_machine)
 
     # 答案—解法一致性校验：若机器 branch_1 声称答案与 eff_final_answers_json 不等价，追加 ANSWER_SOLUTION_CONFLICT
     eff_raw = q_row["eff_final_answers_json"] or "[]"

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 
-from shuati.config import Settings, resolve_subagent_model
+from shuati.config import Settings, TopologyConfig, resolve_subagent_model
+from shuati.core import refresh
 from shuati.core.topology import (
     RELATION_TYPES,
     CandidateEdge,
@@ -19,8 +23,10 @@ from shuati.core.topology import (
     load_question_features,
     merge_relation_overrides,
     normalize_edge_endpoints,
+    pretruncate_refine_candidates,
     write_relations_for_scope,
 )
+from shuati.db import repository
 from shuati.db.connection import CompileLock, PreconditionError
 from shuati.llm.embeddings import EmbeddingClient
 from shuati.llm.gateway import LLMGateway
@@ -28,7 +34,146 @@ from shuati.llm.prompt_builder import build_stage4_refine_messages
 from shuati.llm.seam_loader import load_prompt_seams
 from shuati.models.schemas import Stage4RefineBatchOutput, Stage4RefineItem
 from shuati.pipeline.subagent_bridge import export_task_batches, load_and_validate_results
-from shuati.vectors.store import VectorStore
+from shuati.vectors.store import VectorStore, evaluate_scope_drift
+
+
+def _compute_scope_baseline(
+    conn: sqlite3.Connection,
+    grade_subject: str,
+) -> tuple[int, dict[str, float]]:
+    """计算指定学段当前可服务题量与 L1 模块占比分布。"""
+    rows = conn.execute(
+        """
+        SELECT eff_primary_l1_module, COUNT(*) AS cnt
+        FROM questions
+        WHERE grade_subject = ? AND is_retired = 0 AND eff_is_excluded = 0 AND eff_is_servable = 1
+        GROUP BY eff_primary_l1_module
+        ORDER BY eff_primary_l1_module;
+        """,
+        (grade_subject,),
+    ).fetchall()
+    servable_total = sum(int(r["cnt"]) for r in rows)
+    if servable_total <= 0:
+        return 0, {}
+    l1_dist = {
+        str(r["eff_primary_l1_module"] or ""): int(r["cnt"]) / float(servable_total)
+        for r in rows
+    }
+    return servable_total, l1_dist
+
+
+def _reconstruct_existing_edge(
+    row: sqlite3.Row,
+    features: dict[str, QuestionFeature],
+    topology_cfg: TopologyConfig,
+) -> CandidateEdge:
+    """将 question_relations 既有数据库行还原为 CandidateEdge 以参与局部度数上限与覆写合并。"""
+    su = str(row["source_question_uid"])
+    tu = str(row["target_question_uid"])
+    rtype = str(row["relation_type"])
+    s_sim = float(row["surface_sim"])
+    k_sim = float(row["skeleton_sim"])
+    cont = float(row["containment_score"])
+    trap_ov = float(row["trap_overlap"])
+    fa = features.get(su)
+    fb = features.get(tu)
+
+    if rtype == "CLONE":
+        rank_s = (s_sim + k_sim) * 0.5
+    elif rtype == "ISOMORPHIC":
+        rank_s = 0.6 * k_sim + 0.4 * cont
+    elif rtype == "SCAFFOLD":
+        elo_gap = (fb.elo - fa.elo) if (fa is not None and fb is not None) else 200
+        rank_s = 0.7 * cont + 0.3 * min(1.0, max(0, elo_gap) / 400.0)
+    elif rtype == "CONTRASTIVE":
+        rank_s = s_sim * (1.0 - cont)
+    else:
+        cross_l1 = (
+            fa is not None
+            and fb is not None
+            and bool(fa.primary_l1)
+            and bool(fb.primary_l1)
+            and fa.primary_l1 != fb.primary_l1
+        )
+        bonus = topology_cfg.thresholds.shared_trap.cross_l1_bonus if cross_l1 else 1.0
+        rank_s = trap_ov * bonus
+
+    return CandidateEdge(
+        source_uid=su,
+        target_uid=tu,
+        relation_type=rtype,
+        is_directed=int(row["is_directed"]),
+        is_cross_scope=int(row["is_cross_scope"]),
+        surface_sim=s_sim,
+        skeleton_sim=k_sim,
+        surface_pct=float(row["surface_pct"]),
+        skeleton_pct=float(row["skeleton_pct"]),
+        containment_score=cont,
+        trap_overlap=trap_ov,
+        rank_score=rank_s,
+        k_jaccard=cont if rtype in ("ISOMORPHIC", "CONTRASTIVE", "SHARED_TRAP") else 0.0,
+        confidence_source=str(row["confidence_source"]),
+        pedagogical_note=str(row["pedagogical_note"]),
+        rule_version=str(row["rule_version"]),
+    )
+
+
+def _cap_incremental_target_edges(
+    untouched_edges: list[CandidateEdge],
+    target_candidates: list[CandidateEdge],
+    topology_cfg: TopologyConfig,
+) -> list[CandidateEdge]:
+    """在保留未触及全库既有边不超限的前提下，对触及目标题集的新边按度数上限截断。"""
+    th = topology_cfg.thresholds
+    undirected_caps = {
+        "CLONE": th.clone.degree_cap,
+        "ISOMORPHIC": th.isomorphic.degree_cap,
+        "CONTRASTIVE": th.contrastive.degree_cap,
+        "SHARED_TRAP": th.shared_trap.degree_cap,
+    }
+
+    untouched_by_type: dict[str, list[CandidateEdge]] = {}
+    for e in untouched_edges:
+        untouched_by_type.setdefault(e.relation_type, []).append(e)
+
+    target_by_type: dict[str, list[CandidateEdge]] = {}
+    for e in target_candidates:
+        target_by_type.setdefault(e.relation_type, []).append(e)
+
+    kept_target: list[CandidateEdge] = []
+    for rtype, group in target_by_type.items():
+        ranked = sorted(
+            group,
+            key=lambda x: (-float(x.rank_score), x.source_uid, x.target_uid),
+        )
+        if rtype == "SCAFFOLD":
+            out_deg: dict[str, int] = {}
+            in_deg: dict[str, int] = {}
+            for ue in untouched_by_type.get(rtype, ()):
+                out_deg[ue.source_uid] = out_deg.get(ue.source_uid, 0) + 1
+                in_deg[ue.target_uid] = in_deg.get(ue.target_uid, 0) + 1
+            for e in ranked:
+                if (
+                    out_deg.get(e.source_uid, 0) < th.scaffold.out_degree_cap
+                    and in_deg.get(e.target_uid, 0) < th.scaffold.in_degree_cap
+                ):
+                    kept_target.append(e)
+                    out_deg[e.source_uid] = out_deg.get(e.source_uid, 0) + 1
+                    in_deg[e.target_uid] = in_deg.get(e.target_uid, 0) + 1
+        else:
+            cap = undirected_caps[rtype]
+            deg: dict[str, int] = {}
+            for ue in untouched_by_type.get(rtype, ()):
+                u0, v0 = normalize_edge_endpoints(rtype, ue.source_uid, ue.target_uid)
+                deg[u0] = deg.get(u0, 0) + 1
+                deg[v0] = deg.get(v0, 0) + 1
+            for e in ranked:
+                u, v = normalize_edge_endpoints(rtype, e.source_uid, e.target_uid)
+                if deg.get(u, 0) < cap and deg.get(v, 0) < cap:
+                    kept_target.append(e)
+                    deg[u] = deg.get(u, 0) + 1
+                    deg[v] = deg.get(v, 0) + 1
+    return kept_target
 
 
 def _build_surface_text(question_text: str | None, visual_facts: str | None) -> str:
@@ -167,8 +312,32 @@ async def reindex_vectors_and_quantiles_async(
 
     if rebuild_quantiles:
         for gsr in gs_rows:
+            gs = str(gsr["grade_subject"])
             slug = str(gsr["slug"])
-            quantile_stats[slug] = store.rebuild_quantiles(slug, ("surface", "skeleton"))
+            servable_total, cur_dist = _compute_scope_baseline(conn, gs)
+            scope_baseline = {"n0": servable_total, "l1_dist": cur_dist}
+            quantile_stats[slug] = store.rebuild_quantiles(
+                slug,
+                ("surface", "skeleton"),
+                scope_baseline=scope_baseline,
+            )
+            s3d_ok_rows = conn.execute(
+                """
+                SELECT q.question_uid
+                FROM questions q
+                JOIN compile_state cs ON cs.question_uid = q.question_uid AND cs.stage = 'S3D'
+                WHERE q.grade_subject = ?
+                  AND q.is_retired = 0
+                  AND q.eff_is_excluded = 0
+                  AND q.eff_is_servable = 1
+                  AND cs.status = 'OK'
+                ORDER BY q.question_uid;
+                """,
+                (gs,),
+            ).fetchall()
+            for qr in s3d_ok_rows:
+                refresh.mark_stages_stale(conn, str(qr["question_uid"]), ["S4"])
+        conn.commit()
 
     meta = store.load_meta()
     return {
@@ -210,6 +379,8 @@ async def run_stage4_weave_async(
     subagent_model: str | None = None,
     prompt_profile: str | None = None,
     overwrite_pending: bool = False,
+    only_uids: list[str] | None = None,
+    ignore_drift: bool = False,
 ) -> dict[str, Any]:
     """Stage 4 四通道五边拓扑织网（规则矩阵 + 边界带/CONTRASTIVE 精裁 + 度数截断 + relation_overrides 合并）。"""
     gs_row = conn.execute(
@@ -220,7 +391,82 @@ async def run_stage4_weave_async(
         raise PreconditionError(f"PRECONDITION_FAILED: 学段学科不存在: {grade_subject!r}")
     slug = str(gs_row["slug"])
 
-    # 1. 更新 compile_state 门禁：S3D != 'OK' 或默认不可服务题目置 BLOCKED
+    valid_by_batch: dict[str, Stage4RefineBatchOutput] = {}
+    loaded_map: dict[str, Any] = {}
+    manifest_file = Path(tasks_dir) / "stage4_manifest.json"
+    if mode == "import":
+        if results_path is None:
+            raise PreconditionError("PRECONDITION_FAILED: --mode import 必须提供 --results")
+        task_map_file = Path(tasks_dir) / "stage4_task_map.json"
+        valid_by_batch, loaded_map, errs = load_and_validate_results(
+            "stage4", results_path, task_map_file, Stage4RefineBatchOutput
+        )
+        if errs:
+            raise PreconditionError(
+                f"PRECONDITION_FAILED: Stage 4 结果校验失败 {len(errs)} 批，详见 retry_tasks.jsonl"
+            )
+        if manifest_file.is_file():
+            try:
+                m_loaded = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise PreconditionError(
+                    f"PRECONDITION_FAILED: Stage 4 清单文件无法解析 ({manifest_file}): {exc}"
+                ) from exc
+            if not isinstance(m_loaded, dict):
+                raise PreconditionError(
+                    f"PRECONDITION_FAILED: Stage 4 清单文件根结构非对象 ({manifest_file})"
+                )
+            expected_batch_ids = [
+                str(x).strip()
+                for x in (m_loaded.get("batch_ids") or [])
+                if isinstance(x, str) and x.strip()
+            ]
+            expected_batch_count = int(m_loaded.get("batch_count") or 0)
+            if expected_batch_ids:
+                single_ok = (
+                    len(expected_batch_ids) == 1 and "stage4_single" in valid_by_batch
+                )
+                missing_batches = [
+                    bid for bid in expected_batch_ids if bid not in valid_by_batch
+                ]
+                if missing_batches and not single_ok:
+                    raise PreconditionError(
+                        f"PRECONDITION_FAILED: Stage 4 回传批次不完整，缺失 {len(missing_batches)}/{len(expected_batch_ids)} 批: {missing_batches[:10]}"
+                    )
+            elif expected_batch_count > 0 and len(valid_by_batch) < expected_batch_count:
+                raise PreconditionError(
+                    f"PRECONDITION_FAILED: Stage 4 回传批次数不足 ({len(valid_by_batch)}/{expected_batch_count})"
+                )
+        elif loaded_map.get("pairs") and not valid_by_batch:
+            raise PreconditionError(
+                "PRECONDITION_FAILED: Stage 4 存在待精裁候选对但回传结果为空"
+            )
+
+    resolved_target_set: set[str] | None = None
+    if only_uids:
+        resolved_target_set = set()
+        for raw_id in only_uids:
+            s_id = str(raw_id).strip()
+            if not s_id:
+                continue
+            uid_resolved = repository.resolve_question_uid(conn, s_id)
+            q_gs_row = conn.execute(
+                "SELECT grade_subject FROM raw_questions WHERE question_uid = ?;",
+                (uid_resolved,),
+            ).fetchone()
+            if q_gs_row is not None and str(q_gs_row["grade_subject"]) != grade_subject:
+                raise PreconditionError(
+                    f"PRECONDITION_FAILED: 题目 {uid_resolved!r} 属于学段 {q_gs_row['grade_subject']!r}，与目标学段 {grade_subject!r} 不一致"
+                )
+            resolved_target_set.add(uid_resolved)
+        if not resolved_target_set:
+            resolved_target_set = None
+    elif mode == "import" and isinstance(loaded_map.get("target_uids"), list):
+        restored = {str(u).strip() for u in loaded_map["target_uids"] if str(u).strip()}
+        if restored:
+            resolved_target_set = restored
+
+    # 1. 更新 compile_state 门禁：S3D != 'OK' 或默认不可服务题目置 BLOCKED（only_uids 模式下不改动无关题状态）
     q_rows = conn.execute(
         """
         SELECT q.question_uid, q.eff_is_servable, q.eff_is_excluded,
@@ -238,18 +484,22 @@ async def run_stage4_weave_async(
     blocked_unservable = 0
     for r in q_rows:
         uid = str(r["question_uid"])
+        in_target_scope = resolved_target_set is None or uid in resolved_target_set
         if r["s3d_status"] != "OK":
-            _mark_s4_blocked(conn, uid, "上游 S3D 非 OK")
-            blocked_s3d += 1
+            if in_target_scope:
+                _mark_s4_blocked(conn, uid, "上游 S3D 非 OK")
+                blocked_s3d += 1
         elif not include_unservable and int(r["eff_is_servable"]) != 1:
-            _mark_s4_blocked(conn, uid, "eff_is_servable = 0 (NEEDS_REVIEW/EXCLUDED)")
-            blocked_unservable += 1
+            if in_target_scope:
+                _mark_s4_blocked(conn, uid, "eff_is_servable = 0 (NEEDS_REVIEW/EXCLUDED)")
+                blocked_unservable += 1
         else:
             eligible_uids.append(uid)
     conn.commit()
 
     store = VectorStore(vectors_dir)
-    # 2. 差量补齐向量与冻结分位表（保证 meta.json 就绪）
+    quantiles_rebuilt = False
+    # 2. 差量补齐向量与冻结分位表（保证 meta.json 就绪，并在未忽略漂移时自动刷新失真分位表）
     if mode != "import":
         embed_client = EmbeddingClient(settings, conn=conn, use_mock=use_mock)
         try:
@@ -285,8 +535,22 @@ async def run_stage4_weave_async(
         finally:
             await embed_client.aclose()
 
-        if not store.has_quantiles(slug, "surface") or not store.has_quantiles(slug, "skeleton"):
-            store.rebuild_quantiles(slug, ("surface", "skeleton"))
+        servable_total, cur_dist = _compute_scope_baseline(conn, grade_subject)
+        drift_info = evaluate_scope_drift(store.load_meta(), slug, servable_total, cur_dist)
+        quantiles_missing = (
+            not store.has_quantiles(slug, "surface")
+            or not store.has_quantiles(slug, "skeleton")
+        )
+        if quantiles_missing or (
+            not ignore_drift
+            and (bool(drift_info["drifted"]) or not bool(drift_info["has_baseline"]))
+        ):
+            store.rebuild_quantiles(
+                slug,
+                ("surface", "skeleton"),
+                scope_baseline={"n0": servable_total, "l1_dist": cur_dist},
+            )
+            quantiles_rebuilt = True
 
     features = load_question_features(
         conn, grade_subject=grade_subject, include_unservable=include_unservable
@@ -298,20 +562,26 @@ async def run_stage4_weave_async(
         scope_slug=slug,
         topology_cfg=settings.topology,
         features=features,
+        target_uids=resolved_target_set,
         include_unservable=include_unservable,
     )
 
     auto_edges: list[CandidateEdge] = []
-    refine_candidates: list[CandidateEdge] = []
+    raw_refine_candidates: list[CandidateEdge] = []
     use_refine = bool(settings.pipeline.enable_stage4_llm_refine)
     for e in raw_candidates:
         if use_refine and e.needs_llm_refine:
-            refine_candidates.append(e)
+            raw_refine_candidates.append(e)
         else:
             auto_edges.append(e)
 
+    refine_candidates = pretruncate_refine_candidates(
+        raw_refine_candidates, settings.topology
+    )
+
     # 3. 处理二级 LLM 精裁（api / export / import）
     verified_refine_edges: list[CandidateEdge] = []
+    rejected_refine_keys: set[tuple[tuple[str, str], str]] = set()
     if mode == "export":
         eff_bs = max(1, int(batch_size))
         batches: list[dict[str, Any]] = []
@@ -320,6 +590,8 @@ async def run_stage4_weave_async(
             "include_unservable": include_unservable,
             "pairs": {},
         }
+        if resolved_target_set is not None:
+            task_map["target_uids"] = sorted(resolved_target_set)
         for b_idx, start in enumerate(range(0, len(refine_candidates), eff_bs), start=1):
             chunk = refine_candidates[start : start + eff_bs]
             p_items: list[dict[str, Any]] = []
@@ -368,29 +640,28 @@ async def run_stage4_weave_async(
             max_parallel_workers=settings.subagent.max_parallel_workers,
             overwrite_pending=overwrite_pending,
         )
+        target_eligible_cnt = (
+            len([u for u in eligible_uids if u in resolved_target_set])
+            if resolved_target_set is not None
+            else len(eligible_uids)
+        )
         return {
             "mode": "export",
             "grade_subject": grade_subject,
-            "eligible_questions": len(eligible_uids),
+            "eligible_questions": target_eligible_cnt,
             "auto_candidates": len(auto_edges),
+            "raw_refine_candidates": len(raw_refine_candidates),
             "refine_candidates": len(refine_candidates),
+            "quantiles_rebuilt": quantiles_rebuilt,
+            "target_uids": sorted(resolved_target_set) if resolved_target_set is not None else None,
             "manifest": manifest,
         }
 
-    errs: list[dict[str, Any]] = []
     if mode == "import":
-        if results_path is None:
-            raise PreconditionError("PRECONDITION_FAILED: --mode import 必须提供 --results")
-        task_map_file = Path(tasks_dir) / "stage4_task_map.json"
-        valid_by_batch, loaded_map, errs = load_and_validate_results(
-            "stage4", results_path, task_map_file, Stage4RefineBatchOutput
-        )
-        if errs:
-            raise PreconditionError(f"PRECONDITION_FAILED: Stage 4 结果校验失败 {len(errs)} 批，详见 retry_tasks.jsonl")
         pairs_map = loaded_map.get("pairs", {})
         edge_by_key = {
             (normalize_edge_endpoints(e.relation_type, e.source_uid, e.target_uid), e.relation_type): e
-            for e in refine_candidates
+            for e in raw_refine_candidates
         }
         verdict_by_key: dict[tuple[tuple[str, str], str], tuple[bool, str]] = {}
         for out_model in valid_by_batch.values():
@@ -403,10 +674,13 @@ async def run_stage4_weave_async(
                 verdict_by_key[(ep, rt)] = (bool(dec.is_valid), dec.pedagogical_note.strip())
         for k, cand in edge_by_key.items():
             verdict = verdict_by_key.get(k)
-            if verdict is not None and verdict[0]:
-                cand.confidence_source = "LLM_VERIFIED"
-                cand.pedagogical_note = verdict[1]
-                verified_refine_edges.append(cand)
+            if verdict is not None:
+                if verdict[0]:
+                    cand.confidence_source = "LLM_VERIFIED"
+                    cand.pedagogical_note = verdict[1]
+                    verified_refine_edges.append(cand)
+                else:
+                    rejected_refine_keys.add(k)
     elif refine_candidates:
         cfg_p = Path(config_dir)
         if (cfg_p / "prompts" / "default.yaml").is_file() or prompt_profile is not None:
@@ -454,6 +728,10 @@ async def run_stage4_weave_async(
         for pid_to_edge, out_model in refine_results:
             dec_map = {d.pair_id: d for d in out_model.decisions}
             for pid, cand in pid_to_edge.items():
+                ep_key = (
+                    normalize_edge_endpoints(cand.relation_type, cand.source_uid, cand.target_uid),
+                    cand.relation_type,
+                )
                 refine_dec: Stage4RefineItem | None = dec_map.get(pid)
                 if refine_dec is None:
                     # 仅对 BOUNDARY_BAND 且无显式拒绝时保守留存规则命中（Mock 默认返回空列表场景），CONTRASTIVE 需显式认可或 rule_matrix 仅在 mock 时兜底
@@ -464,17 +742,81 @@ async def run_stage4_weave_async(
                     cand.confidence_source = "LLM_VERIFIED"
                     cand.pedagogical_note = refine_dec.pedagogical_note.strip()
                     verified_refine_edges.append(cand)
+                else:
+                    rejected_refine_keys.add(ep_key)
 
     # 4. 度数上限截断 + 合并 relation_overrides + 落库
-    capped = apply_degree_caps([*auto_edges, *verified_refine_edges], settings.topology)
-    final_edges = merge_relation_overrides(
-        conn,
-        capped,
-        features=features,
-        vector_store=store,
-        scope_slug=slug,
-        topology_cfg=settings.topology,
-    )
+    if resolved_target_set is None:
+        capped = apply_degree_caps([*auto_edges, *verified_refine_edges], settings.topology)
+        final_edges = merge_relation_overrides(
+            conn,
+            capped,
+            features=features,
+            vector_store=store,
+            scope_slug=slug,
+            topology_cfg=settings.topology,
+        )
+        edges_to_write = final_edges
+        uids_to_mark_ok = eligible_uids
+    else:
+        existing_rows = conn.execute(
+            """
+            SELECT *
+            FROM question_relations
+            WHERE source_question_uid IN (SELECT question_uid FROM questions WHERE grade_subject = ?)
+               OR target_question_uid IN (SELECT question_uid FROM questions WHERE grade_subject = ?);
+            """,
+            (grade_subject, grade_subject),
+        ).fetchall()
+        raw_candidate_keys = {
+            (normalize_edge_endpoints(e.relation_type, e.source_uid, e.target_uid), e.relation_type)
+            for e in raw_candidates
+        }
+        untouched_edges: list[CandidateEdge] = []
+        target_pool: dict[tuple[tuple[str, str], str], CandidateEdge] = {}
+        for row in existing_rows:
+            su = str(row["source_question_uid"])
+            tu = str(row["target_question_uid"])
+            rtype = str(row["relation_type"])
+            rec_edge = _reconstruct_existing_edge(row, features, settings.topology)
+            if su not in resolved_target_set and tu not in resolved_target_set:
+                untouched_edges.append(rec_edge)
+            elif str(row["confidence_source"]) == "LLM_VERIFIED":
+                ep_key = (normalize_edge_endpoints(rtype, su, tu), rtype)
+                if ep_key in raw_candidate_keys and ep_key not in rejected_refine_keys:
+                    target_pool[ep_key] = rec_edge
+
+        for e in [*auto_edges, *verified_refine_edges]:
+            ep = normalize_edge_endpoints(e.relation_type, e.source_uid, e.target_uid)
+            ep_key = (ep, e.relation_type)
+            prev = target_pool.get(ep_key)
+            if prev is not None and prev.confidence_source == "LLM_VERIFIED" and e.confidence_source != "LLM_VERIFIED":
+                continue
+            target_pool[ep_key] = CandidateEdge(
+                **{**e.__dict__, "source_uid": ep[0], "target_uid": ep[1]}
+            )
+
+        capped_target = _cap_incremental_target_edges(
+            untouched_edges,
+            list(target_pool.values()),
+            settings.topology,
+        )
+        merged_target = merge_relation_overrides(
+            conn,
+            capped_target,
+            features=features,
+            vector_store=store,
+            scope_slug=slug,
+            topology_cfg=settings.topology,
+            restrict_uids=resolved_target_set,
+        )
+        edges_to_write = [
+            e
+            for e in merged_target
+            if e.source_uid in resolved_target_set or e.target_uid in resolved_target_set
+        ]
+        final_edges = edges_to_write
+        uids_to_mark_ok = [u for u in eligible_uids if u in resolved_target_set]
 
     meta_ver = store.load_meta().get("meta_version", 0)
     s4_hash = f"rule={settings.topology.rule_version}|meta={meta_ver}|unservable={int(include_unservable)}"
@@ -482,8 +824,13 @@ async def run_stage4_weave_async(
     with CompileLock(lock_path):
         conn.execute("BEGIN IMMEDIATE;")
         try:
-            written = write_relations_for_scope(conn, final_edges, grade_subject=grade_subject)
-            for uid in eligible_uids:
+            written = write_relations_for_scope(
+                conn,
+                edges_to_write,
+                grade_subject=grade_subject,
+                target_uids=resolved_target_set,
+            )
+            for uid in uids_to_mark_ok:
                 conn.execute(
                     """
                     INSERT INTO compile_state(question_uid, stage, status, input_hash, prompt_version, model_name, attempts, last_error, updated_at)
@@ -504,6 +851,25 @@ async def run_stage4_weave_async(
             conn.rollback()
             raise
 
+    if mode == "import" and manifest_file.is_file():
+        try:
+            m_post = json.loads(manifest_file.read_text(encoding="utf-8"))
+            if isinstance(m_post, dict) and m_post.get("status") != "IMPORTED":
+                m_post["status"] = "IMPORTED"
+                m_post["imported_at"] = datetime.now(UTC).isoformat()
+                tmp_mf = manifest_file.with_name(f".{manifest_file.name}.{os.getpid()}.tmp")
+                try:
+                    tmp_mf.write_text(
+                        json.dumps(m_post, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    os.replace(tmp_mf, manifest_file)
+                except BaseException:
+                    tmp_mf.unlink(missing_ok=True)
+                    raise
+        except Exception:
+            pass
+
     counts_by_type: dict[str, int] = {rt: 0 for rt in RELATION_TYPES}
     for e in final_edges:
         counts_by_type[e.relation_type] = counts_by_type.get(e.relation_type, 0) + 1
@@ -511,14 +877,17 @@ async def run_stage4_weave_async(
     return {
         "mode": mode,
         "grade_subject": grade_subject,
-        "eligible_questions": len(eligible_uids),
+        "eligible_questions": len(uids_to_mark_ok),
         "blocked_s3d": blocked_s3d,
         "blocked_unservable": blocked_unservable,
         "raw_candidates": len(raw_candidates),
+        "raw_refine_candidates": len(raw_refine_candidates),
         "refine_candidates": len(refine_candidates),
         "written_edges": written,
         "counts_by_type": counts_by_type,
         "meta_version": meta_ver,
+        "quantiles_rebuilt": quantiles_rebuilt,
+        "target_uids": sorted(resolved_target_set) if resolved_target_set is not None else None,
     }
 
 

@@ -45,6 +45,76 @@ def _atomic_write_bytes(target: Path, write_fn: Any) -> None:
         raise
 
 
+def evaluate_scope_drift(
+    meta: dict[str, Any],
+    scope_slug: str,
+    servable_total: int,
+    current_l1_dist: dict[str, float],
+) -> dict[str, Any]:
+    """评估指定学段向量分位表相对冻结基准的题量与 L1 分布漂移（ARCHITECTURE §3.2）。"""
+    total = max(0, int(servable_total))
+    scopes = meta.get("scopes") if isinstance(meta, dict) else None
+    scope_entry = scopes.get(scope_slug) if isinstance(scopes, dict) else None
+
+    if not isinstance(scope_entry, dict):
+        reasons: list[str] = []
+        if total > 0:
+            reasons.append(
+                f"尚未记录 {scope_slug} 的分布基准，建议运行 `shuati reindex --quantiles`"
+            )
+        return {
+            "has_baseline": False,
+            "drifted": False,
+            "n0": 0,
+            "servable_total": total,
+            "rel_growth": 0.0,
+            "max_l1_delta": 0.0,
+            "tvd": 0.0,
+            "reasons": reasons,
+        }
+
+    n0 = int(scope_entry.get("n0") or 0)
+    raw_p0 = scope_entry.get("l1_dist")
+    p0: dict[str, float] = (
+        {str(k): float(v) for k, v in raw_p0.items()} if isinstance(raw_p0, dict) else {}
+    )
+    cur: dict[str, float] = {
+        str(k): float(v) for k, v in (current_l1_dist or {}).items()
+    }
+
+    rel_growth = round(abs(total - n0) / float(n0), 12) if n0 > 0 else 0.0
+    all_keys = set(p0.keys()) | set(cur.keys())
+    max_l1_delta = round(
+        max((abs(cur.get(k, 0.0) - p0.get(k, 0.0)) for k in all_keys), default=0.0),
+        12,
+    )
+    tvd = round(
+        0.5 * sum(abs(cur.get(k, 0.0) - p0.get(k, 0.0)) for k in all_keys),
+        12,
+    )
+
+    drift_reasons: list[str] = []
+    if n0 > 0 and rel_growth >= 0.20:
+        drift_reasons.append(
+            f"可服务题量变化 {rel_growth:.1%} >= 20% (n0={n0} -> N={total})"
+        )
+    if max_l1_delta >= 0.10:
+        drift_reasons.append(f"单 L1 模块占比偏移 {max_l1_delta:.3f} >= 0.10")
+    if tvd >= 0.15:
+        drift_reasons.append(f"L1 分布总变差距离 TVD={tvd:.3f} >= 0.15")
+
+    return {
+        "has_baseline": True,
+        "drifted": bool(drift_reasons),
+        "n0": n0,
+        "servable_total": total,
+        "rel_growth": rel_growth,
+        "max_l1_delta": max_l1_delta,
+        "tvd": tvd,
+        "reasons": drift_reasons,
+    }
+
+
 class VectorStore:
     """统一管理 5 类 .npz 向量矩阵与 meta.json 冻结分位表。"""
 
@@ -71,6 +141,7 @@ class VectorStore:
                 "meta_version": 0,
                 "updated_at": "",
                 "quantiles": {},
+                "scopes": {},
             }
         data = json.loads(self.meta_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -80,12 +151,15 @@ class VectorStore:
                 "meta_version": 0,
                 "updated_at": "",
                 "quantiles": {},
+                "scopes": {},
             }
         data.setdefault("embedding_model", "")
         data.setdefault("dimension", 0)
         data.setdefault("meta_version", 0)
         data.setdefault("updated_at", "")
         data.setdefault("quantiles", {})
+        if not isinstance(data.get("scopes"), dict):
+            data["scopes"] = {}
         return data
 
     def _save_meta(self, meta: dict[str, Any]) -> None:
@@ -228,6 +302,7 @@ class VectorStore:
                 meta["dimension"] = dim
             if force_rebuild and recorded_model and recorded_model != client.model_name:
                 meta["quantiles"] = {}
+                meta["scopes"] = {}
             self._save_meta(meta)
 
         return {
@@ -269,6 +344,7 @@ class VectorStore:
             meta["embedding_model"] = ""
             meta["dimension"] = 0
             meta["quantiles"] = {}
+            meta["scopes"] = {}
             self._save_meta(meta)
 
     def rebuild_quantiles(
@@ -278,6 +354,7 @@ class VectorStore:
         *,
         sample_pairs: int = 20000,
         seed: int = 42,
+        scope_baseline: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """按学段学科与通道抽样计算 101 点经验分位 LUT 并递增 meta_version。"""
         with self._lock():
@@ -331,12 +408,37 @@ class VectorStore:
                 }
 
             meta["quantiles"] = quantiles
+            if scope_baseline is not None:
+                scopes = meta.get("scopes")
+                if not isinstance(scopes, dict):
+                    scopes = {}
+                    meta["scopes"] = scopes
+                raw_dist = scope_baseline.get("l1_dist") or {}
+                scopes[scope_slug] = {
+                    "n0": int(scope_baseline.get("n0") or 0),
+                    "l1_dist": {str(k): float(v) for k, v in dict(raw_dist).items()},
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
             meta["meta_version"] = int(meta.get("meta_version", 0)) + 1
             self._save_meta(meta)
             return {
                 "meta_version": meta["meta_version"],
                 "channels": summary,
             }
+
+    def evaluate_scope_drift(
+        self,
+        scope_slug: str,
+        servable_total: int,
+        current_l1_dist: dict[str, float],
+    ) -> dict[str, Any]:
+        """评估当前 VectorStore 元数据中指定学段的漂移状态。"""
+        return evaluate_scope_drift(
+            self.load_meta(),
+            scope_slug,
+            servable_total,
+            current_l1_dist,
+        )
 
     def has_quantiles(self, scope_slug: str, channel: str) -> bool:
         meta = self.load_meta()

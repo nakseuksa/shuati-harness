@@ -1,11 +1,11 @@
 # 刷题 Harness v2（纯理科题库知识编译器 & `pi` 智能刷题底座）— 会话入口
 
-**开始工作前先读 [docs/HANDOFF.md](docs/HANDOFF.md)、[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 与 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)**。
+**开始工作前先读 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 与 [docs/records/INDEX.md](docs/records/INDEX.md)**。
 
 ## 核心约定
 
 1. **权威文档（主从双层架构）**:
-   - **顶层架构总纲（最高裁决权威）**：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（v2.6 定稿）
+   - **顶层架构总纲（最高裁决权威）**：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（v2.7 收官定稿）
    - **详细实施规范（从层 DDL/公式/CLI 细则）**：[docs/DESIGN.md](docs/DESIGN.md)（v2.6 主从对齐版）
    - **需求与理论基线**：[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)、[docs/理论基础.md](docs/理论基础.md)
 2. **历史归档保护**: `backup/v1/` 为旧版 Web 系统完整备份，**只读参考（勿修改）**；新系统在根目录从零搭建。

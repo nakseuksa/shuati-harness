@@ -160,6 +160,7 @@ class TopologyThresholdsConfig(BaseModel):
 
 class TopologyConfig(BaseModel):
     rule_version: str = "2.4-init"
+    refine_pool_multiplier: int = Field(default=3, ge=1)
     expected_degree: dict[str, list[int]] = Field(
         default_factory=lambda: {
             "CLONE": [0, 1],

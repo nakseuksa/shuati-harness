@@ -160,13 +160,30 @@ async def test_e2e_draft_pipeline_and_dual_channel_sanitization(tmp_path: Path) 
     q5_s4 = conn.execute("SELECT status FROM compile_state WHERE question_uid = 'primary_olympiad:ch03:q05' AND stage = 'S4';").fetchone()["status"]
     assert q5_s4 == "BLOCKED"
 
-    # 4. 锁定 1.0 后 S3C/S3D/S4 全置 STALE，并可无错全量重编
+    # 4. 先预检默认智能无损晋升（smart_preserve），再以 force_recompile=True 验证强制全清重编链路
+    dry_lock = transition_taxonomy(
+        conn,
+        grade_subject="小学奥数",
+        yaml_path=p_res["taxonomy_file"],
+        target_version="1.0",
+        target_status="LOCKED",
+        dry_run=True,
+        config_dir=cfg_dir,
+        backups_dir=tmp_path / "backups",
+        human_dir=tmp_path / "human",
+        reports_dir=tmp_path / "reports",
+        lock_path=tmp_path / ".lock",
+    )
+    assert dry_lock["promotion_mode"] == "smart_preserve"
+    assert dry_lock["preserved_l2_pairs"] >= 1
+
     lock_res = transition_taxonomy(
         conn,
         grade_subject="小学奥数",
         yaml_path=p_res["taxonomy_file"],
         target_version="1.0",
         target_status="LOCKED",
+        force_recompile=True,
         config_dir=cfg_dir,
         backups_dir=tmp_path / "backups",
         human_dir=tmp_path / "human",

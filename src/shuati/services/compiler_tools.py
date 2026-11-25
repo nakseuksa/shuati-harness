@@ -32,7 +32,7 @@ from shuati.db.connection import (
 from shuati.db.schema import init_db
 from shuati.llm.embeddings import EmbeddingClient, _is_loopback_base_url
 from shuati.llm.seam_loader import lint_prompt_seams
-from shuati.vectors.store import VectorStore
+from shuati.vectors.store import VectorStore, evaluate_scope_drift
 from shuati.verify.sympy_sandbox import run_verify_script
 
 _PIPELINE_STAGES: tuple[str, ...] = ("S1", "S2", "S3C", "S3D", "S4")
@@ -109,6 +109,8 @@ def scan_pending_batches(unified_root: Path | str = Path("data/unified")) -> lis
     pending: list[dict[str, Any]] = []
 
     # 1. 检查根目录 unified (UNIFIED_S1_S2 / STAGE2_ONLY)
+    u_manifest_path = root / "unified_manifest.json"
+    u_manifest_data = _safe_read_json(u_manifest_path) if u_manifest_path.is_file() else {}
     tmap_path = root / "task_map.json"
     batches_dir = root / "batches"
     root_batch_files = sorted(batches_dir.glob("batch_*.jsonl")) if batches_dir.is_dir() else []
@@ -124,31 +126,38 @@ def scan_pending_batches(unified_root: Path | str = Path("data/unified")) -> lis
         retry_files = sorted(root.glob("retry*.jsonl"))
         retry_count = sum(_count_jsonl_records(rf) for rf in retry_files)
 
-        if retry_count > 0 and matched_results == 0:
-            status = "HAS_RETRY"
-        elif matched_results == 0:
-            status = "NO_RESULTS"
-        elif task_count > 0 and matched_results < task_count:
-            status = "PARTIAL_RESULTS"
+        if (
+            isinstance(u_manifest_data, dict)
+            and u_manifest_data.get("status") == "IMPORTED"
+            and retry_count == 0
+        ):
+            pass
         else:
-            status = "READY_TO_IMPORT"
+            if retry_count > 0 and matched_results == 0:
+                status = "HAS_RETRY"
+            elif matched_results == 0:
+                status = "NO_RESULTS"
+            elif task_count > 0 and matched_results < task_count:
+                status = "PARTIAL_RESULTS"
+            else:
+                status = "READY_TO_IMPORT"
 
-        pending.append(
-            {
-                "dir": root.as_posix(),
-                "kind": "unified_s1_s2",
-                "step_kind": "unified",
-                "manifest_file": None,
-                "task_map_file": tmap_path.as_posix() if tmap_path.is_file() else None,
-                "batch_count": len(root_batch_files),
-                "task_count": task_count,
-                "results_files": [p.as_posix() for p in results_files],
-                "result_count": matched_results,
-                "retry_files": [p.as_posix() for p in retry_files if _count_jsonl_records(p) > 0],
-                "retry_count": retry_count,
-                "status": status,
-            }
-        )
+            pending.append(
+                {
+                    "dir": root.as_posix(),
+                    "kind": "unified_s1_s2",
+                    "step_kind": "unified",
+                    "manifest_file": u_manifest_path.as_posix() if u_manifest_path.is_file() else None,
+                    "task_map_file": tmap_path.as_posix() if tmap_path.is_file() else None,
+                    "batch_count": len(root_batch_files),
+                    "task_count": task_count,
+                    "results_files": [p.as_posix() for p in results_files],
+                    "result_count": matched_results,
+                    "retry_files": [p.as_posix() for p in retry_files if _count_jsonl_records(p) > 0],
+                    "retry_count": retry_count,
+                    "status": status,
+                }
+            )
 
     # 2. 检查 stage3_4/* 子目录
     stage34_dir = root / "stage3_4"
@@ -188,6 +197,13 @@ def scan_pending_batches(unified_root: Path | str = Path("data/unified")) -> lis
             result_count = _count_stage34_results(results_files)
             retry_files = sorted(sub.glob("retry*.jsonl"))
             retry_count = sum(_count_jsonl_records(rf) for rf in retry_files)
+
+            if (
+                isinstance(manifest_data, dict)
+                and manifest_data.get("status") == "IMPORTED"
+                and retry_count == 0
+            ):
+                continue
 
             if retry_count > 0 and result_count == 0:
                 status = "HAS_RETRY"
@@ -264,7 +280,6 @@ def _check_vectors_status(
             f"Embedding 模型与向量仓不一致 ({recorded_model!r} != {configured_embedding_model!r})，需重算向量仓。"
         )
 
-    scopes_meta = meta.get("scopes") if isinstance(meta.get("scopes"), dict) else {}
     for gs, s_info in subjects_info.items():
         slug = str(s_info["slug"])
         servable_total = int(s_info["servable_total"])
@@ -288,37 +303,34 @@ def _check_vectors_status(
             needs_reindex = True
             drift_warnings.append(f"{gs} ({slug}) 缺失冻结分位表 quantiles。")
 
-        scope_m = scopes_meta.get(slug) if isinstance(scopes_meta, dict) else None
-        if isinstance(scope_m, dict):
-            n0 = int(scope_m.get("n0") or 0)
-            if n0 > 0 and abs(servable_total - n0) / n0 >= 0.20:
-                needs_reindex = True
-                drift_warnings.append(
-                    f"{gs} ({slug}) 可服务题量相对冻结基准增长/变化 >= 20% (n0={n0} -> N={servable_total})，建议重建分位表。"
-                )
-            p0 = scope_m.get("l1_dist")
-            if isinstance(p0, dict) and conn is not None:
-                l1_rows = conn.execute(
-                    """
-                    SELECT eff_primary_l1_module, COUNT(*) AS cnt
-                    FROM questions
-                    WHERE grade_subject = ? AND is_retired = 0 AND eff_is_servable = 1
-                    GROUP BY eff_primary_l1_module
-                    """,
-                    (gs,),
-                ).fetchall()
-                cur_dist = {
-                    str(r["eff_primary_l1_module"] or ""): int(r["cnt"]) / servable_total
-                    for r in l1_rows
-                }
-                all_keys = set(p0.keys()) | set(cur_dist.keys())
-                max_delta = max((abs(cur_dist.get(k, 0.0) - float(p0.get(k, 0.0))) for k in all_keys), default=0.0)
-                tvd = 0.5 * sum(abs(cur_dist.get(k, 0.0) - float(p0.get(k, 0.0))) for k in all_keys)
-                if max_delta >= 0.10 or tvd >= 0.15:
-                    needs_reindex = True
-                    drift_warnings.append(
-                        f"{gs} ({slug}) L1 分布发生漂移 (max_delta={max_delta:.3f}, TVD={tvd:.3f})，建议重算分位表。"
-                    )
+        cur_dist: dict[str, float] = {}
+        if conn is not None:
+            l1_rows = conn.execute(
+                """
+                SELECT eff_primary_l1_module, COUNT(*) AS cnt
+                FROM questions
+                WHERE grade_subject = ? AND is_retired = 0 AND eff_is_excluded = 0 AND eff_is_servable = 1
+                GROUP BY eff_primary_l1_module
+                """,
+                (gs,),
+            ).fetchall()
+            cur_dist = {
+                str(r["eff_primary_l1_module"] or ""): int(r["cnt"]) / float(servable_total)
+                for r in l1_rows
+            }
+
+        drift_eval = evaluate_scope_drift(meta, slug, servable_total, cur_dist)
+        if not drift_eval["has_baseline"]:
+            needs_reindex = True
+            drift_warnings.append(
+                f"[VECTOR_DRIFT] {gs} ({slug}) 存在 {servable_total} 道可服务题但尚未记录 scopes 分布基准，建议运行 `shuati reindex --quantiles`。"
+            )
+        elif drift_eval["drifted"]:
+            needs_reindex = True
+            reason_txt = "；".join(drift_eval["reasons"])
+            drift_warnings.append(
+                f"[VECTOR_DRIFT] {gs} ({slug}) 向量分位基准发生漂移（{reason_txt}），建议运行 `shuati reindex --quantiles`。"
+            )
 
     return {
         "embedding_model": recorded_model,

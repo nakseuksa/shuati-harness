@@ -1,11 +1,11 @@
-# 纯理科题库知识编译器与 `pi` 智能刷题底座 — 架构总纲（v2.6 定稿）
+# 纯理科题库知识编译器与 `pi` 智能刷题底座 — 架构总纲（v2.7 收官定稿）
 
-> **版本状态**：v2.6 权威总纲定稿（在 v2.5 的 21 项评审裁决基础上，合入第三方独立架构与 1,728 题实库实证审核的 **6 项核心拍板裁决 D-Audit-1 ～ D-Audit-6** 及 11 项代码对齐契约）  
+> **版本状态**：v2.7 权威总纲定稿（在 v2.6 的 6 项核心拍板裁决 D-Audit-1 ～ D-Audit-6 基础上，100% 完成全部 11 项代码对齐清单、M3 智能刷题交互底座、无损锁表/复核防级联/Stage 4 预截断优化及一期全库 `LOCKED 1.0` 收官交付）  
 > **文档治理（主从双层架构，D-Audit-1）**：
 > - **顶层总纲（本文档）**：定义系统定位、纯理科理论基准、架构硬不变量、生命周期规则与跨模块关键裁决；凡历史文档与本文档存在冲突者，一律以本文档为准。
-> - **从层实施细则**：[DESIGN.md](DESIGN.md)（保留完整 20 表 SQLite DDL、逐列 `effective.py` 解析表、M3 学习者在线 Elo 完整参数公式、组卷槽位退避细则、CLI JSON 信封规范与 HTML 打印单规范）、[REQUIREMENTS.md](REQUIREMENTS.md)（原始业务需求基线）、[理论基础.md](理论基础.md)（难度与五边拓扑理论溯源）。
+> - **从层实施细则**：[DESIGN.md](DESIGN.md)（保留完整 20 表 SQLite DDL、逐列 `effective.py` 解析表、M3 学习者在线 Elo 完整参数公式、组卷槽位退避细则、CLI JSON 信封规范与 HTML 打印单规范）、[CLI_GUIDE.md](CLI_GUIDE.md)（51 子命令完整参数字典与双通道/增量编排手册）、[REQUIREMENTS.md](REQUIREMENTS.md)（原始业务需求基线）、[理论基础.md](理论基础.md)（难度与五边拓扑理论溯源）。
 >
-> **当前实库工程基线（2026-11-22 实测）**：本地 `data/shuati.db` 共 **1,728 题**（剔除坏题 3 道；活跃 **1,725 题**已完成 Stage 0/1/1.5/2 及首轮 Stage 3/4 `DRAFT` 试跑，其中 `eff_is_servable = 1` 共 **1,649 题**，`NEEDS_REVIEW` 待人工复核 **76 题**；沉淀 5,385 条解题步骤、4,493 组去重 `(raw_l1, raw_l2)`；下一步按本总纲 v2.6 完成 11 项代码对齐并重跑 Stage 3d/Stage 4 后锁定 `LOCKED 1.0`）。
+> **当前实库工程基线（2026-11-25 实测收官终态）**：本地 `data/shuati.db` 扫描 1,734 题（去重归并后活跃 **1,728 题**），全阶段编译矩阵 `S1 / S2 / S3C / S3D / S4` 均达 **`1,728 OK`（可服务率 `100.0%`，`VERIFIED_CONSENSUS = 1,644`、`HUMAN_VERIFIED = 84`、`NEEDS_REVIEW = 0`）**；`小学奥数` 词表已正式锁定 **`LOCKED 1.0`**（**8 个 L1 模块、62 个 L2 核心模型、679 个活跃标准 L3 算子**，L3 归一化熵 `0.9192`，**50 条无环先修边** + 335 条跨模块共现边）；全库织就 **3,740 条五边教学关联**（`CLONE=94`、`ISOMORPHIC=277`、`SCAFFOLD=2,259`、`CONTRASTIVE=106`、`SHARED_TRAP=1,004`）；M3 在线画像、自适应组卷、防剧透伴学、HTML 双模式练习单、三套内置 Skill 与 51 个 CLI 子命令已全量就绪。
 
 ---
 
@@ -161,9 +161,9 @@ flowchart TD
    - `skeleton_<slug>.npz`：编码 `eff_abstract_skeleton`；
    - `l3_nodes_<slug>.npz`：仅编码活跃 `node_level = 'L3'` 节点（`L1/L2/L3` 组合文本，严格排除 `L2` 汇总节点）；
    - `concepts_method.npz` & `concepts_motif.npz`：编码活跃非种子全局概念。
-2. **`meta.json` 冻结分位表与自动漂移巡检**：
-   - 记录 `embedding_model`、`dimension`、`meta_version`、建表时作用域可服务题量 $N_0$、各 L1 模块占比分布向量 $\mathbf{p}_0$，以及最多 20,000 对随机题对的 101 点经验余弦分位表。
-   - **重算触发条件**：满足任一即在 `audit` / `reindex` 中告警并触发重建分位表（递增 `meta_version`，置该学段 `S4 = STALE`）：① 显式执行 `shuati reindex --quantiles` 或切换 Embedding 模型；② 作用域内 `eff_is_servable = 1` 题量相对 $N_0$ 增长 $\ge 20\%$；③ 任一 L1 模块占比偏移 $|\Delta p_i| \ge 0.10$ 或总变差距离 $\text{TVD}(\mathbf{p}, \mathbf{p}_0) \ge 0.15$。
+2. **`meta.json` 冻结分位表与读写解耦漂移巡检**：
+   - 记录 `embedding_model`、`dimension`、`meta_version`、`scopes.<slug>` 冻结基准（建表时作用域可服务题量 $N_0$ 与各 L1 模块占比分布向量 $\mathbf{p}_0$），以及最多 20,000 对随机题对的 101 点经验余弦分位表。
+   - **读写解耦触发规则（D-Grill-5）**：① `shuati status` 与 `shuati audit` 保持**纯只读零写库**，当检测到作用域内 `eff_is_servable = 1` 题量相对 $N_0$ 变化 $\ge 20\%$、任一 L1 模块占比偏移 $|\Delta p_i| \ge 0.10$ 或总变差距离 $\text{TVD}(\mathbf{p}, \mathbf{p}_0) \ge 0.15$（或缺失 `scopes` 基准）时输出 `VECTOR_DRIFT` 告警；② 执行 `shuati reindex --quantiles`（或切换 Embedding 模型）时写入最新 `scopes.<slug>.{n0, l1_dist}` 基准、递增 `meta_version` 并将该学段就绪题 `S4` 置 `STALE`；③ `shuati compile --stage 4` 织网前若检测到超阈值漂移（且未传 `--ignore-drift`），自动前置刷新分位表。
 
 ### 3.3 人工资产与外部错题安全恢复协议（`shuati human restore`，D-Audit-6）
 
@@ -191,9 +191,9 @@ flowchart TD
 
 ### 4.3 Stage 3：词表锁表状态机与同 `L2` 域算子聚类归纳（D-Audit-2）
 
-1. **`DRAFT → LOCKED 1.0` 原子锁表与维护降级模式**：
-   - `shuati taxonomy lock` 先做 `VACUUM INTO` 备份并持 `CompileLock`：单事务内完成 ① `human_overrides` 词表字段自动映射/挂起；② **`practice_log.stuck_node_id` 按 `(l1, l2)` 同步映射至新词表节点或置 `NULL`（保留 `stuck_sub_goal` 文本快照，零悬空 ID）**；③ 清空机器 `m_l1/m_l2/m_knowledge_node_id`（严格保护 `raw_l1/raw_l2/raw_l3` 只读）；④ 清理旧 `draft-%` 节点与边并归档旧并查集账本；⑤ 更新 `grade_subjects` 状态与全学段 `S3C/S3D/S4 = STALE`；**事务 `commit()` 成功后**再原子写盘新 YAML 与 `human/*.jsonl`（杜绝回滚撕裂）。
-   - **维护降级模式**：锁表提交后至 S3C/S3D 重编完成期间，基础题干检索、单题查看与做题日志正常服务；`--l2/--l3` 检索、知识树热力与依赖 `K_set` 的功能显式返回 `MAINTENANCE_DEGRADED` 提示，重编完毕自动恢复。
+1. **`DRAFT → LOCKED 1.0` 智能无损晋升锁表与维护降级模式（D-Grill-2）**：
+   - `shuati taxonomy lock` 先做 `VACUUM INTO` 备份并持 `CompileLock`：默认启用外键安全顺序的**智能无损晋升（Smart In-Place Promotion）**——对未删改或经 `changelog` 重命名的 `(L1, L2)` 模块，单事务内原地将 `L2` 节点、活跃主 `L3` 算子、重定向子 `L3` 节点、`knowledge_edges`、满足 1-to-1 拓扑同构的可逆 `compaction_audit_ledger`、`question_steps`、`practice_log.stuck_node_id`（精确保留 L3 级卡点）、`human_overrides` 及保留题目的 `S3C/S3D` `input_hash` 确定性重映射至新版本，仅对被删除/拆分导致失配的题目清空挂载并置 `S3C/S3D/S4 = STALE`（传 `--force-recompile` 则走全量清空重编兼容路径）；**事务 `commit()` 成功后**再原子写盘新 YAML、`human/*.jsonl` 并原地更新 `l3_nodes_<slug>.npz` 的 `ids` 数组（杜绝回滚撕裂，未变模块零 Token 秒级锁表）。
+   - **维护降级模式**：若存在删改模块或传 `--force-recompile` 进入重编窗口期，基础题干检索、单题查看与做题日志正常服务；`--l2/--l3` 检索、知识树热力与依赖 `K_set` 的功能显式返回 `MAINTENANCE_DEGRADED` 提示，差量重编完毕自动恢复。
 2. **Stage 3d 升级：同 `L2` 域 `Cluster-then-Assign` 标准算子归纳（D-Audit-2）**：
    - **废弃全量两两字面同义批裁判**（实测 6.8 万对仅合并 1.8%，留下 96% `df=1` 单题孤岛）；
    - **新机制（同域聚类归纳）**：在严格同一 `(grade_subject, taxonomy_version, L1, L2)` 作用域内（排除 `node_level='L2'` 汇总节点），汇总该 `L2` 下全部去重 `raw_l3` 短语及频次（若某 `L2` 下去重 `raw_l3` 超过 80 条，先以 Embedding 预聚为子簇），一次送入强推理模型（支持 `--mode api|export|import`）**归纳出 5～15 个 4～14 字标准原子转化算子（`canonical_l3`）并将每个 `raw_l3` 映射归入对应标准算子**；
@@ -231,21 +231,28 @@ flowchart TD
 
 ---
 
-## 六、 迈向 `LOCKED 1.0` 与 M3 的代码对齐路线图（11 项实施清单）
+## 六、 一期代码对齐收官验收基线（11/11 已闭环）与二期演进路线图
 
-在当前 M2 `DRAFT` 基线上，下一步按以下优先级推进工程闭环（遵循三模型实证测试纪律）：
+### 6.1 v2.6 → v2.7 全部 11 项实施清单与收官增强验收状态
 
-1. **P0 拓扑与知识网核心修正（4 项）**：
-   - 修正 [topology.py](file:///d:/0.default/shuati-harness/src/shuati/core/topology.py) 与 [prompt_builder.py](file:///d:/0.default/shuati-harness/src/shuati/llm/prompt_builder.py) 中 `SCAFFOLD` 方向为 `source = 子题 → target = 母题`（D-Audit-5）；
-   - 修正 [topology.py](file:///d:/0.default/shuati-harness/src/shuati/core/topology.py) 平滑 IDF 为 `+ 1.0`、陷阱重合分母改为并集 $E_A \cup E_B$，并在 `SHARED_TRAP` 中排除 `TRAP_ARITHMETIC_SLIP`（D-Audit-3）；
-   - 修正 [stage4_weave.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/stage4_weave.py) 中 `surface` 向量拼接为 `eff_question_text + "\n" + eff_visual_facts`，并过滤非 `eff_is_servable` 题；
-   - 升级 [stage3_taxonomy.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/stage3_taxonomy.py) 与 [knowledge_graph.py](file:///d:/0.default/shuati-harness/src/shuati/core/knowledge_graph.py) 为同 `L2` 域 `Cluster-then-Assign` 标准算子归纳归并（采纳 `canonical_name`），并放宽 Stage 4 `ISOMORPHIC`/`SCAFFOLD` 为“向量近邻 + `L2` 共现宽进召回 → LLM 精裁”（D-Audit-2）。
-2. **P1 多模态 Stage 2、数据安全与生命周期补齐（5 项）**：
-   - 新增独立 `pipeline/stage2_decompose.py` 与 `shuati compile --stage 2`，对 `has_images = 1` 强制传原图并注入人工 `eff_visual_facts` 最高优先级指令（D-Audit-4）；
-   - 升级 [human_mirror.py](file:///d:/0.default/shuati-harness/src/shuati/db/human_mirror.py) 新增 `human/external_questions.jsonl` 镜像、外键完整性前置预检与 `include_practice_log` 防误删保护（D-Audit-6）；
-   - 升级 [effective.py](file:///d:/0.default/shuati-harness/src/shuati/core/effective.py) 与 [refresh.py](file:///d:/0.default/shuati-harness/src/shuati/core/refresh.py) 落地分组 `base_fingerprint`（仅验真类强绑 `content_hash`）；
-   - 升级 [taxonomy.py](file:///d:/0.default/shuati-harness/src/shuati/core/taxonomy.py) 在 `taxonomy lock` 中同步迁移/置空 `practice_log.stuck_node_id`、将磁盘 YAML 写入移至 `conn.commit()` 之后，并补齐维护降级模式状态校验；
-   - 升级 [subagent_bridge.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/subagent_bridge.py) 强制校验批处理返回条目完整性，杜绝截断静默放行。
-3. **P2 质检巡检完善与 M3/M4 推进（2 项）**：
-   - 完善 [store.py](file:///d:/0.default/shuati-harness/src/shuati/vectors/store.py) 与 [audit.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/audit.py)：补齐 `meta.json` 漂移检测（$N_0, \mathbf{p}_0$）、单路有图题优先假共识抽检队列及 `legacy_tags` 对比板块；
-   - 实库重跑优化后的 Stage 3d/Stage 4 验证五边分布健康度，审定词表锁定 `LOCKED 1.0`，随后进入 **M3（`pi` CLI/Skill 交互底座、启发式画像、自适应组卷与双模式 HTML 练习单）**。
+原 v2.6 制定的 **11 项代码对齐清单及 M3 交互底座已 100% 落地并通过实证回归测试与实库收官验收**（历次裁决与审计记录见 [docs/records/INDEX.md](records/INDEX.md)）：
+
+1. **✅ P0 拓扑与知识网核心修正（4/4 已验收）**：
+   - [topology.py](file:///d:/0.default/shuati-harness/src/shuati/core/topology.py) 与 [prompt_builder.py](file:///d:/0.default/shuati-harness/src/shuati/llm/prompt_builder.py) 全局锁死 `SCAFFOLD` 方向为 `source = 子题 → target = 母题`（D-Audit-5）；
+   - [topology.py](file:///d:/0.default/shuati-harness/src/shuati/core/topology.py) 平滑 IDF `+ 1.0`、陷阱并集分母并在 `SHARED_TRAP` 中排除 `TRAP_ARITHMETIC_SLIP`（D-Audit-3）；
+   - [stage4_weave.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/stage4_weave.py) `surface` 向量强制拼接 `eff_question_text + "\n" + eff_visual_facts` 并默认隔离非 `eff_is_servable` 题；
+   - [stage3_taxonomy.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/stage3_taxonomy.py) 与 [knowledge_graph.py](file:///d:/0.default/shuati-harness/src/shuati/core/knowledge_graph.py) 升级为同 `L2` 域 `Cluster-then-Assign` 标准算子归纳归并，Stage 4 升级为宽进召回 + 单侧 `_near_threshold` + 每题 `3 × degree_cap` 精裁池预截断 + `--only-uids` 差量织网（D-Audit-2 & D-Grill-7）。
+2. **✅ P1 多模态 Stage 2、数据安全与生命周期补齐（5/5 已验收）**：
+   - 独立多模态 [stage2_decompose.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/stage2_decompose.py) 与 `shuati compile --stage 2`（有图题强制传原图 + 人工核定事实最高权威，D-Audit-4）；
+   - [human_mirror.py](file:///d:/0.default/shuati-harness/src/shuati/db/human_mirror.py) 5 文件 git 快照（含 `external_questions.jsonl` 自举、外键预检与日志保护，D-Audit-6）；
+   - [effective.py](file:///d:/0.default/shuati-harness/src/shuati/core/effective.py) 与 [refresh.py](file:///d:/0.default/shuati-harness/src/shuati/core/refresh.py) 三组分组 `base_fingerprint`；[stage1_solve.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/stage1_solve.py) `materialize_solutions` 升级为原地 `UPSERT` 杜绝复核采纳级联误删步骤；
+   - [taxonomy.py](file:///d:/0.default/shuati-harness/src/shuati/core/taxonomy.py) 智能无损晋升锁表、迁移 `practice_log.stuck_node_id`、事务后写盘 YAML 与 `MAINTENANCE_DEGRADED` 降级保护（D-Grill-2）；
+   - [subagent_bridge.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/subagent_bridge.py) 与 [stage4_weave.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/stage4_weave.py) 强制校验批次及条目 100% 完整性。
+3. **✅ P2 质检巡检闭环、`LOCKED 1.0` 正式锁表与 M3 全量交付（2/2 已验收）**：
+   - [store.py](file:///d:/0.default/shuati-harness/src/shuati/vectors/store.py)、[compiler_tools.py](file:///d:/0.default/shuati-harness/src/shuati/services/compiler_tools.py)、[facade.py](file:///d:/0.default/shuati-harness/src/shuati/services/facade.py) 与 [audit.py](file:///d:/0.default/shuati-harness/src/shuati/pipeline/audit.py) 已完成 `scopes` 分布漂移检测、单路有图题置顶抽检队列 + Wilson 95% 置信上界、8 档与四维难度直方图及 `legacy_tags` 纠偏对比 8 板块闭环；
+   - 一期 `小学奥数` 全库 **1,728 / 1,728 题** 已达成全阶段 `100% OK` 并锁定 **`LOCKED 1.0`**（679 个标准算子、3,740 条五边关系），M3 在线画像、自适应组卷、防剧透判题、双模式 HTML 练习单、三套内置 Skill（`shuati-init` / `shuati-compiler` / `shuati`）、三层提示词接缝与角色隔离 MCP 服务已全部投产。
+
+### 6.2 二期与日常演进路线图
+
+1. **日常伴学与题库增量维护**：通过 [`skills/shuati/SKILL.md`](../skills/shuati/SKILL.md) 开展多学习者日常自适应刷题、错题诊断入库与水平追踪；新增同科章节或遇到新 `L2` 候选时，通过 [`skills/shuati-compiler/SKILL.md`](../skills/shuati-compiler/SKILL.md) 走差量编译与 `taxonomy migrate`（`1.0 → 1.1`）平滑升级。
+2. **多学段纯理科扩展（初中/高中数理化）**：接入新学段题源时，运行 `shuati grade-subject add` 并沿 [`skills/shuati-init/SKILL.md`](../skills/shuati-init/SKILL.md) 完成学科专属提示词接缝（`config/prompts/subjects/<slug>.yaml`）、4～5 道黄金锚点定标与独立词表涌现；按需在 `verify/` 增量挂载物理单位制/有效数字或化学方程式配平校验插件，并激活跨学段 `ISOMORPHIC` 与 `SHARED_TRAP` 联合骨架桥接。

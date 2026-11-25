@@ -353,7 +353,7 @@ shuati unified import --results data/unified/results.jsonl --task-map data/unifi
 
 #### 19. `shuati compile`
 按阶段执行断点续跑的离线知识编译流水线，统一支持 `api` 直连与 `export / import` 脱敏批任务包双通道。
-- **业务选项**：`--stage TEXT`（必填：`1` 视觉转译与求解验真 / `2` 强制多模态拆解与四维打标 / `3c` 词表回填映射 / `3d` 同域节点挂载 / `3e` 先修依赖 DAG / `4` 五边拓扑织网 / `all` 顺序执行 `3c→3d→compact→3e→4`，`all` 仅限 `--mode api`）、`--mode TEXT`（`api` / `export` / `import`，默认 `api`）、`--grade-subject TEXT`、`--only-uids TEXT`、`--stress-test-25`（Stage 1 仅跑 25 题压力测试集）、`--force`、`--include-human-verified`（Stage 1 包含已人工核验题重跑）、`--include-unservable`（Stage 4 包含 `NEEDS_REVIEW` 题）、`--tasks-dir PATH`、`--results PATH`、`--batch-size INTEGER`、`--subagent-model TEXT`、`--prompt-profile TEXT`、`--overwrite-pending`。
+- **业务选项**：`--stage TEXT`（必填：`1` 视觉转译与求解验真 / `2` 强制多模态拆解与四维打标 / `3c` 词表回填映射 / `3d` 同域节点挂载 / `3e` 先修依赖 DAG / `4` 五边拓扑织网 / `all` 顺序执行 `3c→3d→compact→3e→4`，`all` 仅限 `--mode api`）、`--mode TEXT`（`api` / `export` / `import`，默认 `api`）、`--grade-subject TEXT`、`--only-uids TEXT`（支持 Stage 1/2/4 按指定题集差量编译与差量织网）、`--stress-test-25`（Stage 1 仅跑 25 题压力测试集）、`--force`、`--include-human-verified`（Stage 1 包含已人工核验题重跑）、`--include-unservable`（Stage 4 包含 `NEEDS_REVIEW` 题）、`--ignore-drift`（Stage 4 跳过向量分位漂移前置自动重算）、`--tasks-dir PATH`、`--results PATH`、`--batch-size INTEGER`、`--subagent-model TEXT`、`--prompt-profile TEXT`、`--overwrite-pending`。
 ```bash
 shuati compile --stage 1 --grade-subject "小学奥数" --mode api --json
 shuati compile --stage all --grade-subject "小学奥数" --mode api --json
@@ -367,8 +367,8 @@ shuati review --grade-subject "小学奥数" --port 8765
 ```
 
 #### 21. `shuati audit`
-执行 Stage Q 全库质量体检，输出覆盖验真率、难度分布、L3 收敛度、DAG 无环、五边度数、向量漂移与人工镜像一致性的 7 板块报告。
-- **业务选项**：`--grade-subject TEXT`、`--prune-runs`（清理未被引用的历史失败 `stage1_vlm_runs` 记录）。
+执行 Stage Q 全库质量体检（纯只读无写库副作用），输出覆盖验真率与假共识 Wilson 置信上界、8 档与四维难度分布、L3 收敛度、DAG 无环、五边度数、`scopes` 向量漂移巡检、人工镜像一致性及新旧 `legacy_tags` 纠偏对比的 8 板块报告。
+- **业务选项**：`--grade-subject TEXT`、`--prune-runs`（显式传入时清理未被引用的历史失败 `stage1_vlm_runs` 记录）。
 ```bash
 shuati audit --grade-subject "小学奥数" --json
 ```
@@ -399,8 +399,8 @@ shuati taxonomy candidates --grade-subject "小学奥数" --status PENDING --jso
 ```
 
 #### 25. `shuati taxonomy lock`
-Stage 3b 执行四步原子事务，将词表从 `DRAFT` 锁定晋升为 `LOCKED` 正式版（自动备份数据库、迁移人工覆写与做题卡点节点、标记后续阶段待重编）。
-- **业务选项**：`--grade-subject TEXT`（默认 `小学奥数`）、`--file PATH`（默认取当前学段词表 YAML）、`--to-version TEXT`（默认 `1.0`）、`--status TEXT`（`LOCKED` / `DRAFT`，默认 `LOCKED`）、`--allow-stale-overrides`（将无法自动映射的覆写置为 `TAXONOMY_UNMAPPED` 挂起）、`--dry-run`（仅预检迁移影响）。
+Stage 3b 执行原子事务，将词表从 `DRAFT` 锁定晋升为 `LOCKED` 正式版（默认启用**智能无损晋升**，保留未删改模块的算子、先修边、并查集可逆账本、步骤挂载与 L3 向量 ID，仅对删改模块关联题目局部置 `STALE`；传 `--force-recompile` 则执行全量清空重编）。
+- **业务选项**：`--grade-subject TEXT`（默认 `小学奥数`）、`--file PATH`（默认取当前学段词表 YAML）、`--to-version TEXT`（默认 `1.0`）、`--status TEXT`（`LOCKED` / `DRAFT`，默认 `LOCKED`）、`--allow-stale-overrides`（将无法自动映射的覆写置为 `TAXONOMY_UNMAPPED` 挂起）、`--force-recompile`（强制清空旧节点与挂载并全学段重编）、`--vectors-dir PATH`（默认 `data/vectors`）、`--dry-run`（仅预检迁移与保留统计）。
 ```bash
 shuati taxonomy lock --grade-subject "小学奥数" --to-version 1.0 --status LOCKED --dry-run --json
 ```

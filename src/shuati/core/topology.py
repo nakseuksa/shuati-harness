@@ -319,7 +319,8 @@ def _trap_idf_overlap(ea: set[str], eb: set[str], idf_t: dict[str, float]) -> fl
 def _near_threshold(val: float, threshold: float, band: float) -> bool:
     if threshold <= 0.0 or band <= 0.0:
         return False
-    return abs(val - threshold) <= threshold * band
+    lower = round(threshold * (1.0 - band), 12)
+    return lower <= val < threshold
 
 
 def _compute_knn_ranks(vecs: np.ndarray, top_k: int) -> dict[int, dict[int, int]]:
@@ -557,9 +558,9 @@ def generate_candidate_edges(
             iso_struct_ok
             and not iso_core_hit
             and iso_boundary > 0
-            and k_pct >= th.isomorphic.skeleton_pct * (1.0 - iso_boundary)
-            and k_sim >= th.isomorphic.skeleton_sim_min * (1.0 - iso_boundary)
-            and k_jacc >= th.isomorphic.k_jaccard_min * (1.0 - iso_boundary)
+            and k_pct >= round(th.isomorphic.skeleton_pct * (1.0 - iso_boundary), 12)
+            and k_sim >= round(th.isomorphic.skeleton_sim_min * (1.0 - iso_boundary), 12)
+            and k_jacc >= round(th.isomorphic.k_jaccard_min * (1.0 - iso_boundary), 12)
         )
         shared_k_tokens = fa.k_union & fb.k_union
         is_skel_topk_any = (
@@ -630,8 +631,8 @@ def generate_candidate_edges(
                 and not sc_core
                 and sc_band > 0
                 and elo_gap > 0
-                and low_in_high >= th.scaffold.containment_min * (1.0 - sc_band)
-                and elo_gap >= th.scaffold.min_elo_diff * (1.0 - sc_band)
+                and low_in_high >= round(th.scaffold.containment_min * (1.0 - sc_band), 12)
+                and elo_gap >= round(th.scaffold.min_elo_diff * (1.0 - sc_band), 12)
             )
             shared_l2 = bool(low_f.l2_entities & high_f.l2_entities)
             skel_related = (
@@ -736,6 +737,56 @@ def generate_candidate_edges(
                 )
 
     return out_edges
+
+
+def pretruncate_refine_candidates(
+    refine_edges: list[CandidateEdge],
+    topology_cfg: TopologyConfig,
+) -> list[CandidateEdge]:
+    """送 LLM 二级精裁前按 refine_pool_multiplier * degree_cap 预截断冗余候选边。"""
+    mult = max(1, int(topology_cfg.refine_pool_multiplier))
+    th = topology_cfg.thresholds
+    undirected_caps = {
+        "CLONE": th.clone.degree_cap,
+        "ISOMORPHIC": th.isomorphic.degree_cap,
+        "CONTRASTIVE": th.contrastive.degree_cap,
+        "SHARED_TRAP": th.shared_trap.degree_cap,
+    }
+
+    by_type: dict[str, list[CandidateEdge]] = {}
+    for e in refine_edges:
+        by_type.setdefault(e.relation_type, []).append(e)
+
+    ordered_types = [rt for rt in RELATION_TYPES if rt in by_type] + [
+        rt for rt in sorted(by_type.keys()) if rt not in RELATION_TYPES
+    ]
+
+    kept: list[CandidateEdge] = []
+    for rtype in ordered_types:
+        ranked = sorted(
+            by_type[rtype],
+            key=lambda x: (-float(x.rank_score), x.source_uid, x.target_uid),
+        )
+        if rtype == "SCAFFOLD":
+            out_cap = mult * th.scaffold.out_degree_cap
+            in_cap = mult * th.scaffold.in_degree_cap
+            out_deg: dict[str, int] = {}
+            in_deg: dict[str, int] = {}
+            for e in ranked:
+                if out_deg.get(e.source_uid, 0) < out_cap and in_deg.get(e.target_uid, 0) < in_cap:
+                    kept.append(e)
+                    out_deg[e.source_uid] = out_deg.get(e.source_uid, 0) + 1
+                    in_deg[e.target_uid] = in_deg.get(e.target_uid, 0) + 1
+        else:
+            cap = mult * undirected_caps[rtype]
+            deg: dict[str, int] = {}
+            for e in ranked:
+                u, v = normalize_edge_endpoints(rtype, e.source_uid, e.target_uid)
+                if deg.get(u, 0) < cap and deg.get(v, 0) < cap:
+                    kept.append(e)
+                    deg[u] = deg.get(u, 0) + 1
+                    deg[v] = deg.get(v, 0) + 1
+    return kept
 
 
 def apply_degree_caps(edges: list[CandidateEdge], topology_cfg: TopologyConfig) -> list[CandidateEdge]:

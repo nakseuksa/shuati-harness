@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -80,6 +81,101 @@ def _insert_active_override(
     )
 
 
+def _canonical_answers_key(raw_json: str | None) -> str:
+    if not raw_json:
+        return "[]"
+    try:
+        parsed = json.loads(raw_json)
+        if isinstance(parsed, list) and parsed:
+            parts = normalize_answer_parts([AnswerPart.model_validate(x) for x in parsed])
+            return json.dumps([p.model_dump() for p in parts], ensure_ascii=False, sort_keys=True)
+        if isinstance(parsed, list):
+            return "[]"
+    except Exception:
+        pass
+    return str(raw_json)
+
+
+def _snapshot_s2_upstream(conn: sqlite3.Connection, question_uid: str) -> dict[str, Any]:
+    q_row = conn.execute(
+        """
+        SELECT eff_question_text, eff_visual_facts, eff_final_answers_json,
+               eff_is_servable, eff_verification_status
+        FROM questions
+        WHERE question_uid = ?
+        """,
+        (question_uid,),
+    ).fetchone()
+    sols = conn.execute(
+        """
+        SELECT branch_id, is_optimal, solution_markdown
+        FROM question_solutions
+        WHERE question_uid = ?
+        ORDER BY branch_id ASC
+        """,
+        (question_uid,),
+    ).fetchall()
+    step_cnt_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM question_steps WHERE question_uid = ?",
+        (question_uid,),
+    ).fetchone()
+    cs_map = {
+        str(r["stage"]): str(r["status"])
+        for r in conn.execute(
+            "SELECT stage, status FROM compile_state WHERE question_uid = ? AND stage IN ('S2', 'S4')",
+            (question_uid,),
+        ).fetchall()
+    }
+    return {
+        "four_tuple": (
+            str(q_row["eff_question_text"] or "") if q_row else "",
+            str(q_row["eff_visual_facts"] or "") if q_row else "",
+            _canonical_answers_key(q_row["eff_final_answers_json"] if q_row else "[]"),
+            [
+                (str(b["branch_id"]), int(b["is_optimal"]), str(b["solution_markdown"] or ""))
+                for b in sols
+            ],
+        ),
+        "eff_is_servable": int(q_row["eff_is_servable"]) if q_row else 0,
+        "eff_verification_status": str(q_row["eff_verification_status"] or "") if q_row else "",
+        "step_count": int(step_cnt_row["c"]) if step_cnt_row else 0,
+        "s2_status": cs_map.get("S2", ""),
+        "s4_status": cs_map.get("S4", ""),
+    }
+
+
+def _sync_s2_state_preserving_unchanged(
+    conn: sqlite3.Connection,
+    question_uid: str,
+    before_snap: dict[str, Any],
+) -> None:
+    """对比修改前后拆解上游四要素：若原有步骤且 S2=='OK' 且四要素未变，不将 S2/S3C/S3D 置 STALE。"""
+    after_snap = _snapshot_s2_upstream(conn, question_uid)
+    if after_snap["eff_verification_status"] == "NEEDS_REVIEW":
+        conn.execute(
+            """
+            INSERT INTO compile_state(question_uid, stage, status, updated_at)
+            VALUES (?, 'S2', 'BLOCKED', datetime('now'))
+            ON CONFLICT(question_uid, stage) DO UPDATE SET
+                status = 'BLOCKED',
+                updated_at = datetime('now')
+            """,
+            (question_uid,),
+        )
+    elif (
+        before_snap["step_count"] > 0
+        and before_snap["s2_status"] == "OK"
+        and before_snap["four_tuple"] == after_snap["four_tuple"]
+    ):
+        if (
+            before_snap["eff_is_servable"] != after_snap["eff_is_servable"]
+            or after_snap["s4_status"] != "OK"
+        ):
+            refresh.mark_stages_stale(conn, question_uid, ["S4"])
+    else:
+        refresh.mark_stages_stale(conn, question_uid, ["S2", "S3C", "S3D", "S4"])
+
+
 def _sync_s2_state_after_recompute(conn: sqlite3.Connection, question_uid: str) -> None:
     """依据生效验真状态更新下游 compile_state（NEEDS_REVIEW 置 S2=BLOCKED，否则置 S2..S4=STALE）。"""
     row = conn.execute(
@@ -109,8 +205,12 @@ def list_review_queue(
     grade_subject: str | None = None,
     audit_mode: bool = False,
     limit: int = 100,
+    seed: str = "shuati-audit-v1",
 ) -> list[dict[str, Any]]:
-    """查询待复核队列（或 audit_mode=True 时的已共识抽检队列）。"""
+    """查询待复核队列（或 audit_mode=True 时的已共识定向抽检队列）。"""
+    if limit <= 0:
+        return []
+
     target_status = "VERIFIED_CONSENSUS" if audit_mode else "NEEDS_REVIEW"
     where_clauses = [
         "q.is_retired = 0",
@@ -122,25 +222,80 @@ def list_review_queue(
         where_clauses.append("q.grade_subject = ?")
         params.append(grade_subject)
 
-    params.append(limit)
+    if not audit_mode:
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT
+                q.question_uid, r.source_id, q.grade_subject, q.eff_format,
+                q.eff_question_text, q.eff_verification_status, q.eff_review_reason,
+                q.has_images, q.cas_images_json, q.image_captions_json,
+                q.updated_at
+            FROM questions q
+            JOIN raw_questions r ON q.question_uid = r.question_uid
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY q.question_uid ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+        return [
+            {
+                "question_uid": r["question_uid"],
+                "source_id": r["source_id"],
+                "grade_subject": r["grade_subject"],
+                "eff_format": r["eff_format"],
+                "eff_question_text": r["eff_question_text"],
+                "eff_verification_status": r["eff_verification_status"],
+                "eff_review_reason": r["eff_review_reason"],
+                "review_reasons": [x for x in (r["eff_review_reason"] or "").split(",") if x],
+                "has_images": bool(r["has_images"]),
+                "cas_images": _safe_json_loads(r["cas_images_json"], []),
+                "image_captions": _safe_json_loads(r["image_captions_json"], []),
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
     rows = conn.execute(
         f"""
         SELECT
             q.question_uid, r.source_id, q.grade_subject, q.eff_format,
             q.eff_question_text, q.eff_verification_status, q.eff_review_reason,
             q.has_images, q.cas_images_json, q.image_captions_json,
-            q.updated_at
+            q.updated_at,
+            EXISTS (
+                SELECT 1 FROM stage1_vlm_runs sr
+                WHERE sr.question_uid = q.question_uid
+                  AND sr.role = 'SECONDARY'
+                  AND sr.run_status = 'OK'
+            ) AS has_secondary_ok
         FROM questions q
         JOIN raw_questions r ON q.question_uid = r.question_uid
         WHERE {' AND '.join(where_clauses)}
-        ORDER BY q.question_uid ASC
-        LIMIT ?
         """,
         params,
     ).fetchall()
 
-    items: list[dict[str, Any]] = []
+    scored: list[tuple[int, str, str, sqlite3.Row, bool]] = []
     for r in rows:
+        uid_str = str(r["question_uid"])
+        has_sec = bool(r["has_secondary_ok"])
+        has_img = bool(r["has_images"])
+        if not has_sec and has_img:
+            tier = 0
+        elif not has_sec and not has_img:
+            tier = 1
+        else:
+            tier = 2
+        digest = hashlib.sha256(f"{seed}:{uid_str}".encode()).hexdigest()
+        scored.append((tier, digest, uid_str, r, has_sec))
+
+    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    items: list[dict[str, Any]] = []
+    for tier, _, _, r, has_sec in scored[: int(limit)]:
         items.append(
             {
                 "question_uid": r["question_uid"],
@@ -155,6 +310,8 @@ def list_review_queue(
                 "cas_images": _safe_json_loads(r["cas_images_json"], []),
                 "image_captions": _safe_json_loads(r["image_captions_json"], []),
                 "updated_at": r["updated_at"],
+                "audit_priority_tier": tier,
+                "is_single_run": not has_sec,
             }
         )
     return items
@@ -349,6 +506,7 @@ def adopt_run(
     adopt_reason = reason or f"ADOPT_RUN:{role}"
 
     with active_writer.transaction(conn):
+        before_snap = _snapshot_s2_upstream(conn, uid)
         for field_name, override_val in [
             ("visual_facts", chosen_run["visual_facts"]),
             ("final_answers_json", normalized_answers_json),
@@ -368,7 +526,7 @@ def adopt_run(
 
         materialize_solutions(conn, uid)
         effective.recompute(conn, uid)
-        _sync_s2_state_after_recompute(conn, uid)
+        _sync_s2_state_preserving_unchanged(conn, uid, before_snap)
 
     human_mirror.export_snapshot(conn, human_dir=human_dir)
     return {
@@ -579,6 +737,7 @@ def reconfirm_stale_overrides(
     active_writer = writer or _DEFAULT_WRITER
 
     with active_writer.transaction(conn):
+        before_snap = _snapshot_s2_upstream(conn, uid)
         for old in stale_rows:
             old_bid = old["bundle_id"]
             if old_bid:
@@ -621,7 +780,7 @@ def reconfirm_stale_overrides(
 
         materialize_solutions(conn, uid)
         effective.recompute(conn, uid)
-        _sync_s2_state_after_recompute(conn, uid)
+        _sync_s2_state_preserving_unchanged(conn, uid, before_snap)
 
     human_mirror.export_snapshot(conn, human_dir=human_dir)
     q_after = conn.execute(

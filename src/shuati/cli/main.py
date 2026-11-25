@@ -569,6 +569,7 @@ def compile_stage(
     results: Path | None = typer.Option(None, "--results", help="Subagent 回传结果 JSONL 路径"),
     batch_size: int | None = typer.Option(None, "--batch-size", help="覆盖默认批大小"),
     include_unservable: bool = typer.Option(False, "--include-unservable", help="Stage 4 包含 NEEDS_REVIEW 题目"),
+    ignore_drift: bool = typer.Option(False, "--ignore-drift", help="Stage 4 跳过向量分位漂移自动重算"),
     subagent_model: str | None = typer.Option(None, "--subagent-model", help="覆盖 Subagent 锁模 ID（export 模式）"),
     prompt_profile: str | None = typer.Option(None, "--prompt-profile", help="加载 Prompt profile（export 模式）"),
     overwrite_pending: bool = typer.Option(False, "--overwrite-pending", help="允许覆盖挂起未回灌批（export 模式）"),
@@ -742,6 +743,8 @@ def compile_stage(
                             subagent_model=subagent_model,
                             prompt_profile=prompt_profile,
                             overwrite_pending=overwrite_pending,
+                            only_uids=parsed_uids,
+                            ignore_drift=ignore_drift,
                         )
                     )
                 else:  # ALL
@@ -1203,6 +1206,8 @@ def taxonomy_lock(
     to_version: str = typer.Option("1.0", "--to-version", help="目标版本号"),
     status: str = typer.Option("LOCKED", "--status", help="目标状态（LOCKED 或 DRAFT）"),
     allow_stale_overrides: bool = typer.Option(False, "--allow-stale-overrides", help="无法自动迁移的人工覆写置为 TAXONOMY_UNMAPPED 挂起"),
+    force_recompile: bool = typer.Option(False, "--force-recompile", help="强制清空旧节点与挂载并全学段重编"),
+    vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
     dry_run: bool = typer.Option(False, "--dry-run", help="仅预检人工覆写迁移影响，不写库"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
     config_dir: Path = typer.Option(Path("config"), "--config-dir", help="配置文件目录"),
@@ -1235,6 +1240,8 @@ def taxonomy_lock(
                 target_status=norm_status,  # type: ignore[arg-type]
                 allow_stale_overrides=allow_stale_overrides,
                 dry_run=dry_run,
+                force_recompile=force_recompile,
+                vectors_dir=vectors_dir,
                 config_dir=config_dir,
                 backups_dir=db.parent / "backups",
                 human_dir=human_dir,
@@ -1497,6 +1504,7 @@ def audit_cmd(
                 human_dir=human_dir,
                 vectors_dir=vectors_dir,
                 reports_dir=reports_dir,
+                config_dir=config_dir,
                 prune_runs=prune_runs,
             )
             if not prune_runs and conn.in_transaction:
