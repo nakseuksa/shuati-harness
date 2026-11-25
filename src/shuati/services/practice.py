@@ -37,6 +37,7 @@ from shuati.verify.answer_parts import (
     normalize_symbol_fill,
 )
 from shuati.verify.equivalence import compare_answer_parts
+from shuati.verify.sympy_sandbox import split_top_level
 
 
 def _run_coro_sync(coro: Any) -> Any:
@@ -756,6 +757,23 @@ def get_related_questions(
     }
 
 
+def _has_wrapping_delimiters(text: str, left: str, right: str) -> bool:
+    """校验首尾成对分隔符是否真正包裹整个字符串（中间深度不提前归零）。"""
+    if len(text) < 2 or text[0] != left or text[-1] != right:
+        return False
+    depth = 0
+    for idx, ch in enumerate(text):
+        if ch == left:
+            depth += 1
+        elif ch == right:
+            depth -= 1
+            if depth == 0 and idx < len(text) - 1:
+                return False
+            if depth < 0:
+                return False
+    return depth == 0
+
+
 def _parse_student_answer_parts(
     raw_input: str,
     expected_parts: list[AnswerPart],
@@ -856,7 +874,7 @@ def _parse_student_answer_parts(
                     )
                 )
             elif ref.collection_mode == "LABELED_MAP":
-                raw_tokens = [t.strip() for t in val.replace("，", ",").split(",") if t.strip()]
+                raw_tokens = split_top_level(val.replace("，", ","), ",")
                 map_items: list[dict[str, str]] = []
                 ref_labels = [str(it.get("label") or "") for it in (ref.items or []) if isinstance(it, dict)]
                 for idx, tok in enumerate(raw_tokens):
@@ -878,9 +896,9 @@ def _parse_student_answer_parts(
                 )
             else:
                 cleaned = val.strip()
-                if (cleaned.startswith("{") and cleaned.endswith("}")) or (cleaned.startswith("(") and cleaned.endswith(")")):
+                if _has_wrapping_delimiters(cleaned, "{", "}") or _has_wrapping_delimiters(cleaned, "(", ")"):
                     cleaned = cleaned[1:-1]
-                raw_tokens = [t.strip() for t in cleaned.replace("，", ",").split(",") if t.strip()]
+                raw_tokens = split_top_level(cleaned.replace("，", ","), ",")
                 stu_parts.append(
                     AnswerPart(
                         label=lbl,

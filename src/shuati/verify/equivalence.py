@@ -15,7 +15,11 @@ from shuati.verify.answer_parts import (
     normalize_part_label,
     normalize_symbol_fill,
 )
-from shuati.verify.sympy_sandbox import SympySandboxResult, run_symbolic_check_in_sandbox
+from shuati.verify.sympy_sandbox import (
+    SympySandboxResult,
+    run_symbolic_check_in_sandbox,
+    split_top_level,
+)
 
 _FULLWIDTH_TRANS = str.maketrans(
     "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ（）［］｛｝＋－＊／＝＜＞：，．；",
@@ -23,7 +27,9 @@ _FULLWIDTH_TRANS = str.maketrans(
 )
 
 _IMPLICATION_SEPS = ("\\Rightarrow", "\\Longrightarrow", "\\implies", "⇒", "→")
-_TEXT_CMD_RE = re.compile(r"\\(?:text|mathrm|mbox|operatorname)\s*\{[^{}]*\}")
+_UNWRAP_CMD_RE = re.compile(r"\\(?:mathrm|operatorname)\s*\{([^{}]*)\}")
+_TEXT_CMD_RE = re.compile(r"\\(?:text|mbox)\s*\{([^{}]*)\}")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _FRAC_RE = re.compile(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
 _SHORT_FRAC_RE = re.compile(
     r"\\frac\s*(?:\{([^{}]*)\}|([A-Za-z0-9]))\s*(?:\{([^{}]*)\}|([A-Za-z0-9]))"
@@ -172,6 +178,13 @@ def _replace_short_frac(match: re.Match[str]) -> str:
     return f"(({num})/({den}))"
 
 
+def _replace_text_cmd(match: re.Match[str]) -> str:
+    inner = match.group(1)
+    if _CJK_RE.search(inner):
+        return ""
+    return inner
+
+
 def latex_to_plain(text: str) -> str:
     """LaTeX 答案转纯表达式（兼容 \\frac, \\sqrt, \\pi, \\times, \\div, \\cdot, \\text, 全角等）。"""
     s = _fullwidth_to_halfwidth(text).strip()
@@ -179,7 +192,8 @@ def latex_to_plain(text: str) -> str:
     # 保护显式转义集合花括号 \{ \}，避免被当作 LaTeX 分组括号转换为 ()
     s = s.replace(r"\{", "\x00LBRACE\x00").replace(r"\}", "\x00RBRACE\x00")
     s = re.sub(r"\^\s*\{\s*\\circ\s*\}|\^\s*\\circ", "", s)
-    s = _TEXT_CMD_RE.sub("", s).replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    s = _UNWRAP_CMD_RE.sub(r"\1", s)
+    s = _TEXT_CMD_RE.sub(_replace_text_cmd, s).replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
     for _ in range(8):
         expanded = _SQRT_NTH_RE.sub(r"((\2)**(1/(\1)))", s)
         expanded = _SQRT_RE.sub(r"sqrt(\1)", expanded)
@@ -311,6 +325,7 @@ async def _symbolic_equal(
     allow_pi_314: bool,
     timeout_seconds: float,
     memory_limit_mb: int,
+    allow_latin_unit: bool = True,
 ) -> tuple[bool, str | None]:
     if mode == "EXPRESSION":
         qa = _parse_quantity(expr_a)
@@ -318,8 +333,8 @@ async def _symbolic_equal(
         if qa is not None and qb is not None:
             return (qa[1] == qb[1] and abs(qa[0] - qb[0]) <= 1e-9 * max(1.0, abs(qa[0]), abs(qb[0]))), None
 
-    pa = _prepare_expr(expr_a, allow_latin_unit=True)
-    pb = _prepare_expr(expr_b, allow_latin_unit=True)
+    pa = _prepare_expr(expr_a, allow_latin_unit=allow_latin_unit)
+    pb = _prepare_expr(expr_b, allow_latin_unit=allow_latin_unit)
     if not pa or not pb:
         return False, "BAD_INPUT"
 
@@ -405,6 +420,7 @@ async def _items_pair_equal(
     allow_pi_314: bool,
     timeout_seconds: float,
     memory_limit_mb: int,
+    allow_latin_unit: bool = True,
 ) -> bool:
     type_a, val_a = item_a
     type_b, val_b = item_b
@@ -412,6 +428,7 @@ async def _items_pair_equal(
         if type_a != type_b:
             return False
         return normalize_symbol_fill(val_a) == normalize_symbol_fill(val_b)
+    eff_allow_latin = allow_latin_unit and type_a == "NUMERIC" and type_b == "NUMERIC"
     eq, _ = await _symbolic_equal(
         val_a,
         val_b,
@@ -419,6 +436,7 @@ async def _items_pair_equal(
         allow_pi_314=allow_pi_314,
         timeout_seconds=timeout_seconds,
         memory_limit_mb=memory_limit_mb,
+        allow_latin_unit=eff_allow_latin,
     )
     return eq
 
@@ -434,6 +452,7 @@ async def _compare_symbolic_parts(
     if p.collection_mode != s.collection_mode:
         return False
     mode = _sandbox_mode_for_part(p)
+    allow_latin_unit = p.answer_type == "NUMERIC" and s.answer_type == "NUMERIC"
     if p.collection_mode == "SINGLE":
         va = p.sympy_expr or p.answer
         vb = s.sympy_expr or s.answer
@@ -444,6 +463,7 @@ async def _compare_symbolic_parts(
             allow_pi_314=allow_pi_314,
             timeout_seconds=timeout_seconds,
             memory_limit_mb=memory_limit_mb,
+            allow_latin_unit=allow_latin_unit,
         )
         return eq
 
@@ -461,6 +481,7 @@ async def _compare_symbolic_parts(
                 allow_pi_314=allow_pi_314,
                 timeout_seconds=timeout_seconds,
                 memory_limit_mb=memory_limit_mb,
+                allow_latin_unit=allow_latin_unit,
             ):
                 return False
         return True
@@ -471,14 +492,24 @@ async def _compare_symbolic_parts(
         rem_a: list[tuple[str, str]] = []
         for ia in p_items:
             ta, va = _extract_item_info(ia)
-            pa_norm = _prepare_expr(va, allow_latin_unit=True) if ta != "SYMBOL_FILL" else normalize_symbol_fill(va)
+            pa_allow_latin = allow_latin_unit and ta == "NUMERIC"
+            pa_norm = (
+                _prepare_expr(va, allow_latin_unit=pa_allow_latin)
+                if ta != "SYMBOL_FILL"
+                else normalize_symbol_fill(va)
+            )
             found_idx = None
             for idx, ib in enumerate(s_items):
                 if idx in used:
                     continue
                 tb, vb = _extract_item_info(ib)
                 if ta == tb:
-                    pb_norm = _prepare_expr(vb, allow_latin_unit=True) if tb != "SYMBOL_FILL" else normalize_symbol_fill(vb)
+                    pb_allow_latin = allow_latin_unit and tb == "NUMERIC"
+                    pb_norm = (
+                        _prepare_expr(vb, allow_latin_unit=pb_allow_latin)
+                        if tb != "SYMBOL_FILL"
+                        else normalize_symbol_fill(vb)
+                    )
                     if pa_norm and pa_norm == pb_norm:
                         found_idx = idx
                         break
@@ -499,6 +530,7 @@ async def _compare_symbolic_parts(
                     allow_pi_314=allow_pi_314,
                     timeout_seconds=timeout_seconds,
                     memory_limit_mb=memory_limit_mb,
+                    allow_latin_unit=allow_latin_unit,
                 ):
                     used.add(idx)
                     matched = True
@@ -520,6 +552,7 @@ async def _compare_symbolic_parts(
                 allow_pi_314=allow_pi_314,
                 timeout_seconds=timeout_seconds,
                 memory_limit_mb=memory_limit_mb,
+                allow_latin_unit=allow_latin_unit,
             ):
                 return False
         return True
@@ -536,6 +569,7 @@ async def _verify_part_against_sandbox(
     memory_limit_mb: int,
 ) -> bool:
     mode = _sandbox_mode_for_part(p)
+    allow_latin_unit = p.answer_type == "NUMERIC"
     if p.collection_mode == "SINGLE":
         sbx_str = sbx_val[0] if isinstance(sbx_val, list) and len(sbx_val) == 1 else str(sbx_val)
         if isinstance(sbx_val, list) and len(sbx_val) != 1:
@@ -548,6 +582,7 @@ async def _verify_part_against_sandbox(
             allow_pi_314=allow_pi_314,
             timeout_seconds=timeout_seconds,
             memory_limit_mb=memory_limit_mb,
+            allow_latin_unit=allow_latin_unit,
         )
         return eq
 
@@ -558,7 +593,7 @@ async def _verify_part_against_sandbox(
     if isinstance(sbx_val, list):
         sbx_list = sbx_val
     else:
-        sbx_list = [x.strip() for x in str(sbx_val).split(",") if x.strip()]
+        sbx_list = split_top_level(str(sbx_val), ",")
 
     if p.collection_mode == "ORDERED_TUPLE":
         if len(p_items) != len(sbx_list):
@@ -571,6 +606,7 @@ async def _verify_part_against_sandbox(
                 allow_pi_314=allow_pi_314,
                 timeout_seconds=timeout_seconds,
                 memory_limit_mb=memory_limit_mb,
+                allow_latin_unit=allow_latin_unit,
             ):
                 # Also allow SYMBOL_FILL comparison if ia is SYMBOL_FILL
                 ta, va = _extract_item_info(ia)
@@ -583,8 +619,34 @@ async def _verify_part_against_sandbox(
         if len(p_items) != len(sbx_list):
             return False
         used: set[int] = set()
+        # Pass 1: 快速精确文本匹配，避免重排纯文本值触发无谓子进程开销
+        rem_a: list[tuple[str, str]] = []
         for ia in p_items:
-            info_a = _extract_item_info(ia)
+            ta, va = _extract_item_info(ia)
+            eff_allow_latin = allow_latin_unit and ta == "NUMERIC"
+            pa_norm = (
+                normalize_symbol_fill(va)
+                if ta == "SYMBOL_FILL"
+                else _prepare_expr(va, allow_latin_unit=eff_allow_latin)
+            )
+            found_idx = None
+            for idx, sb in enumerate(sbx_list):
+                if idx in used:
+                    continue
+                pb_norm = (
+                    normalize_symbol_fill(sb)
+                    if ta == "SYMBOL_FILL"
+                    else _prepare_expr(sb, allow_latin_unit=eff_allow_latin)
+                )
+                if pa_norm and pa_norm == pb_norm:
+                    found_idx = idx
+                    break
+            if found_idx is not None:
+                used.add(found_idx)
+            else:
+                rem_a.append((ta, va))
+
+        for info_a in rem_a:
             matched = False
             for idx, sb in enumerate(sbx_list):
                 if idx in used:
@@ -596,7 +658,12 @@ async def _verify_part_against_sandbox(
                     allow_pi_314=allow_pi_314,
                     timeout_seconds=timeout_seconds,
                     memory_limit_mb=memory_limit_mb,
+                    allow_latin_unit=allow_latin_unit,
                 ):
+                    used.add(idx)
+                    matched = True
+                    break
+                if info_a[0] == "SYMBOL_FILL" and normalize_symbol_fill(info_a[1]) == normalize_symbol_fill(sb):
                     used.add(idx)
                     matched = True
                     break
@@ -620,6 +687,7 @@ async def _verify_part_against_sandbox(
                     allow_pi_314=allow_pi_314,
                     timeout_seconds=timeout_seconds,
                     memory_limit_mb=memory_limit_mb,
+                    allow_latin_unit=allow_latin_unit,
                 ):
                     return False
             return True
@@ -632,6 +700,7 @@ async def _verify_part_against_sandbox(
                 allow_pi_314=allow_pi_314,
                 timeout_seconds=timeout_seconds,
                 memory_limit_mb=memory_limit_mb,
+                allow_latin_unit=allow_latin_unit,
             ):
                 return False
         return True

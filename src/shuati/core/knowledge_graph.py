@@ -582,13 +582,42 @@ def _merge_single_concept(
             (json.dumps(merged_aliases, ensure_ascii=False), to_id),
         )
 
-        # 去重迁移 question_concepts 避免主键冲突，优先保留 HUMAN 来源
+        # 去重迁移 question_concepts 避免主键冲突，优先保留 HUMAN 来源，并记录无损回滚快照
         ref_ids = [from_id, *child_ids]
         ph = ",".join("?" for _ in ref_ids)
         qc_rows = conn.execute(
-            f"SELECT question_uid, concept_id, kind, origin FROM question_concepts WHERE concept_id IN ({ph});",
+            f"""
+            SELECT question_uid, concept_id, kind, origin
+            FROM question_concepts
+            WHERE concept_id IN ({ph})
+            ORDER BY question_uid, concept_id;
+            """,
             ref_ids,
         ).fetchall()
+        moved_qc: list[dict[str, str]] = [
+            {
+                "question_uid": str(qcr["question_uid"]),
+                "concept_id": str(qcr["concept_id"]),
+                "kind": str(qcr["kind"]),
+                "origin": str(qcr["origin"]),
+            }
+            for qcr in qc_rows
+        ]
+        unique_quids = list(dict.fromkeys(str(qcr["question_uid"]) for qcr in qc_rows))
+        to_prev_qc: list[dict[str, Any]] = []
+        for quid in unique_quids:
+            ex_to = conn.execute(
+                "SELECT origin FROM question_concepts WHERE question_uid = ? AND concept_id = ?;",
+                (quid, to_id),
+            ).fetchone()
+            to_prev_qc.append(
+                {
+                    "question_uid": quid,
+                    "existed": ex_to is not None,
+                    "prev_origin": str(ex_to["origin"]) if ex_to is not None else None,
+                }
+            )
+
         for qcr in qc_rows:
             quid = str(qcr["question_uid"])
             affected_uids.add(quid)
@@ -606,7 +635,11 @@ def _merge_single_concept(
                 (quid, qcr["concept_id"]),
             )
 
-        c_scope = {**scope_dict, "kind": row_to["kind"]}
+        c_scope = {
+            **scope_dict,
+            "kind": row_to["kind"],
+            "qc_backup": {"moved": moved_qc, "to_prev": to_prev_qc},
+        }
         conn.execute(
             """
             INSERT INTO compaction_audit_ledger(
@@ -1139,12 +1172,13 @@ def revert_merge_batch(
                 to_id = str(r["to_id"])
                 prev_aliases = str(r["previous_aliases_to_json"] or "[]")
                 child_ids: list[str] = list(json.loads(r["affected_child_ids_json"] or "[]"))
+                sc_obj: Any = None
                 try:
                     sc_obj = json.loads(r["scope_json"] or "{}")
                     if isinstance(sc_obj, dict) and sc_obj.get("created_master_id"):
                         created_masters_to_check[(kind, str(sc_obj["created_master_id"]))] = None
                 except ValueError:
-                    pass
+                    sc_obj = None
 
                 if kind == "KNOWLEDGE_NODE":
                     conn.execute(
@@ -1183,6 +1217,41 @@ def revert_merge_batch(
                         "UPDATE concepts SET aliases_json = ? WHERE concept_id = ?;",
                         (prev_aliases, to_id),
                     )
+                    if isinstance(sc_obj, dict) and isinstance(sc_obj.get("qc_backup"), dict):
+                        qc_backup = sc_obj["qc_backup"]
+                        for item in qc_backup.get("to_prev", []):
+                            if not isinstance(item, dict) or not item.get("question_uid"):
+                                continue
+                            quid = str(item["question_uid"])
+                            if item.get("existed"):
+                                conn.execute(
+                                    "UPDATE question_concepts SET origin = ? WHERE question_uid = ? AND concept_id = ?;",
+                                    (str(item.get("prev_origin") or "MACHINE"), quid, to_id),
+                                )
+                            else:
+                                conn.execute(
+                                    "DELETE FROM question_concepts WHERE question_uid = ? AND concept_id = ?;",
+                                    (quid, to_id),
+                                )
+                        for item in qc_backup.get("moved", []):
+                            if (
+                                not isinstance(item, dict)
+                                or not item.get("question_uid")
+                                or not item.get("concept_id")
+                            ):
+                                continue
+                            conn.execute(
+                                """
+                                INSERT OR REPLACE INTO question_concepts(question_uid, concept_id, kind, origin)
+                                VALUES (?, ?, ?, ?);
+                                """,
+                                (
+                                    str(item["question_uid"]),
+                                    str(item["concept_id"]),
+                                    str(item["kind"]),
+                                    str(item["origin"]),
+                                ),
+                            )
 
                 conn.execute(
                     "UPDATE compaction_audit_ledger SET is_reverted = 1, reverted_at = datetime('now') WHERE merge_id = ?;",
@@ -1338,12 +1407,18 @@ def compute_l3_distribution_entropy(
     grade_subject: str,
     taxonomy_version: str,
 ) -> dict[str, Any]:
-    """仅统计活跃 node_level='L3' 节点在题目步骤上的分布熵（H 与归一化熵）。"""
+    """仅统计活跃 node_level='L3' 节点（聚合自身及重定向子节点）在题目步骤上的分布熵（H 与归一化熵）。"""
     rows = conn.execute(
         """
-        SELECT kn.node_id, COUNT(s.step_id) AS cnt
+        SELECT kn.node_id, COUNT(DISTINCT s.step_id) AS cnt
         FROM knowledge_nodes kn
-        LEFT JOIN question_steps s ON s.m_knowledge_node_id = kn.node_id
+        LEFT JOIN knowledge_nodes member
+          ON member.grade_subject = kn.grade_subject
+         AND member.taxonomy_version = kn.taxonomy_version
+         AND member.node_level = 'L3'
+         AND (member.node_id = kn.node_id OR member.redirect_to_id = kn.node_id)
+        LEFT JOIN question_steps s
+          ON s.m_knowledge_node_id = member.node_id
         WHERE kn.grade_subject = ?
           AND kn.taxonomy_version = ?
           AND kn.node_level = 'L3'

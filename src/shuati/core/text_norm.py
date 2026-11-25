@@ -19,6 +19,143 @@ _GEOMETRIC_NON_OPTION_SUBSTRINGS = (
 )
 _GEOMETRIC_NON_OPTION_RE = re.compile(r"点\s*[A-E][.、．)）]")
 
+# 横向选项行检测与分隔符正则（保护 A. ...   B. ... 不被空白折叠压扁）
+_HORIZ_OPT_LINE_START_RE = re.compile(r"^[ \t]*[A-E][.、．)）]")
+_HORIZ_OPT_SEP_RE = re.compile(r"[ \t]{2,}(?=[B-E][.、．)）])")
+
+_OPT_LETTER_MAP: dict[str, str] = {
+    "A": "A",
+    "B": "B",
+    "C": "C",
+    "D": "D",
+    "E": "E",
+    "Ａ": "A",
+    "Ｂ": "B",
+    "Ｃ": "C",
+    "Ｄ": "D",
+    "Ｅ": "E",
+}
+_OPT_DELIM_FAMILY: dict[str, str] = {
+    ".": "dot",
+    "．": "dot",
+    "、": "dun",
+    ")": "paren",
+    "）": "paren",
+}
+
+
+def _is_unescaped(text: str, idx: int) -> bool:
+    backslashes = 0
+    j = idx - 1
+    while j >= 0 and text[j] == "\\":
+        backslashes += 1
+        j -= 1
+    return (backslashes % 2) == 0
+
+
+def _extract_single_space_horizontal_options(line: str) -> list[tuple[str, str]]:
+    """安全提取行首起始、单空格分隔的严格连续横向选项。
+
+    仅在满足全部条件时返回候选列表：
+    1. 行首为 [A-EＡ-Ｅ][.、．)）]；
+    2. 后续选项标记位于空白之后且处于顶层（不在 $...$/$$...$$ 数学模式，也不在未闭合的 ()/（）/[]/【】/{} 内）；
+    3. 同一行内所有选项标记使用同一种规范分隔符族（`.`/`．` vs `、` vs `)`/`）`）；
+    4. 选项字母严格连续（ord(next) == ord(prev) + 1）、>= 2 项、每项非空且通过几何非选项过滤。
+    """
+    n = len(line)
+    if n < 3:
+        return []
+    first_letter = _OPT_LETTER_MAP.get(line[0])
+    first_family = _OPT_DELIM_FAMILY.get(line[1])
+    if first_letter is None or first_family is None:
+        return []
+
+    markers: list[tuple[int, int, str]] = [(0, 2, first_letter)]
+    math_delim: str | None = None
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+
+    i = 2
+    while i < n:
+        ch = line[i]
+        # 1. 追踪 $...$ / $$...$$ 数学跨度，跨度内不切分且不计普通括号深度（兼容半开区间 $[0, 1)$）
+        if ch == "$" and _is_unescaped(line, i):
+            if math_delim is None:
+                if i + 1 < n and line[i + 1] == "$":
+                    math_delim = "$$"
+                    i += 2
+                    continue
+                math_delim = "$"
+                i += 1
+                continue
+            if math_delim == "$$" and i + 1 < n and line[i + 1] == "$":
+                math_delim = None
+                i += 2
+                continue
+            if math_delim == "$":
+                math_delim = None
+                i += 1
+                continue
+            i += 1
+            continue
+
+        if math_delim is not None:
+            i += 1
+            continue
+
+        # 2. 仅在顶层且前置空白时识别同分隔符族的后续选项标记
+        if (
+            paren_depth == 0
+            and bracket_depth == 0
+            and brace_depth == 0
+            and line[i - 1] in (" ", "\t")
+            and i + 1 < n
+        ):
+            letter = _OPT_LETTER_MAP.get(ch)
+            delim_family = _OPT_DELIM_FAMILY.get(line[i + 1])
+            if letter is not None and delim_family == first_family:
+                markers.append((i, i + 2, letter))
+                i += 2
+                continue
+
+        # 3. 追踪普通括号深度
+        if ch in ("(", "（"):
+            paren_depth += 1
+        elif ch in (")", "）"):
+            paren_depth = max(0, paren_depth - 1)
+        elif ch in ("[", "【"):
+            bracket_depth += 1
+        elif ch in ("]", "】"):
+            bracket_depth = max(0, bracket_depth - 1)
+        elif ch == "{":
+            brace_depth += 1
+        elif ch == "}":
+            brace_depth = max(0, brace_depth - 1)
+
+        i += 1
+
+    if len(markers) < 2:
+        return []
+
+    candidates: list[tuple[str, str]] = []
+    for idx, (_m_start, m_end, letter) in enumerate(markers):
+        val_end = markers[idx + 1][0] if idx + 1 < len(markers) else n
+        val = line[m_end:val_end].strip()
+        if not val:
+            return []
+        if any(sub in val for sub in _GEOMETRIC_NON_OPTION_SUBSTRINGS) or _GEOMETRIC_NON_OPTION_RE.search(val):
+            return []
+        candidates.append((letter, val))
+
+    if not all(
+        ord(candidates[idx][0]) == ord(candidates[idx - 1][0]) + 1
+        for idx in range(1, len(candidates))
+    ):
+        return []
+
+    return candidates
+
 
 @dataclass(frozen=True)
 class NormalizeResult:
@@ -118,8 +255,15 @@ def normalize_text(raw_text: str, num_images: int = 0) -> NormalizeResult:
         curr = pattern.sub(_replace_cjk_newline, curr)
     joined_text = curr
 
-    # 4. 折叠空白与换行
-    joined_text = re.sub(r"[ \t]+", " ", joined_text)
+    # 4. 折叠空白与换行（保留横向选项行中相邻选项间的双空格分隔）
+    norm_lines: list[str] = []
+    for line in joined_text.split("\n"):
+        if _HORIZ_OPT_LINE_START_RE.match(line) and _HORIZ_OPT_SEP_RE.search(line):
+            parts = _HORIZ_OPT_SEP_RE.split(line)
+            norm_lines.append("  ".join(re.sub(r"[ \t]+", " ", p) for p in parts))
+        else:
+            norm_lines.append(re.sub(r"[ \t]+", " ", line))
+    joined_text = "\n".join(norm_lines)
     joined_text = re.sub(r"\n{3,}", "\n\n", joined_text)
     joined_text = joined_text.strip()
 
@@ -150,16 +294,13 @@ def detect_and_extract_choice_options(text: str) -> tuple[bool, dict[str, str]]:
 
     norm_letter_map = {"Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D", "Ｅ": "E"}
 
-    lines = [line.strip() for line in text.splitlines()]
+    non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     found_keys: list[str] = []
     temp_opts: dict[str, str] = {}
 
-    for line in lines:
-        if not line:
-            continue
-
-        # 1. 尝试匹配横向多个选项（>= 2 个）
+    for line_idx, line in enumerate(non_empty_lines):
+        # 1. 尝试匹配横向多个选项（>= 2 个，2 个及以上空白分隔）
         h_matches = horizontal_re.findall(line)
         if len(h_matches) >= 2:
             row_candidates: list[tuple[str, str]] = []
@@ -182,12 +323,35 @@ def detect_and_extract_choice_options(text: str) -> tuple[bool, dict[str, str]]:
                         temp_opts[k] = v
                 continue
 
+        # 1b. 安全兜底：行首以选项标签起头且单空格分隔的严格连续横向选项（如人工覆写直接输入 "A. 10 B. 20 C. 30 D. 40"）
+        m_cur = line_opt_re.match(line)
+        if m_cur:
+            cur_k = norm_letter_map.get(m_cur.group(1).upper(), m_cur.group(1).upper())
+            next_is_consecutive_vertical = False
+            if line_idx + 1 < len(non_empty_lines):
+                m_next = line_opt_re.match(non_empty_lines[line_idx + 1])
+                if m_next:
+                    next_k = norm_letter_map.get(m_next.group(1).upper(), m_next.group(1).upper())
+                    if ord(next_k) == ord(cur_k) + 1:
+                        next_is_consecutive_vertical = True
+
+            if not next_is_consecutive_vertical:
+                s_candidates = _extract_single_space_horizontal_options(line)
+                if s_candidates:
+                    for k, v in s_candidates:
+                        if k == "A" and not found_keys:
+                            found_keys.append(k)
+                            temp_opts[k] = v
+                        elif found_keys and ord(k) == ord(found_keys[-1]) + 1:
+                            found_keys.append(k)
+                            temp_opts[k] = v
+                    continue
+
         # 2. 单行选项匹配
-        m = line_opt_re.match(line)
-        if m:
-            k = m.group(1).upper()
+        if m_cur:
+            k = m_cur.group(1).upper()
             k = norm_letter_map.get(k, k)
-            val = m.group(2).strip()
+            val = m_cur.group(2).strip()
             # 过滤几何声明
             if any(sub in val for sub in _GEOMETRIC_NON_OPTION_SUBSTRINGS) or _GEOMETRIC_NON_OPTION_RE.search(val):
                 continue

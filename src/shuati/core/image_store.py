@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,6 +46,7 @@ def validate_image(path: Path | str) -> ImageValidationResult:
             exif = img.getexif()
             if exif:
                 orientation = exif.get(0x0112, 1)
+            img.load()
 
             warnings: list[str] = []
             if min(w, h) < 120:
@@ -96,10 +98,27 @@ def archive_image(
     out_path = out_dir / cas_filename
 
     if not out_path.exists():
-        # 写入临时文件后 replace，确保原子写入
-        tmp_path = out_path.with_suffix(f"{out_path.suffix}.tmp")
-        tmp_path.write_bytes(raw_bytes)
-        os.replace(tmp_path, out_path)
+        # 写入进程/调用唯一的临时文件后 replace，确保并发安全原子写入
+        tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            tmp_path.write_bytes(raw_bytes)
+            try:
+                os.replace(tmp_path, out_path)
+            except PermissionError:
+                # Windows 并发 os.replace 同一 CAS 目标可能报 WinError 5；若目标已落盘且大小一致则视为幂等成功
+                if out_path.exists() and out_path.stat().st_size == len(raw_bytes):
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                else:
+                    raise
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     return cas_filename
 
@@ -118,8 +137,12 @@ def prepare_external_image(
         # 1. 矫正 EXIF 方向
         img: Image.Image = ImageOps.exif_transpose(raw_img)
 
-        # 2. 颜色模式转 RGB
-        if img.mode in ("RGBA", "P", "LA"):
+        # 2. 颜色模式转 RGB（含透明通道的 RGBA/LA/PA/P 合成到不透明白底，避免黑底）
+        if img.mode in ("RGBA", "LA", "PA", "P") or "transparency" in img.info:
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(bg, rgba).convert("RGB")
+        elif img.mode != "RGB":
             img = img.convert("RGB")
 
         # 3. 限制长边像素上限

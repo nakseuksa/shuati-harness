@@ -276,6 +276,391 @@ def _ensure_l2_and_l3_node(
     return l3_id
 
 
+def _parse_version_tuple(version: str) -> tuple[int, ...] | None:
+    """解析点分数字版本号（如 '1.10'、'v1.2.3'）为整数元组；非纯数字版本返回 None。"""
+    s = (version or "").strip()
+    if s.startswith(("v", "V")):
+        s = s[1:].strip()
+    if not s:
+        return None
+    parts = s.split(".")
+    if not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def _compare_versions(a: str, b: str) -> int:
+    """数值优先比较两个版本号：返回 -1 / 0 / 1。"""
+    ta = _parse_version_tuple(a)
+    tb = _parse_version_tuple(b)
+    if ta is not None and tb is not None:
+        if ta < tb:
+            return -1
+        if ta > tb:
+            return 1
+        return 0
+    sa = (a or "").strip()
+    sb = (b or "").strip()
+    if sa < sb:
+        return -1
+    if sa > sb:
+        return 1
+    return 0
+
+
+def _version_sort_key(version: str) -> tuple[int, tuple[int, ...], str]:
+    parsed = _parse_version_tuple(version)
+    if parsed is not None:
+        return (0, parsed, "")
+    return (1, (), (version or "").strip())
+
+
+def _collect_incremental_changelog_maps(
+    spec: TaxonomySpec,
+    cur_ver: str,
+    target_ver: str,
+) -> tuple[list[TaxonomyChangeAction], dict[str, str], dict[tuple[str, str], tuple[str, str]]]:
+    """筛选并按版本序合成 cur_ver → target_ver 的多跳传递 L1/L2 改名与合并映射。"""
+    matched_entries: list[tuple[int, TaxonomyChangelogEntry]] = []
+    for idx, entry in enumerate(spec.changelog):
+        if (
+            _compare_versions(entry.from_version, cur_ver) >= 0
+            and _compare_versions(entry.to_version, target_ver) <= 0
+            and _compare_versions(entry.from_version, entry.to_version) < 0
+        ):
+            matched_entries.append((idx, entry))
+
+    matched_entries.sort(
+        key=lambda item: (
+            _version_sort_key(item[1].from_version),
+            _version_sort_key(item[1].to_version),
+            item[0],
+        )
+    )
+
+    actions: list[TaxonomyChangeAction] = []
+    l1_map: dict[str, str] = {}
+    l2_map: dict[tuple[str, str], tuple[str, str]] = {}
+
+    for _, entry in matched_entries:
+        for act in entry.actions:
+            actions.append(act)
+            dst = act.new_name if act.op == "rename" else act.merge_into
+            if act.op not in ("rename", "merge") or not dst or not act.target:
+                continue
+            if act.level == "L1":
+                if act.target == dst:
+                    continue
+                for k in list(l1_map.keys()):
+                    if l1_map[k] == act.target:
+                        l1_map[k] = dst
+                if act.target not in l1_map:
+                    l1_map[act.target] = dst
+                for k in list(l1_map.keys()):
+                    if l1_map[k] == k:
+                        del l1_map[k]
+                for pair_k, (v_l1, v_l2) in list(l2_map.items()):
+                    if v_l1 == act.target:
+                        l2_map[pair_k] = (dst, v_l2)
+            elif act.level == "L2" and act.parent_l1:
+                if act.target == dst:
+                    continue
+                eff_p = l1_map.get(act.parent_l1, act.parent_l1)
+                for pair_k, (v_l1, v_l2) in list(l2_map.items()):
+                    if v_l1 == eff_p and v_l2 == act.target:
+                        l2_map[pair_k] = (eff_p, dst)
+                src_l1s = [k for k, v in l1_map.items() if v == eff_p]
+                if eff_p not in l1_map:
+                    src_l1s.append(eff_p)
+                for src_l1 in src_l1s:
+                    if (src_l1, act.target) not in l2_map:
+                        l2_map[(src_l1, act.target)] = (eff_p, dst)
+                for pair_k in list(l2_map.keys()):
+                    if l2_map[pair_k] == (l1_map.get(pair_k[0], pair_k[0]), pair_k[1]):
+                        del l2_map[pair_k]
+
+    return actions, l1_map, l2_map
+
+
+def _resolve_incremental_pair(
+    old_l1: str,
+    old_l2: str,
+    l1_map: dict[str, str],
+    l2_map: dict[tuple[str, str], tuple[str, str]],
+    lookup: TaxonomyLookup,
+) -> tuple[str, str] | None:
+    if not old_l1.strip() or not old_l2.strip():
+        return None
+    if (old_l1, old_l2) in l2_map:
+        cand_l1, cand_l2 = l2_map[(old_l1, old_l2)]
+    else:
+        cand_l1 = l1_map.get(old_l1, old_l1)
+        cand_l2 = old_l2
+    if lookup.has_pair(cand_l1, cand_l2):
+        return (cand_l1, cand_l2)
+    return lookup.resolve_l2(cand_l1, cand_l2)
+
+
+def _migrate_knowledge_edges(
+    conn: sqlite3.Connection,
+    *,
+    grade_subject: str,
+    old_node_where: str,
+    old_node_params: tuple[Any, ...],
+    node_id_map: dict[str, str],
+) -> None:
+    """将旧版本 knowledge_edges 映射到新版本 node_id（去重、去自环、必要时 DAG 破环）后清理旧边。"""
+    old_edges = conn.execute(
+        f"""
+        SELECT source_node_id, target_node_id, edge_type, weight, evidence_json
+        FROM knowledge_edges
+        WHERE grade_subject = ?
+          AND (
+              source_node_id IN (SELECT node_id FROM knowledge_nodes WHERE {old_node_where})
+              OR target_node_id IN (SELECT node_id FROM knowledge_nodes WHERE {old_node_where})
+          )
+        ORDER BY weight DESC, source_node_id, target_node_id;
+        """,
+        (grade_subject, *old_node_params, *old_node_params),
+    ).fetchall()
+
+    prereq_candidates: list[dict[str, Any]] = []
+    co_edges_to_insert: list[tuple[str, str, str, float, str]] = []
+    seen_edge_keys: set[tuple[str, str, str]] = set()
+    for er in old_edges:
+        old_src = str(er["source_node_id"])
+        old_dst = str(er["target_node_id"])
+        if old_src not in node_id_map or old_dst not in node_id_map:
+            continue
+        nsrc = node_id_map[old_src]
+        ndst = node_id_map[old_dst]
+        if nsrc == ndst:
+            continue
+        etype = str(er["edge_type"])
+        ekey = (nsrc, ndst, etype)
+        if ekey in seen_edge_keys:
+            continue
+        seen_edge_keys.add(ekey)
+        w_val = float(er["weight"])
+        ev_json = str(er["evidence_json"] or "{}")
+        if etype == "PREREQUISITE":
+            prereq_candidates.append(
+                {
+                    "source_node_id": nsrc,
+                    "target_node_id": ndst,
+                    "weight": w_val,
+                    "evidence_json": ev_json,
+                }
+            )
+        else:
+            co_edges_to_insert.append((nsrc, ndst, etype, w_val, ev_json))
+
+    if prereq_candidates and len(set(node_id_map.values())) < len(node_id_map):
+        from shuati.core.knowledge_graph import check_dag_and_break_cycles
+
+        prereq_candidates, _ = check_dag_and_break_cycles(prereq_candidates)
+
+    for pe in prereq_candidates:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO knowledge_edges(
+                source_node_id, target_node_id, grade_subject, edge_type, weight, evidence_json
+            )
+            VALUES (?, ?, ?, 'PREREQUISITE', ?, ?);
+            """,
+            (
+                pe["source_node_id"],
+                pe["target_node_id"],
+                grade_subject,
+                pe["weight"],
+                pe["evidence_json"],
+            ),
+        )
+    for nsrc, ndst, etype, w_val, ev_json in co_edges_to_insert:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO knowledge_edges(
+                source_node_id, target_node_id, grade_subject, edge_type, weight, evidence_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (nsrc, ndst, grade_subject, etype, w_val, ev_json),
+        )
+
+    conn.execute(
+        f"""
+        DELETE FROM knowledge_edges
+        WHERE grade_subject = ?
+          AND (
+              source_node_id IN (SELECT node_id FROM knowledge_nodes WHERE {old_node_where})
+              OR target_node_id IN (SELECT node_id FROM knowledge_nodes WHERE {old_node_where})
+          );
+        """,
+        (grade_subject, *old_node_params, *old_node_params),
+    )
+
+
+def _migrate_compaction_ledger(
+    conn: sqlite3.Connection,
+    *,
+    grade_subject: str,
+    target_version: str,
+    node_id_map: dict[str, str],
+    new_node_meta: dict[str, tuple[str, str, str]],
+    reverse_l3_sources: dict[str, list[str]],
+    created_redirect_new_ids: set[str],
+    new_redirect_target: dict[str, str | None],
+    source_version: str | None = None,
+) -> None:
+    """迁移 KNOWLEDGE_NODE 归并审计账本（严格校验 1-to-1 重定向拓扑可逆不变量）。"""
+
+    def _new_root(nid: str) -> str:
+        nxt = new_redirect_target.get(nid)
+        return nxt if nxt is not None else nid
+
+    ledger_rows = conn.execute(
+        """
+        SELECT merge_id, batch_id, scope_json, from_id, to_id, affected_child_ids_json
+        FROM compaction_audit_ledger
+        WHERE target_kind = 'KNOWLEDGE_NODE' AND is_reverted = 0
+        ORDER BY merge_id ASC;
+        """
+    ).fetchall()
+
+    scoped_entries: list[dict[str, Any]] = []
+    for lr in ledger_rows:
+        try:
+            sc = json.loads(lr["scope_json"] or "{}")
+        except ValueError:
+            continue
+        if not isinstance(sc, dict):
+            continue
+        if sc.get("grade_subject") != grade_subject:
+            continue
+        if source_version is not None:
+            if sc.get("taxonomy_version") != source_version:
+                continue
+        elif sc.get("taxonomy_version") == target_version:
+            continue
+
+        old_from = str(lr["from_id"])
+        old_to = str(lr["to_id"])
+        try:
+            raw_ch = json.loads(lr["affected_child_ids_json"] or "[]")
+            old_children = [str(c) for c in raw_ch] if isinstance(raw_ch, list) else []
+        except ValueError:
+            old_children = []
+        old_cm = str(sc["created_master_id"]) if sc.get("created_master_id") else ""
+        old_set = {old_from, old_to, *old_children}
+        if old_cm:
+            old_set.add(old_cm)
+        new_set = {node_id_map[x] for x in old_set if x in node_id_map}
+
+        row_ok = (
+            all(x in node_id_map for x in old_set)
+            and all(len(reverse_l3_sources.get(node_id_map[x], ())) == 1 for x in old_set)
+            and node_id_map.get(old_from) != node_id_map.get(old_to)
+            and node_id_map.get(old_from, "") in created_redirect_new_ids
+            and all(node_id_map.get(c, "") in created_redirect_new_ids for c in old_children)
+            and _new_root(node_id_map.get(old_from, "")) == _new_root(node_id_map.get(old_to, ""))
+        )
+        scoped_entries.append(
+            {
+                "merge_id": int(lr["merge_id"]),
+                "batch_id": str(lr["batch_id"]),
+                "sc": sc,
+                "old_from": old_from,
+                "old_to": old_to,
+                "old_children": old_children,
+                "old_set": old_set,
+                "new_set": new_set,
+                "row_ok": row_ok,
+            }
+        )
+
+    n_ent = len(scoped_entries)
+    uf_parent = list(range(n_ent))
+
+    def _uf_find(x: int) -> int:
+        while uf_parent[x] != x:
+            uf_parent[x] = uf_parent[uf_parent[x]]
+            x = uf_parent[x]
+        return x
+
+    def _uf_union(a: int, b: int) -> None:
+        ra, rb = _uf_find(a), _uf_find(b)
+        if ra != rb:
+            uf_parent[rb] = ra
+
+    by_batch_idx: dict[str, int] = {}
+    by_old_node_idx: dict[str, int] = {}
+    by_new_node_idx: dict[str, int] = {}
+    for idx_e, ent in enumerate(scoped_entries):
+        bid = ent["batch_id"]
+        if bid in by_batch_idx:
+            _uf_union(idx_e, by_batch_idx[bid])
+        else:
+            by_batch_idx[bid] = idx_e
+        for onid in ent["old_set"]:
+            if onid in by_old_node_idx:
+                _uf_union(idx_e, by_old_node_idx[onid])
+            else:
+                by_old_node_idx[onid] = idx_e
+        for nnid in ent["new_set"]:
+            if nnid in by_new_node_idx:
+                _uf_union(idx_e, by_new_node_idx[nnid])
+            else:
+                by_new_node_idx[nnid] = idx_e
+
+    comp_ok: dict[int, bool] = {}
+    for idx_e, ent in enumerate(scoped_entries):
+        root_i = _uf_find(idx_e)
+        comp_ok[root_i] = comp_ok.get(root_i, True) and bool(ent["row_ok"])
+
+    for idx_e, ent in enumerate(scoped_entries):
+        if comp_ok[_uf_find(idx_e)]:
+            new_from = node_id_map[ent["old_from"]]
+            new_to = node_id_map[ent["old_to"]]
+            new_children = list(
+                dict.fromkeys(
+                    node_id_map[c]
+                    for c in ent["old_children"]
+                    if c in node_id_map and node_id_map[c] not in (new_from, new_to)
+                )
+            )
+            new_sc = dict(ent["sc"])
+            new_sc["taxonomy_version"] = target_version
+            if new_to in new_node_meta:
+                nl1, nl2, _ = new_node_meta[new_to]
+                new_sc["l1_module"] = nl1
+                new_sc["l2_entity"] = nl2
+                if "l1" in new_sc:
+                    new_sc["l1"] = nl1
+                if "l2" in new_sc:
+                    new_sc["l2"] = nl2
+            if "created_master_id" in new_sc and str(new_sc["created_master_id"]) in node_id_map:
+                new_sc["created_master_id"] = node_id_map[str(new_sc["created_master_id"])]
+            conn.execute(
+                """
+                UPDATE compaction_audit_ledger
+                SET from_id = ?, to_id = ?, affected_child_ids_json = ?, scope_json = ?
+                WHERE merge_id = ?;
+                """,
+                (
+                    new_from,
+                    new_to,
+                    json.dumps(new_children, ensure_ascii=False),
+                    json.dumps(new_sc, ensure_ascii=False),
+                    ent["merge_id"],
+                ),
+            )
+        else:
+            conn.execute(
+                "UPDATE compaction_audit_ledger SET is_reverted = 1, reverted_at = datetime('now') WHERE merge_id = ?;",
+                (ent["merge_id"],),
+            )
+
+
 def _build_changelog_renames(spec: TaxonomySpec, from_version: str) -> tuple[dict[str, str], dict[tuple[str, str], tuple[str, str]]]:
     l1_rename: dict[str, str] = {}
     l2_rename: dict[tuple[str, str], tuple[str, str]] = {}
@@ -1197,238 +1582,25 @@ def transition_taxonomy(
                         stale_uids.append(uid)
 
                 # B4. knowledge_edges 迁移
-                old_edges = conn.execute(
-                    f"""
-                    SELECT source_node_id, target_node_id, edge_type, weight, evidence_json
-                    FROM knowledge_edges
-                    WHERE grade_subject = ?
-                      AND (
-                          source_node_id IN (SELECT node_id FROM knowledge_nodes WHERE {old_node_where})
-                          OR target_node_id IN (SELECT node_id FROM knowledge_nodes WHERE {old_node_where})
-                      )
-                    ORDER BY weight DESC, source_node_id, target_node_id;
-                    """,
-                    (grade_subject, *old_node_params, *old_node_params),
-                ).fetchall()
-
-                prereq_candidates: list[dict[str, Any]] = []
-                co_edges_to_insert: list[tuple[str, str, str, float, str]] = []
-                seen_edge_keys: set[tuple[str, str, str]] = set()
-                for er in old_edges:
-                    nsrc = node_id_map.get(str(er["source_node_id"]), str(er["source_node_id"]))
-                    ndst = node_id_map.get(str(er["target_node_id"]), str(er["target_node_id"]))
-                    if (
-                        str(er["source_node_id"]) not in node_id_map
-                        or str(er["target_node_id"]) not in node_id_map
-                        or nsrc == ndst
-                    ):
-                        continue
-                    etype = str(er["edge_type"])
-                    ekey = (nsrc, ndst, etype)
-                    if ekey in seen_edge_keys:
-                        continue
-                    seen_edge_keys.add(ekey)
-                    w_val = float(er["weight"])
-                    ev_json = str(er["evidence_json"] or "{}")
-                    if etype == "PREREQUISITE":
-                        prereq_candidates.append(
-                            {
-                                "source_node_id": nsrc,
-                                "target_node_id": ndst,
-                                "weight": w_val,
-                                "evidence_json": ev_json,
-                            }
-                        )
-                    else:
-                        co_edges_to_insert.append((nsrc, ndst, etype, w_val, ev_json))
-
-                if prereq_candidates and len(set(node_id_map.values())) < len(node_id_map):
-                    from shuati.core.knowledge_graph import check_dag_and_break_cycles
-
-                    prereq_candidates, _ = check_dag_and_break_cycles(prereq_candidates)
-
-                for pe in prereq_candidates:
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO knowledge_edges(
-                            source_node_id, target_node_id, grade_subject, edge_type, weight, evidence_json
-                        )
-                        VALUES (?, ?, ?, 'PREREQUISITE', ?, ?);
-                        """,
-                        (
-                            pe["source_node_id"],
-                            pe["target_node_id"],
-                            grade_subject,
-                            pe["weight"],
-                            pe["evidence_json"],
-                        ),
-                    )
-                for nsrc, ndst, etype, w_val, ev_json in co_edges_to_insert:
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO knowledge_edges(
-                            source_node_id, target_node_id, grade_subject, edge_type, weight, evidence_json
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?);
-                        """,
-                        (nsrc, ndst, grade_subject, etype, w_val, ev_json),
-                    )
-
-                conn.execute(
-                    f"""
-                    DELETE FROM knowledge_edges
-                    WHERE grade_subject = ?
-                      AND (
-                          source_node_id IN (SELECT node_id FROM knowledge_nodes WHERE {old_node_where})
-                          OR target_node_id IN (SELECT node_id FROM knowledge_nodes WHERE {old_node_where})
-                      );
-                    """,
-                    (grade_subject, *old_node_params, *old_node_params),
+                _migrate_knowledge_edges(
+                    conn,
+                    grade_subject=grade_subject,
+                    old_node_where=old_node_where,
+                    old_node_params=old_node_params,
+                    node_id_map=node_id_map,
                 )
 
                 # B5. compaction_audit_ledger 迁移（严格校验 1-to-1 重定向拓扑可逆不变量）
-                def _new_root(nid: str) -> str:
-                    nxt = new_redirect_target.get(nid)
-                    return nxt if nxt is not None else nid
-
-                ledger_rows = conn.execute(
-                    """
-                    SELECT merge_id, batch_id, scope_json, from_id, to_id, affected_child_ids_json
-                    FROM compaction_audit_ledger
-                    WHERE target_kind = 'KNOWLEDGE_NODE' AND is_reverted = 0
-                    ORDER BY merge_id ASC;
-                    """
-                ).fetchall()
-
-                scoped_entries: list[dict[str, Any]] = []
-                for lr in ledger_rows:
-                    try:
-                        sc = json.loads(lr["scope_json"] or "{}")
-                    except ValueError:
-                        continue
-                    if not isinstance(sc, dict):
-                        continue
-                    if sc.get("grade_subject") != grade_subject or sc.get("taxonomy_version") == target_version:
-                        continue
-                    old_from = str(lr["from_id"])
-                    old_to = str(lr["to_id"])
-                    try:
-                        raw_ch = json.loads(lr["affected_child_ids_json"] or "[]")
-                        old_children = [str(c) for c in raw_ch] if isinstance(raw_ch, list) else []
-                    except ValueError:
-                        old_children = []
-                    old_cm = str(sc["created_master_id"]) if sc.get("created_master_id") else ""
-                    old_set = {old_from, old_to, *old_children}
-                    if old_cm:
-                        old_set.add(old_cm)
-                    new_set = {node_id_map[x] for x in old_set if x in node_id_map}
-
-                    row_ok = (
-                        all(x in node_id_map for x in old_set)
-                        and all(len(reverse_l3_sources.get(node_id_map[x], ())) == 1 for x in old_set)
-                        and node_id_map.get(old_from) != node_id_map.get(old_to)
-                        and node_id_map.get(old_from, "") in created_redirect_new_ids
-                        and all(node_id_map.get(c, "") in created_redirect_new_ids for c in old_children)
-                        and _new_root(node_id_map.get(old_from, "")) == _new_root(node_id_map.get(old_to, ""))
-                    )
-                    scoped_entries.append(
-                        {
-                            "merge_id": int(lr["merge_id"]),
-                            "batch_id": str(lr["batch_id"]),
-                            "sc": sc,
-                            "old_from": old_from,
-                            "old_to": old_to,
-                            "old_children": old_children,
-                            "old_set": old_set,
-                            "new_set": new_set,
-                            "row_ok": row_ok,
-                        }
-                    )
-
-                n_ent = len(scoped_entries)
-                uf_parent = list(range(n_ent))
-
-                def _uf_find(x: int) -> int:
-                    while uf_parent[x] != x:
-                        uf_parent[x] = uf_parent[uf_parent[x]]
-                        x = uf_parent[x]
-                    return x
-
-                def _uf_union(a: int, b: int) -> None:
-                    ra, rb = _uf_find(a), _uf_find(b)
-                    if ra != rb:
-                        uf_parent[rb] = ra
-
-                by_batch_idx: dict[str, int] = {}
-                by_old_node_idx: dict[str, int] = {}
-                by_new_node_idx: dict[str, int] = {}
-                for idx_e, ent in enumerate(scoped_entries):
-                    bid = ent["batch_id"]
-                    if bid in by_batch_idx:
-                        _uf_union(idx_e, by_batch_idx[bid])
-                    else:
-                        by_batch_idx[bid] = idx_e
-                    for onid in ent["old_set"]:
-                        if onid in by_old_node_idx:
-                            _uf_union(idx_e, by_old_node_idx[onid])
-                        else:
-                            by_old_node_idx[onid] = idx_e
-                    for nnid in ent["new_set"]:
-                        if nnid in by_new_node_idx:
-                            _uf_union(idx_e, by_new_node_idx[nnid])
-                        else:
-                            by_new_node_idx[nnid] = idx_e
-
-                comp_ok: dict[int, bool] = {}
-                for idx_e, ent in enumerate(scoped_entries):
-                    root_i = _uf_find(idx_e)
-                    comp_ok[root_i] = comp_ok.get(root_i, True) and bool(ent["row_ok"])
-
-                for idx_e, ent in enumerate(scoped_entries):
-                    if comp_ok[_uf_find(idx_e)]:
-                        new_from = node_id_map[ent["old_from"]]
-                        new_to = node_id_map[ent["old_to"]]
-                        new_children = list(
-                            dict.fromkeys(
-                                node_id_map[c]
-                                for c in ent["old_children"]
-                                if c in node_id_map and node_id_map[c] not in (new_from, new_to)
-                            )
-                        )
-                        new_sc = dict(ent["sc"])
-                        new_sc["taxonomy_version"] = target_version
-                        if new_to in new_node_meta:
-                            nl1, nl2, _ = new_node_meta[new_to]
-                            new_sc["l1_module"] = nl1
-                            new_sc["l2_entity"] = nl2
-                            if "l1" in new_sc:
-                                new_sc["l1"] = nl1
-                            if "l2" in new_sc:
-                                new_sc["l2"] = nl2
-                        if (
-                            "created_master_id" in new_sc
-                            and str(new_sc["created_master_id"]) in node_id_map
-                        ):
-                            new_sc["created_master_id"] = node_id_map[str(new_sc["created_master_id"])]
-                        conn.execute(
-                            """
-                            UPDATE compaction_audit_ledger
-                            SET from_id = ?, to_id = ?, affected_child_ids_json = ?, scope_json = ?
-                            WHERE merge_id = ?;
-                            """,
-                            (
-                                new_from,
-                                new_to,
-                                json.dumps(new_children, ensure_ascii=False),
-                                json.dumps(new_sc, ensure_ascii=False),
-                                ent["merge_id"],
-                            ),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE compaction_audit_ledger SET is_reverted = 1, reverted_at = datetime('now') WHERE merge_id = ?;",
-                            (ent["merge_id"],),
-                        )
+                _migrate_compaction_ledger(
+                    conn,
+                    grade_subject=grade_subject,
+                    target_version=target_version,
+                    node_id_map=node_id_map,
+                    new_node_meta=new_node_meta,
+                    reverse_l3_sources=reverse_l3_sources,
+                    created_redirect_new_ids=created_redirect_new_ids,
+                    new_redirect_target=new_redirect_target,
+                )
 
                 # Step C: 安全删除旧版本节点
                 conn.execute(
@@ -1647,12 +1819,13 @@ def migrate_taxonomy_incremental(
     grade_subject: str,
     new_yaml_path: Path | str,
     dry_run: bool = False,
+    vectors_dir: Path | str = Path("data/vectors"),
     config_dir: Path | str = Path("config"),
     backups_dir: Path | str = Path("data/backups"),
     human_dir: Path | str = Path("human"),
     lock_path: Path | str = Path("data/.compile.lock"),
 ) -> dict[str, Any]:
-    """按 LOCKED YAML 中的 changelog（add/rename/merge）精准增量迁移（如 1.0 → 1.1）。"""
+    """按 LOCKED YAML 中的 changelog（add/rename/merge）精准增量迁移（如 1.0 → 1.1、1.2 → 1.11）。"""
     gs_row = conn.execute(
         "SELECT slug, taxonomy_status, taxonomy_version FROM grade_subjects WHERE grade_subject = ?",
         (grade_subject,),
@@ -1671,20 +1844,7 @@ def migrate_taxonomy_incremental(
     if target_ver == cur_ver:
         raise PreconditionError(f"PRECONDITION_FAILED: 新版本号 {target_ver!r} 与当前版本相同")
 
-    actions: list[TaxonomyChangeAction] = []
-    for entry in spec.changelog:
-        if entry.from_version == cur_ver or (entry.from_version > cur_ver and entry.to_version <= target_ver):
-            actions.extend(entry.actions)
-
-    l1_map: dict[str, str] = {}
-    l2_map: dict[tuple[str, str], tuple[str, str]] = {}
-    for act in actions:
-        dst = act.new_name if act.op == "rename" else act.merge_into
-        if act.op in ("rename", "merge") and dst and act.target:
-            if act.level == "L1":
-                l1_map[act.target] = dst
-            elif act.level == "L2" and act.parent_l1:
-                l2_map[(act.parent_l1, act.target)] = (act.parent_l1, dst)
+    actions, l1_map, l2_map = _collect_incremental_changelog_maps(spec, cur_ver, target_ver)
 
     if dry_run:
         return {
@@ -1699,139 +1859,348 @@ def migrate_taxonomy_incremental(
 
     backup_path = human_mirror.vacuum_backup(conn, backups_dir, "taxonomy_migrate")
     affected_uids: set[str] = set()
+    remapped_uids: set[str] = set()
     lookup = build_lookup_index(spec)
+    node_id_map: dict[str, str] = {}
+    migrated_practice_logs = 0
+    nulled_practice_logs = 0
 
     with CompileLock(lock_path):
         conn.execute("BEGIN IMMEDIATE;")
         try:
-            # 迁移受影响步骤并收集受影响 question_uid
-            for old_l1, new_l1 in l1_map.items():
-                rows = conn.execute(
-                    """
-                    SELECT DISTINCT s.question_uid
-                    FROM question_steps s
-                    JOIN questions q ON q.question_uid = s.question_uid
-                    WHERE q.grade_subject = ? AND s.m_l1 = ?;
-                    """,
-                    (grade_subject, old_l1),
-                ).fetchall()
-                affected_uids.update(str(r["question_uid"]) for r in rows)
-                conn.execute(
-                    """
-                    UPDATE question_steps SET m_l1 = ?
-                    WHERE question_uid IN (SELECT question_uid FROM questions WHERE grade_subject = ?)
-                      AND m_l1 = ?;
-                    """,
-                    (new_l1, grade_subject, old_l1),
-                )
-                q_prim = conn.execute(
-                    "SELECT question_uid, m_secondary_l1_modules_json FROM questions WHERE grade_subject = ?;",
-                    (grade_subject,),
-                ).fetchall()
-                for qr in q_prim:
-                    sec = json.loads(qr["m_secondary_l1_modules_json"] or "[]")
-                    changed = False
-                    new_sec = []
-                    for s_l1 in sec:
-                        nv = l1_map.get(s_l1, s_l1)
-                        if nv != s_l1:
-                            changed = True
-                        if nv not in new_sec:
-                            new_sec.append(nv)
-                    if changed:
-                        affected_uids.add(str(qr["question_uid"]))
-                        conn.execute(
-                            "UPDATE questions SET m_secondary_l1_modules_json = ? WHERE question_uid = ?;",
-                            (json.dumps(new_sec, ensure_ascii=False), qr["question_uid"]),
-                        )
-                conn.execute(
-                    "UPDATE questions SET m_primary_l1_module = ? WHERE grade_subject = ? AND m_primary_l1_module = ?;",
-                    (new_l1, grade_subject, old_l1),
-                )
+            old_node_where = "grade_subject = ? AND taxonomy_version = ?"
+            old_node_params: tuple[Any, ...] = (grade_subject, cur_ver)
 
-            for (p_l1, old_l2), (new_p_l1, new_l2) in l2_map.items():
-                rows = conn.execute(
-                    """
-                    SELECT DISTINCT s.question_uid
-                    FROM question_steps s
-                    JOIN questions q ON q.question_uid = s.question_uid
-                    WHERE q.grade_subject = ? AND s.m_l1 = ? AND s.m_l2 = ?;
-                    """,
-                    (grade_subject, p_l1, old_l2),
-                ).fetchall()
-                affected_uids.update(str(r["question_uid"]) for r in rows)
-                conn.execute(
-                    """
-                    UPDATE question_steps SET m_l1 = ?, m_l2 = ?, m_knowledge_node_id = NULL
-                    WHERE question_uid IN (SELECT question_uid FROM questions WHERE grade_subject = ?)
-                      AND m_l1 = ? AND m_l2 = ?;
-                    """,
-                    (new_p_l1, new_l2, grade_subject, p_l1, old_l2),
-                )
-
-            # 更新知识节点表版本号并补齐新增 L2 节点
-            conn.execute(
-                "UPDATE knowledge_nodes SET taxonomy_version = ? WHERE grade_subject = ? AND taxonomy_version = ?;",
-                (target_ver, grade_subject, cur_ver),
-            )
-            for (p_l1, old_l2), (new_p_l1, new_l2) in l2_map.items():
-                # 合并/重命名旧 L3 到新 L2 下，避免与已有 L3 唯一索引冲突
-                old_l3s = conn.execute(
-                    """
-                    SELECT node_id, l3_operator FROM knowledge_nodes
-                    WHERE grade_subject = ? AND taxonomy_version = ? AND node_level = 'L3'
-                      AND l1_module = ? AND l2_entity = ?;
-                    """,
-                    (grade_subject, target_ver, p_l1, old_l2),
-                ).fetchall()
-                for r in old_l3s:
-                    existing = conn.execute(
-                        """
-                        SELECT node_id FROM knowledge_nodes
-                        WHERE grade_subject = ? AND taxonomy_version = ? AND node_level = 'L3'
-                          AND l1_module = ? AND l2_entity = ? AND l3_operator = ? AND redirect_to_id IS NULL;
-                        """,
-                        (grade_subject, target_ver, new_p_l1, new_l2, r["l3_operator"]),
-                    ).fetchone()
-                    if existing and existing["node_id"] != r["node_id"]:
-                        conn.execute(
-                            "UPDATE question_steps SET m_knowledge_node_id = ? WHERE m_knowledge_node_id = ?;",
-                            (existing["node_id"], r["node_id"]),
-                        )
-                        conn.execute(
-                            "UPDATE knowledge_nodes SET redirect_to_id = ? WHERE node_id = ?;",
-                            (existing["node_id"], r["node_id"]),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE knowledge_nodes SET l1_module = ?, l2_entity = ? WHERE node_id = ?;",
-                            (new_p_l1, new_l2, r["node_id"]),
-                        )
-                # 清理旧 L2 汇总行
-                conn.execute(
-                    """
-                    DELETE FROM knowledge_nodes
-                    WHERE grade_subject = ? AND taxonomy_version = ? AND node_level = 'L2'
-                      AND l1_module = ? AND l2_entity = ?;
-                    """,
-                    (grade_subject, target_ver, p_l1, old_l2),
-                )
-
+            # 1. 插入全部 target_ver L2 汇总节点（含最新 aliases）
             for mod in spec.modules:
                 for l2 in mod.l2_entities:
                     l2_id = make_node_id(slug, target_ver, "L2", mod.name, l2.name, "")
                     conn.execute(
                         """
-                        INSERT OR IGNORE INTO knowledge_nodes(
+                        INSERT INTO knowledge_nodes(
                             node_id, grade_subject, taxonomy_version, node_level,
                             l1_module, l2_entity, l3_operator, aliases_json, redirect_to_id
                         )
-                        VALUES (?, ?, ?, 'L2', ?, ?, '', ?, NULL);
+                        VALUES (?, ?, ?, 'L2', ?, ?, '', ?, NULL)
+                        ON CONFLICT(node_id) DO UPDATE SET aliases_json = excluded.aliases_json;
                         """,
-                        (l2_id, grade_subject, target_ver, mod.name, l2.name, json.dumps(l2.aliases, ensure_ascii=False)),
+                        (
+                            l2_id,
+                            grade_subject,
+                            target_ver,
+                            mod.name,
+                            l2.name,
+                            json.dumps(l2.aliases, ensure_ascii=False),
+                        ),
                     )
 
-            # 迁移受影响 human_overrides
+            # 2. 基于 cur_ver 全部知识节点构建 old_id -> new_id 映射并重建 target_ver 活跃与重定向 L3 节点
+            old_kn_rows = conn.execute(
+                f"""
+                SELECT node_id, node_level, l1_module, l2_entity, l3_operator, aliases_json, redirect_to_id
+                FROM knowledge_nodes
+                WHERE {old_node_where}
+                ORDER BY node_id;
+                """,
+                old_node_params,
+            ).fetchall()
+
+            old_cur_ver_node_ids: set[str] = set()
+            old_redirect_map: dict[str, str | None] = {}
+            new_node_meta: dict[str, tuple[str, str, str]] = {}
+            reverse_l3_sources: dict[str, list[str]] = {}
+            created_redirect_new_ids: set[str] = set()
+            new_redirect_target: dict[str, str | None] = {}
+
+            for kn in old_kn_rows:
+                oid = str(kn["node_id"])
+                old_cur_ver_node_ids.add(oid)
+                old_redirect_map[oid] = str(kn["redirect_to_id"]) if kn["redirect_to_id"] else None
+                if kn["node_level"] == "L2":
+                    p_hit = _resolve_incremental_pair(
+                        str(kn["l1_module"]),
+                        str(kn["l2_entity"]),
+                        l1_map,
+                        l2_map,
+                        lookup,
+                    )
+                    if p_hit is not None:
+                        node_id_map[oid] = make_node_id(slug, target_ver, "L2", p_hit[0], p_hit[1], "")
+
+            # 2a) 活跃主 L3 节点（redirect_to_id IS NULL）
+            for kn in old_kn_rows:
+                if kn["node_level"] != "L3" or kn["redirect_to_id"] is not None:
+                    continue
+                oid = str(kn["node_id"])
+                ol1, ol2 = str(kn["l1_module"]), str(kn["l2_entity"])
+                p_hit = _resolve_incremental_pair(ol1, ol2, l1_map, l2_map, lookup)
+                if p_hit is None:
+                    continue
+                nl1, nl2 = p_hit
+                l3_op = str(kn["l3_operator"])
+                new_id = make_node_id(slug, target_ver, "L3", nl1, nl2, l3_op)
+                old_al = json.loads(kn["aliases_json"] or "[]")
+                ex_kn = conn.execute(
+                    "SELECT node_id, aliases_json FROM knowledge_nodes WHERE node_id = ?;",
+                    (new_id,),
+                ).fetchone()
+                if ex_kn is not None:
+                    cur_al = json.loads(ex_kn["aliases_json"] or "[]")
+                    merged_al = [
+                        a for a in dict.fromkeys([*cur_al, *old_al]) if a and a != l3_op
+                    ][:32]
+                    conn.execute(
+                        "UPDATE knowledge_nodes SET aliases_json = ? WHERE node_id = ?;",
+                        (json.dumps(merged_al, ensure_ascii=False), new_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO knowledge_nodes(
+                            node_id, grade_subject, taxonomy_version, node_level,
+                            l1_module, l2_entity, l3_operator, aliases_json, redirect_to_id
+                        )
+                        VALUES (?, ?, ?, 'L3', ?, ?, ?, ?, NULL);
+                        """,
+                        (
+                            new_id,
+                            grade_subject,
+                            target_ver,
+                            nl1,
+                            nl2,
+                            l3_op,
+                            json.dumps(old_al, ensure_ascii=False),
+                        ),
+                    )
+                node_id_map[oid] = new_id
+                new_node_meta[new_id] = (nl1, nl2, l3_op)
+                new_redirect_target[new_id] = None
+                reverse_l3_sources.setdefault(new_id, []).append(oid)
+
+            # 2b) 重定向子 L3 节点（redirect_to_id IS NOT NULL，保持跳数 <= 1）
+            for kn in old_kn_rows:
+                if kn["node_level"] != "L3" or kn["redirect_to_id"] is None:
+                    continue
+                oid = str(kn["node_id"])
+                old_tgt = str(kn["redirect_to_id"])
+                new_target_id = _follow_old_redirect_target(old_tgt, old_redirect_map, node_id_map)
+                if new_target_id is None:
+                    continue
+                ol1, ol2 = str(kn["l1_module"]), str(kn["l2_entity"])
+                p_hit = _resolve_incremental_pair(ol1, ol2, l1_map, l2_map, lookup)
+                if p_hit is not None:
+                    nl1, nl2 = p_hit
+                elif new_target_id in new_node_meta:
+                    nl1, nl2 = new_node_meta[new_target_id][0], new_node_meta[new_target_id][1]
+                else:
+                    continue
+                l3_op = str(kn["l3_operator"])
+                new_child_id = make_node_id(slug, target_ver, "L3", nl1, nl2, l3_op)
+                if new_child_id == new_target_id:
+                    node_id_map[oid] = new_target_id
+                    reverse_l3_sources.setdefault(new_target_id, []).append(oid)
+                    continue
+                active_conflict = conn.execute(
+                    """
+                    SELECT node_id FROM knowledge_nodes
+                    WHERE grade_subject = ? AND taxonomy_version = ? AND node_level = 'L3'
+                      AND l1_module = ? AND l2_entity = ? AND l3_operator = ? AND redirect_to_id IS NULL
+                    LIMIT 1;
+                    """,
+                    (grade_subject, target_ver, nl1, nl2, l3_op),
+                ).fetchone()
+                ex_child = conn.execute(
+                    "SELECT node_id, redirect_to_id FROM knowledge_nodes WHERE node_id = ?;",
+                    (new_child_id,),
+                ).fetchone()
+                if active_conflict is None and ex_child is None:
+                    conn.execute(
+                        """
+                        INSERT INTO knowledge_nodes(
+                            node_id, grade_subject, taxonomy_version, node_level,
+                            l1_module, l2_entity, l3_operator, aliases_json, redirect_to_id
+                        )
+                        VALUES (?, ?, ?, 'L3', ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            new_child_id,
+                            grade_subject,
+                            target_ver,
+                            nl1,
+                            nl2,
+                            l3_op,
+                            kn["aliases_json"] or "[]",
+                            new_target_id,
+                        ),
+                    )
+                    node_id_map[oid] = new_child_id
+                    new_node_meta[new_child_id] = (nl1, nl2, l3_op)
+                    created_redirect_new_ids.add(new_child_id)
+                    new_redirect_target[new_child_id] = new_target_id
+                    reverse_l3_sources.setdefault(new_child_id, []).append(oid)
+                elif ex_child is not None and ex_child["redirect_to_id"] == new_target_id:
+                    node_id_map[oid] = new_child_id
+                    reverse_l3_sources.setdefault(new_child_id, []).append(oid)
+                else:
+                    node_id_map[oid] = new_target_id
+                    reverse_l3_sources.setdefault(new_target_id, []).append(oid)
+
+            # 3. 更新 questions 与 question_steps（保留有效 L3 绑定，重映射全部旧版本 node_id）
+            q_rows = conn.execute(
+                """
+                SELECT question_uid, m_primary_l1_module, m_secondary_l1_modules_json
+                FROM questions
+                WHERE grade_subject = ?;
+                """,
+                (grade_subject,),
+            ).fetchall()
+            for qr in q_rows:
+                uid = str(qr["question_uid"])
+                old_prim = str(qr["m_primary_l1_module"] or "")
+                new_prim = l1_map.get(old_prim, old_prim)
+                prim_changed = new_prim != old_prim
+
+                raw_sec = json.loads(qr["m_secondary_l1_modules_json"] or "[]")
+                sec_list = [str(x) for x in raw_sec] if isinstance(raw_sec, list) else []
+                new_sec: list[str] = []
+                for s_l1 in sec_list:
+                    nv = l1_map.get(s_l1, s_l1)
+                    if new_prim and nv == new_prim and (prim_changed or nv != s_l1):
+                        continue
+                    if nv not in new_sec:
+                        new_sec.append(nv)
+                sec_changed = new_sec != sec_list
+
+                if prim_changed or sec_changed:
+                    affected_uids.add(uid)
+                    conn.execute(
+                        """
+                        UPDATE questions
+                        SET m_primary_l1_module = ?, m_secondary_l1_modules_json = ?
+                        WHERE question_uid = ?;
+                        """,
+                        (new_prim, json.dumps(new_sec, ensure_ascii=False), uid),
+                    )
+
+            step_rows = conn.execute(
+                """
+                SELECT s.step_id, s.question_uid, s.m_l1, s.m_l2, s.m_knowledge_node_id
+                FROM question_steps s
+                JOIN questions q ON q.question_uid = s.question_uid
+                WHERE q.grade_subject = ?;
+                """,
+                (grade_subject,),
+            ).fetchall()
+            for sr in step_rows:
+                uid = str(sr["question_uid"])
+                old_ml1 = str(sr["m_l1"] or "")
+                old_ml2 = str(sr["m_l2"] or "")
+                old_nid = str(sr["m_knowledge_node_id"]) if sr["m_knowledge_node_id"] is not None else None
+
+                if (old_ml1, old_ml2) in l2_map:
+                    new_ml1, new_ml2 = l2_map[(old_ml1, old_ml2)]
+                elif old_ml1 in l1_map:
+                    new_ml1, new_ml2 = l1_map[old_ml1], old_ml2
+                elif old_ml1 and old_ml2:
+                    resolved_step_pair = _resolve_incremental_pair(old_ml1, old_ml2, l1_map, l2_map, lookup)
+                    if resolved_step_pair is not None:
+                        new_ml1, new_ml2 = resolved_step_pair
+                    else:
+                        new_ml1, new_ml2 = old_ml1, old_ml2
+                else:
+                    new_ml1, new_ml2 = old_ml1, old_ml2
+
+                if old_nid is None:
+                    new_nid: str | None = None
+                elif old_nid in node_id_map:
+                    new_nid = node_id_map[old_nid]
+                elif old_nid in old_cur_ver_node_ids:
+                    new_nid = None
+                else:
+                    new_nid = old_nid
+
+                tax_changed = (new_ml1 != old_ml1) or (new_ml2 != old_ml2)
+                nid_dropped = old_nid is not None and new_nid is None
+                nid_changed = new_nid != old_nid
+
+                if tax_changed or nid_dropped:
+                    affected_uids.add(uid)
+                elif nid_changed:
+                    remapped_uids.add(uid)
+
+                if tax_changed or nid_changed:
+                    conn.execute(
+                        """
+                        UPDATE question_steps
+                        SET m_l1 = ?, m_l2 = ?, m_knowledge_node_id = ?
+                        WHERE step_id = ?;
+                        """,
+                        (new_ml1, new_ml2, new_nid, sr["step_id"]),
+                    )
+
+            # 4. 迁移 knowledge_edges（必须在删除旧节点前完成，避免 ON DELETE CASCADE 误删）
+            _migrate_knowledge_edges(
+                conn,
+                grade_subject=grade_subject,
+                old_node_where=old_node_where,
+                old_node_params=old_node_params,
+                node_id_map=node_id_map,
+            )
+
+            # 5. 迁移 practice_log.stuck_node_id（优先保留 L3 级卡点，退化到 L2 或 NULL）
+            pl_rows = conn.execute(
+                f"""
+                SELECT p.log_id, p.stuck_node_id, kn.l1_module, kn.l2_entity
+                FROM practice_log p
+                JOIN knowledge_nodes kn ON kn.node_id = p.stuck_node_id
+                WHERE kn.{old_node_where};
+                """,
+                old_node_params,
+            ).fetchall()
+            for pr in pl_rows:
+                old_snid = str(pr["stuck_node_id"] or "")
+                if old_snid in node_id_map:
+                    conn.execute(
+                        "UPDATE practice_log SET stuck_node_id = ? WHERE log_id = ?;",
+                        (node_id_map[old_snid], pr["log_id"]),
+                    )
+                    migrated_practice_logs += 1
+                else:
+                    pair_hit = _resolve_incremental_pair(
+                        str(pr["l1_module"] or ""),
+                        str(pr["l2_entity"] or ""),
+                        l1_map,
+                        l2_map,
+                        lookup,
+                    )
+                    if pair_hit is not None:
+                        new_l2_id = make_node_id(slug, target_ver, "L2", pair_hit[0], pair_hit[1], "")
+                        conn.execute(
+                            "UPDATE practice_log SET stuck_node_id = ? WHERE log_id = ?;",
+                            (new_l2_id, pr["log_id"]),
+                        )
+                        migrated_practice_logs += 1
+                    else:
+                        conn.execute(
+                            "UPDATE practice_log SET stuck_node_id = NULL WHERE log_id = ?;",
+                            (pr["log_id"],),
+                        )
+                        nulled_practice_logs += 1
+
+            # 6. 迁移 compaction_audit_ledger（严格校验 1-to-1 重定向拓扑可逆不变量）
+            _migrate_compaction_ledger(
+                conn,
+                grade_subject=grade_subject,
+                target_version=target_ver,
+                source_version=cur_ver,
+                node_id_map=node_id_map,
+                new_node_meta=new_node_meta,
+                reverse_l3_sources=reverse_l3_sources,
+                created_redirect_new_ids=created_redirect_new_ids,
+                new_redirect_target=new_redirect_target,
+            )
+
+            # 7. 迁移受影响 human_overrides（并刷新 taxonomy_override_json 中每个 node_id）
             ov_rows = conn.execute(
                 """
                 SELECT o.override_id, o.question_uid, o.field_name, o.override_value
@@ -1845,10 +2214,24 @@ def migrate_taxonomy_incremental(
             l1_ren = {normalize_label(k): v for k, v in l1_map.items()}
             l2_ren = {(normalize_label(k[0]), normalize_label(k[1])): v for k, v in l2_map.items()}
             for r in ov_rows:
+                fname = str(r["field_name"])
                 ok, new_val, _ = _migrate_override_value(
-                    str(r["field_name"]), str(r["override_value"]), lookup, l1_ren, l2_ren, target_ver
+                    fname, str(r["override_value"]), lookup, l1_ren, l2_ren, target_ver
                 )
                 if ok:
+                    if fname == "taxonomy_override_json":
+                        tax_obj = json.loads(new_val)
+                        for nd in tax_obj["nodes"]:
+                            nd["node_id"] = _ensure_l2_and_l3_node(
+                                conn,
+                                grade_subject=grade_subject,
+                                slug=slug,
+                                taxonomy_version=target_ver,
+                                l1_module=nd["l1"],
+                                l2_entity=nd["l2"],
+                                l3_operator=nd["l3"],
+                            )
+                        new_val = json.dumps(tax_obj, ensure_ascii=False)
                     conn.execute(
                         "UPDATE human_overrides SET override_value = ?, taxonomy_version = ? WHERE override_id = ?;",
                         (new_val, target_ver, r["override_id"]),
@@ -1860,6 +2243,17 @@ def migrate_taxonomy_incremental(
                     )
                 affected_uids.add(str(r["question_uid"]))
 
+            # 8. 安全删除 cur_ver 旧知识节点（先重定向子节点，再剩余节点）
+            conn.execute(
+                f"DELETE FROM knowledge_nodes WHERE {old_node_where} AND redirect_to_id IS NOT NULL;",
+                old_node_params,
+            )
+            conn.execute(
+                f"DELETE FROM knowledge_nodes WHERE {old_node_where};",
+                old_node_params,
+            )
+
+            # 9. 更新 grade_subjects 并仅对 affected_uids 标记 S3D/S4 STALE
             target_yaml = default_taxonomy_path(config_dir, slug, "LOCKED")
             locked_spec = spec.model_copy(update={"status": "LOCKED"})
             conn.execute(
@@ -1867,7 +2261,7 @@ def migrate_taxonomy_incremental(
                 (target_ver, str(target_yaml), grade_subject),
             )
 
-            for uid in affected_uids:
+            for uid in sorted(affected_uids):
                 refresh.mark_stages_stale(conn, uid, ["S3D", "S4"])
 
             conn.commit()
@@ -1875,13 +2269,24 @@ def migrate_taxonomy_incremental(
             conn.rollback()
             raise
 
+        # 10. 事务提交后再落盘 YAML、刷新生效列与 human/ 镜像
         save_taxonomy_spec(locked_spec, target_yaml)
 
-        for uid in affected_uids:
+        recompute_uids = affected_uids | remapped_uids
+        for uid in sorted(recompute_uids):
             effective.recompute(conn, uid)
-        if affected_uids:
+        if recompute_uids:
             conn.commit()
         human_mirror.export_snapshot(conn, human_dir=human_dir)
+
+    migrated_l3_vectors = _migrate_l3_vectors_npz(
+        conn,
+        vectors_dir=vectors_dir,
+        grade_subject=grade_subject,
+        slug=slug,
+        target_version=target_ver,
+        node_id_map=node_id_map,
+    )
 
     return {
         "dry_run": False,
@@ -1890,4 +2295,7 @@ def migrate_taxonomy_incremental(
         "to_version": target_ver,
         "backup_path": str(backup_path),
         "affected_questions": len(affected_uids),
+        "migrated_practice_logs": migrated_practice_logs,
+        "nulled_practice_logs": nulled_practice_logs,
+        "migrated_l3_vectors": migrated_l3_vectors,
     }

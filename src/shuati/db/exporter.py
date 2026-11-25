@@ -167,9 +167,14 @@ def export_all_jsonl(
         f"""
         SELECT kn.node_id, kn.grade_subject, kn.taxonomy_version, kn.node_level,
                kn.l1_module, kn.l2_entity, kn.l3_operator, kn.aliases_json, kn.created_at,
-               COUNT(s.step_id) AS step_binding_count
+               COUNT(DISTINCT s.step_id) AS step_binding_count
         FROM knowledge_nodes kn
-        LEFT JOIN question_steps s ON s.m_knowledge_node_id = kn.node_id
+        LEFT JOIN knowledge_nodes member
+          ON member.grade_subject = kn.grade_subject
+         AND member.taxonomy_version = kn.taxonomy_version
+         AND member.node_level = kn.node_level
+         AND (member.node_id = kn.node_id OR member.redirect_to_id = kn.node_id)
+        LEFT JOIN question_steps s ON s.m_knowledge_node_id = member.node_id
         WHERE {kn_where}
         GROUP BY kn.node_id
         ORDER BY kn.grade_subject, kn.node_level, kn.l1_module, kn.l2_entity, kn.l3_operator;

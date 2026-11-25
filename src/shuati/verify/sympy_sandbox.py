@@ -6,6 +6,7 @@ import ast
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -181,11 +182,34 @@ _SAFE_STRING_CALL_NAMES = frozenset(
     }
 )
 
+_NUMERIC_STRING_CALL_NAMES = frozenset({"Rational", "Fraction", "Float", "Integer"})
+_NUMERIC_STR_LITERAL_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?:/[+-]?\d+)?$")
+
 _TRIVIAL_WRAPPER_CALLS = frozenset({"str", "repr", "int", "float", "list", "tuple", "set", "dict"})
 
 _RESULT_SENTINEL = "###RESULT###"
 _ERROR_SENTINEL = "###ERROR###"
 _STDERR_TAIL_CHARS = 800
+
+
+def split_top_level(text: str, sep_char: str = ",") -> list[str]:
+    """按顶层分隔符切分文本，忽略 (), [], {} 括号内部的分隔符。"""
+    parts: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == sep_char and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf).strip())
+    return [p for p in parts if p]
 
 
 @dataclass
@@ -525,6 +549,32 @@ def _collect_string_tainted_vars(tree: ast.Module) -> set[str]:
     return str_vars
 
 
+def _is_expr_string_tainted(expr: ast.AST, str_vars: set[str]) -> bool:
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return True
+    if isinstance(expr, ast.JoinedStr):
+        return True
+    if isinstance(expr, ast.Name) and expr.id in str_vars:
+        return True
+    if isinstance(expr, ast.BinOp):
+        return _is_expr_string_tainted(expr.left, str_vars) or _is_expr_string_tainted(expr.right, str_vars)
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name) and expr.func.id in {"str", "repr", "format"}:
+        return True
+    return False
+
+
+def _is_numeric_string_call_allowed(call_node: ast.Call, str_vars: set[str]) -> bool:
+    """仅当 Rational/Fraction/Float/Integer 的全部字符串参数均为合法纯数字字面量时放行。"""
+    all_vals: list[ast.AST] = [*call_node.args, *(kw.value for kw in call_node.keywords)]
+    for val in all_vals:
+        if isinstance(val, ast.Constant) and isinstance(val.value, str):
+            if not _NUMERIC_STR_LITERAL_RE.fullmatch(val.value.strip()):
+                return False
+        elif _is_expr_string_tainted(val, str_vars):
+            return False
+    return True
+
+
 def _call_uses_string_arg(call_node: ast.Call, str_vars: set[str]) -> bool:
     for arg in call_node.args:
         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
@@ -605,7 +655,10 @@ def validate_script_ast(code_str: str) -> ASTValidationResult:
                 call_name = func.attr
 
             if call_name is not None and call_name not in _SAFE_STRING_CALL_NAMES and call_name not in user_fn_names:
-                if _call_uses_string_arg(node, str_vars):
+                if call_name in _NUMERIC_STRING_CALL_NAMES:
+                    if not _is_numeric_string_call_allowed(node, str_vars):
+                        return ASTValidationResult(False, "FORBIDDEN_CALL")
+                elif _call_uses_string_arg(node, str_vars):
                     return ASTValidationResult(False, "FORBIDDEN_CALL")
 
     if not _validate_verify_anti_tautology(tree):
