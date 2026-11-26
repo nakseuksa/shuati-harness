@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -71,15 +72,17 @@ def vacuum_backup(
     b_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    backup_file = b_dir / f"{timestamp}_{command_name}.db"
+    safe_command = re.sub(r"[^A-Za-z0-9_-]", "_", command_name).strip("_") or "backup"
+    backup_file = b_dir / f"{timestamp}_{safe_command}.db"
 
     # SQLite VACUUM INTO 要求目标文件不存在
     if backup_file.exists():
         backup_file.unlink()
 
-    # 转为正斜杠绝对路径
+    # 转为正斜杠绝对路径并转义 SQLite 字符串单引号
     posix_path = backup_file.resolve().as_posix()
-    conn.execute(f"VACUUM INTO '{posix_path}';")
+    escaped_path = posix_path.replace("'", "''")
+    conn.execute(f"VACUUM INTO '{escaped_path}';")
 
     # 清理超出 keep 的备份文件
     existing_backups = sorted(
@@ -634,13 +637,12 @@ def restore_snapshot(
                 conn.execute("DELETE FROM quiz_batches WHERE learner_id = ?;", (lid,))
                 conn.execute("DELETE FROM learners WHERE learner_id = ?;", (lid,))
 
-    # 恢复后对涉及题目调用 effective.recompute
-    for uid in affected_question_uids:
-        # 仅当题目在 questions 表中存在时才重算
-        exists = conn.execute("SELECT 1 FROM questions WHERE question_uid = ?", (uid,)).fetchone()
-        if exists:
-            effective.recompute(conn, uid)
-    conn.commit()
+        # 6. 在同一事务内对涉及题目调用 effective.recompute（恢复与 eff_* / FTS 重算原子同提交或同回滚）
+        for uid in sorted(affected_question_uids):
+            # 仅当题目在 questions 表中存在时才重算
+            exists = conn.execute("SELECT 1 FROM questions WHERE question_uid = ?", (uid,)).fetchone()
+            if exists:
+                effective.recompute(conn, uid)
 
     return counts
 

@@ -54,17 +54,19 @@ def resolve_question_uid(conn: sqlite3.Connection, id_or_uid: str) -> str:
         if row:
             return _follow_duplicates(conn, row["question_uid"])
 
-    # 2. source_id 简写匹配
+    # 2. source_id 简写匹配（先经 _follow_duplicates 归一再去重，避免主副同题误报歧义）
     rows = conn.execute(
-        "SELECT question_uid FROM raw_questions WHERE source_id = ?",
+        "SELECT question_uid FROM raw_questions WHERE source_id = ? ORDER BY question_uid ASC",
         (id_or_uid,),
     ).fetchall()
 
-    if len(rows) == 1:
-        return _follow_duplicates(conn, rows[0]["question_uid"])
-    elif len(rows) > 1:
-        candidates = [r["question_uid"] for r in rows]
-        raise AmbiguousUidError(candidates)
+    if rows:
+        canonical_uids = list(
+            dict.fromkeys(_follow_duplicates(conn, str(r["question_uid"])) for r in rows)
+        )
+        if len(canonical_uids) == 1:
+            return canonical_uids[0]
+        raise AmbiguousUidError(canonical_uids)
 
     # 3. 兜底检查（如传入的不带冒号但等于 question_uid）
     row = conn.execute(

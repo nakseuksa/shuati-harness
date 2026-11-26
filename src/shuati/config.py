@@ -13,15 +13,47 @@ from pydantic import BaseModel, Field, field_validator
 
 
 def _resolve_env_vars(text: str) -> str:
-    """展开字符串中的 ${VAR} 与 ${VAR:-default}。"""
+    """展开字符串中的 ${VAR} 与 ${VAR:-default}（未设置或为空串时均回退 default）。"""
     pattern = re.compile(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}")
 
     def replace_match(match: re.Match[str]) -> str:
         var_name = match.group(1)
         default_val = match.group(2) if match.group(2) is not None else ""
-        return os.environ.get(var_name, default_val)
+        val = os.environ.get(var_name)
+        return val if val else default_val
 
     return pattern.sub(replace_match, text)
+
+
+def _parse_env_value(raw: str) -> str:
+    """解析 .env 等号右侧值，支持引号内 #、双引号转义与尾部行内 # 注释。"""
+    v = raw.strip()
+    if not v:
+        return ""
+    if v[0] == '"':
+        chars: list[str] = []
+        i = 1
+        n = len(v)
+        while i < n:
+            ch = v[i]
+            if ch == "\\" and i + 1 < n and v[i + 1] in ('"', "\\"):
+                chars.append(v[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                suffix = v[i + 1 :]
+                if re.match(r"^\s*(#.*)?$", suffix):
+                    return "".join(chars)
+                break
+            chars.append(ch)
+            i += 1
+    elif v[0] == "'":
+        end_idx = v.find("'", 1)
+        if end_idx != -1:
+            suffix = v[end_idx + 1 :]
+            if re.match(r"^\s*(#.*)?$", suffix):
+                return v[1:end_idx]
+    return re.split(r"[ \t]+#", v, maxsplit=1)[0].strip()
 
 
 def _load_env_file(env_path: Path) -> None:
@@ -35,11 +67,7 @@ def _load_env_file(env_path: Path) -> None:
                 continue
             k, v = line.split("=", 1)
             k = k.strip()
-            v = v.strip()
-            if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                v = v[1:-1]
-            else:
-                v = re.split(r"[ \t]+#", v, maxsplit=1)[0].strip()
+            v = _parse_env_value(v)
             if k not in os.environ:
                 os.environ[k] = v
 

@@ -125,7 +125,7 @@ def run_stage_q_audit(
     settings: Settings,
     *,
     grade_subject: str | None = None,
-    human_dir: Path | str = Path("human"),
+    human_dir: Path | str | None = None,
     vectors_dir: Path | str = Path("data/vectors"),
     reports_dir: Path | str = Path("data/reports"),
     config_dir: Path | str = Path("config"),
@@ -429,9 +429,131 @@ def run_stage_q_audit(
         stats["expected_degree"] = settings.topology.expected_degree.get(rt, [0, 0])
         topology_health[rt] = stats
 
-    # 板块 5：生效层一致性（纯只读保存点保护） + 人工镜像一致性 + LLM 成本审计
+    # 板块 5：生效层一致性（纯只读保存点保护） + 人工镜像一致性 + DB/拓扑硬不变量 + LLM 成本审计
     eff_consistency = _readonly_verify_effective_consistency(conn)
-    mirror_consistency = human_mirror.verify_snapshot(conn, human_dir=human_dir)
+    resolved_human_dir = (
+        Path(settings.human_mirror.dir) if human_dir is None else Path(human_dir)
+    )
+    mirror_consistency = human_mirror.verify_snapshot(
+        conn,
+        human_dir=resolved_human_dir,
+        include_practice_log=settings.human_mirror.include_practice_log,
+    )
+
+    fk_rows = conn.execute("PRAGMA foreign_key_check;").fetchall()
+    fk_samples = [
+        {
+            "table": str(r[0]),
+            "rowid": r[1],
+            "parent": str(r[2]),
+            "fkid": r[3],
+        }
+        for r in fk_rows[:5]
+    ]
+    if grade_subject:
+        kn_gt1_hop = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM knowledge_nodes a
+                JOIN knowledge_nodes b ON a.redirect_to_id = b.node_id
+                WHERE b.redirect_to_id IS NOT NULL
+                  AND a.grade_subject = ?;
+                """,
+                (grade_subject,),
+            ).fetchone()["cnt"]
+        )
+    else:
+        kn_gt1_hop = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM knowledge_nodes a
+                JOIN knowledge_nodes b ON a.redirect_to_id = b.node_id
+                WHERE b.redirect_to_id IS NOT NULL;
+                """
+            ).fetchone()["cnt"]
+        )
+    concepts_gt1_hop = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM concepts a
+            JOIN concepts b ON a.redirect_to_id = b.concept_id
+            WHERE b.redirect_to_id IS NOT NULL;
+            """
+        ).fetchone()["cnt"]
+    )
+
+    sc_th = settings.topology.thresholds.scaffold
+    sc_rule_min_diff = float(sc_th.min_elo_diff)
+    sc_llm_min_diff = round(float(sc_th.min_elo_diff) * (1.0 - float(sc_th.boundary_band)), 12)
+    sc_gs_clause = "AND (s.grade_subject = ? OR t.grade_subject = ?)" if grade_subject else ""
+    sc_params: list[Any] = [sc_rule_min_diff, sc_llm_min_diff]
+    if grade_subject:
+        sc_params.extend([grade_subject, grade_subject])
+    scaffold_violation_rows = conn.execute(
+        f"""
+        SELECT
+            r.source_question_uid,
+            r.target_question_uid,
+            s.eff_base_elo AS s_elo,
+            t.eff_base_elo AS t_elo,
+            CASE
+                WHEN s.eff_base_elo IS NOT NULL AND t.eff_base_elo IS NOT NULL
+                THEN (t.eff_base_elo - s.eff_base_elo)
+                ELSE NULL
+            END AS elo_diff,
+            r.confidence_source
+        FROM question_relations r
+        JOIN questions s ON s.question_uid = r.source_question_uid
+        JOIN questions t ON t.question_uid = r.target_question_uid
+        WHERE r.relation_type = 'SCAFFOLD'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM relation_overrides ro
+              WHERE ro.source_question_uid = r.source_question_uid
+                AND ro.target_question_uid = r.target_question_uid
+                AND ro.relation_type = 'SCAFFOLD'
+                AND ro.action = 'ASSERT'
+                AND ro.is_active = 1
+          )
+          AND (
+              s.eff_base_elo IS NULL
+              OR t.eff_base_elo IS NULL
+              OR t.eff_base_elo <= s.eff_base_elo
+              OR (r.confidence_source != 'LLM_VERIFIED' AND (t.eff_base_elo - s.eff_base_elo) < ?)
+              OR (r.confidence_source = 'LLM_VERIFIED' AND (t.eff_base_elo - s.eff_base_elo) < ?)
+          )
+          {sc_gs_clause}
+        ORDER BY r.source_question_uid, r.target_question_uid;
+        """,
+        sc_params,
+    ).fetchall()
+    scaffold_violation_samples = [
+        {
+            "source_question_uid": str(r["source_question_uid"]),
+            "target_question_uid": str(r["target_question_uid"]),
+            "s_elo": r["s_elo"],
+            "t_elo": r["t_elo"],
+            "elo_diff": r["elo_diff"],
+            "confidence_source": str(r["confidence_source"]),
+        }
+        for r in scaffold_violation_rows[:5]
+    ]
+    db_invariants: dict[str, Any] = {
+        "foreign_key_violations": len(fk_rows),
+        "foreign_key_violation_samples": fk_samples,
+        "multi_hop_redirects": {
+            "knowledge_nodes_gt1_hop": kn_gt1_hop,
+            "concepts_gt1_hop": concepts_gt1_hop,
+        },
+        "scaffold_contract_violations": {
+            "count": len(scaffold_violation_rows),
+            "samples": scaffold_violation_samples,
+        },
+    }
+
     llm_summary = [
         dict(r)
         for r in conn.execute(
@@ -528,6 +650,19 @@ def run_stage_q_audit(
         risks.append(f"eff_* 一致性存在差异: {eff_consistency.get('diff_count')} 题")
     if not mirror_consistency.get("is_consistent", False):
         risks.append("human/*.jsonl 与 DB 快照不一致，请运行 `shuati human export`")
+    if db_invariants["foreign_key_violations"] > 0:
+        risks.append(
+            f"DB_INVARIANT: SQLite 外键完整性违例 {db_invariants['foreign_key_violations']} 条（PRAGMA foreign_key_check）"
+        )
+    if kn_gt1_hop > 0:
+        risks.append(f"DB_INVARIANT: knowledge_nodes 存在 {kn_gt1_hop} 条多跳/成环 redirect_to_id")
+    if concepts_gt1_hop > 0:
+        risks.append(f"DB_INVARIANT: concepts 存在 {concepts_gt1_hop} 条多跳/成环 redirect_to_id")
+    if db_invariants["scaffold_contract_violations"]["count"] > 0:
+        risks.append(
+            f"DB_INVARIANT: SCAFFOLD 边契约违例 {db_invariants['scaffold_contract_violations']['count']} 条"
+            f"（含缺失 Elo / 反向 / 低于阈值 {sc_th.min_elo_diff} 或 boundary_band {sc_llm_min_diff:g}）"
+        )
     if needs_review_q > 0:
         risks.append(f"待人工复核题目 (NEEDS_REVIEW): {needs_review_q} 题")
     if suspended_ov > 0:
@@ -666,6 +801,7 @@ def run_stage_q_audit(
         "section_5_integrity_and_cost": {
             "effective_consistency": eff_consistency,
             "human_mirror_consistency": mirror_consistency,
+            "db_invariants": db_invariants,
             "llm_calls_summary": llm_summary,
         },
         "section_6_vectors": {
@@ -755,6 +891,11 @@ def run_stage_q_audit(
             "## 5. 生效层一致性、人工镜像与成本审计",
             f"- `effective.verify_effective_consistency`: `total_checked={eff_consistency['total_checked']}`, `diff_count={eff_consistency['diff_count']}`",
             f"- `human_mirror.verify_snapshot`: `is_consistent={mirror_consistency['is_consistent']}`",
+            (
+                f"- `db_invariants`: `fk_violations={db_invariants['foreign_key_violations']}`, "
+                f"`multi_hop_redirects(kn={kn_gt1_hop}, concepts={concepts_gt1_hop})`, "
+                f"`scaffold_contract_violations={db_invariants['scaffold_contract_violations']['count']}`"
+            ),
             "",
             "## 6. 向量仓与冻结分位表",
             f"- 模型: `{report['section_6_vectors']['embedding_model']}` (`dim={report['section_6_vectors']['dimension']}`, `meta_version={report['section_6_vectors']['meta_version']}`)",

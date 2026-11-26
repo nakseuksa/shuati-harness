@@ -399,13 +399,30 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
     )
 
     # (8) 四维难度与 Elo / Tier
+    eff_c: int | None = q_row["m_c_score"]
+    eff_s: int | None = q_row["m_s_score"]
+    eff_t: int | None = q_row["m_t_score"]
+    eff_l: int | None = q_row["m_l_score"]
+    eff_base_elo: int | None = None
+    eff_tier: str | None = None
+    eff_tier_rank: int | None = None
+
+    override_diff_applied = False
     if "difficulty_override_json" in active_overrides:
         try:
             d_val = json.loads(active_overrides["difficulty_override_json"]["override_value"])
-            eff_c = int(d_val["C"])
-            eff_s = int(d_val["S"])
-            eff_t = int(d_val["T"])
-            eff_l = int(d_val["L"])
+            if not isinstance(d_val, dict):
+                raise ValueError("difficulty_override_json 必须为 JSON 对象")
+            raw_c, raw_s, raw_t, raw_l = d_val["C"], d_val["S"], d_val["T"], d_val["L"]
+            if any(isinstance(v, bool) for v in (raw_c, raw_s, raw_t, raw_l)):
+                raise ValueError("difficulty_override_json 维度值拒绝 bool")
+            cand_c, cand_s, cand_t, cand_l = int(raw_c), int(raw_s), int(raw_t), int(raw_l)
+            d_res = compute_difficulty(cand_c, cand_s, cand_t, cand_l)
+            eff_c, eff_s, eff_t, eff_l = cand_c, cand_s, cand_t, cand_l
+            eff_base_elo = d_res.base_elo
+            eff_tier = d_res.tier
+            eff_tier_rank = d_res.tier_rank
+            override_diff_applied = True
         except Exception:
             eff_c, eff_s, eff_t, eff_l = (
                 q_row["m_c_score"],
@@ -413,23 +430,19 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
                 q_row["m_t_score"],
                 q_row["m_l_score"],
             )
-    else:
-        eff_c, eff_s, eff_t, eff_l = (
-            q_row["m_c_score"],
-            q_row["m_s_score"],
-            q_row["m_t_score"],
-            q_row["m_l_score"],
-        )
 
-    if eff_c is not None and eff_s is not None and eff_t is not None and eff_l is not None:
-        d_res = compute_difficulty(eff_c, eff_s, eff_t, eff_l)
-        eff_base_elo: int | None = d_res.base_elo
-        eff_tier: str | None = d_res.tier
-        eff_tier_rank: int | None = d_res.tier_rank
-    else:
-        eff_base_elo = None
-        eff_tier = None
-        eff_tier_rank = None
+    if not override_diff_applied and (
+        eff_c is not None and eff_s is not None and eff_t is not None and eff_l is not None
+    ):
+        try:
+            d_res = compute_difficulty(eff_c, eff_s, eff_t, eff_l)
+            eff_base_elo = d_res.base_elo
+            eff_tier = d_res.tier
+            eff_tier_rank = d_res.tier_rank
+        except Exception:
+            eff_base_elo = None
+            eff_tier = None
+            eff_tier_rank = None
 
     # (9) 下架与可用标记
     if "is_excluded" in active_overrides:

@@ -1480,7 +1480,9 @@ def graph_calibrate_eval(
 def audit_cmd(
     grade_subject: str | None = typer.Option(None, "--grade-subject", help="限定学段学科"),
     prune_runs: bool = typer.Option(False, "--prune-runs", help="清理未被引用的 FAILED stage1_vlm_runs"),
-    human_dir: Path = typer.Option(Path("human"), "--human-dir", help="人工覆盖层镜像目录"),
+    human_dir: Path | None = typer.Option(
+        None, "--human-dir", help="人工覆盖层镜像目录（默认读取 settings.human_mirror.dir）"
+    ),
     vectors_dir: Path = typer.Option(Path("data/vectors"), "--vectors-dir", help="向量仓目录"),
     reports_dir: Path = typer.Option(Path("data/reports"), "--reports-dir", help="输出报告目录"),
     db: Path = typer.Option(Path("data/shuati.db"), "--db", help="SQLite 数据库文件路径"),
