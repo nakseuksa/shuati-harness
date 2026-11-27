@@ -597,8 +597,13 @@ SEED_TRAPS = [
     },
     {
         "code": "TRAP_EXTENDED_BODY_LENGTH",
-        "name": "有长物体车身加减混淆",
-        "description": "火车过桥/过隧与错车超车中，混淆完全通过（加车长）、整车在桥上（减车长）、地面看双车长和与车上人看单车长。",
+        "name": "错车超车双车长与参考系混淆",
+        "description": "两车相向错车、同向超车或运动行人观察火车问题中，混淆地面看双车长之和与车内窗前看对方单车长、或漏加其中一车车长。",
+    },
+    {
+        "code": "TRAP_BRIDGE_ON_VS_PASS",
+        "name": "过桥加车长与在桥减车长混淆",
+        "description": "单列火车通过静态桥隧问题中，混淆“完全通过桥隧（路程 = 桥长 + 车长）”、“整列火车完全在桥上（路程 = 桥长 - 车长）”或漏算自身车长。",
     },
     {
         "code": "TRAP_ASYNC_SYNC_CONFUSION",
@@ -607,8 +612,13 @@ SEED_TRAPS = [
     },
     {
         "code": "TRAP_DIRECTION_REF_POINT",
-        "name": "折返参照端与遇追混淆",
-        "description": "多次往返或偏移问题中，混淆“距A地/距B地/距中点”、混淆已走路程与剩余路程、或混淆迎面速度和与同向追及速度差。",
+        "name": "参照端点与遇追方向混淆",
+        "description": "往返相遇或相对运动问题中，混淆“距A地 vs 距B地”参照端点、混淆已走路程与剩余路程、或混淆迎面速度和与同向追及速度差。",
+    },
+    {
+        "code": "TRAP_MIDPOINT_OFFSET_DOUBLE",
+        "name": "中点偏移路程差倍半混淆",
+        "description": "相向相遇偏离中点或对称点问题中，忽略“两动点路程差 = 2 × 相遇点距中点距离”的倍半关系，误将单倍偏移量当作路程差或将路程差直接当作距中点距离。",
     },
 ]
 
@@ -618,7 +628,7 @@ def init_db(conn: sqlite3.Connection, config_dir: Path | str | None = None) -> N
 
     Bootstrap 顺序（DESIGN.md §3.2-11）：
     1. 插入 grade_subjects 种子 '小学奥数' (slug='primary_olympiad', subject_family='MATH')
-    2. 插入 concepts 6 个预置 TRAP (is_seed=1)
+    2. 插入/同步 concepts 12 个预置 TRAP (is_seed=1)
     3. 插入 learners 'default' (display_name='默认', default_grade_subject='小学奥数', is_current=1)
     """
     for stmt in DDL_STATEMENTS:
@@ -634,7 +644,7 @@ def init_db(conn: sqlite3.Connection, config_dir: Path | str | None = None) -> N
         """
     )
 
-    # Bootstrap Step 2: concepts 6 个预置 TRAP
+    # Bootstrap Step 2: concepts 预置 TRAP（幂等同步新增枚举与最新中文别名/描述）
     traps = SEED_TRAPS
     if config_dir is not None:
         cfg_path = Path(config_dir) / "method_blacklist.yaml"
@@ -654,8 +664,12 @@ def init_db(conn: sqlite3.Connection, config_dir: Path | str | None = None) -> N
         aliases_json = json.dumps([name], ensure_ascii=False)
         conn.execute(
             """
-            INSERT OR IGNORE INTO concepts(concept_id, kind, name, aliases_json, description, is_seed)
-            VALUES (?, 'TRAP', ?, ?, ?, 1);
+            INSERT INTO concepts(concept_id, kind, name, aliases_json, description, is_seed)
+            VALUES (?, 'TRAP', ?, ?, ?, 1)
+            ON CONFLICT(concept_id) DO UPDATE SET
+                aliases_json = excluded.aliases_json,
+                description = excluded.description,
+                is_seed = 1;
             """,
             (concept_id, code, aliases_json, desc),
         )

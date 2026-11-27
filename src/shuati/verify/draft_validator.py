@@ -47,8 +47,10 @@ _DEFAULT_SEED_TRAPS: frozenset[str] = frozenset(
         "TRAP_ARITHMETIC_SLIP",
         "TRAP_AVERAGE_HARMONIC",
         "TRAP_EXTENDED_BODY_LENGTH",
+        "TRAP_BRIDGE_ON_VS_PASS",
         "TRAP_ASYNC_SYNC_CONFUSION",
         "TRAP_DIRECTION_REF_POINT",
+        "TRAP_MIDPOINT_OFFSET_DOUBLE",
     }
 )
 

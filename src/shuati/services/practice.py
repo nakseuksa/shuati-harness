@@ -248,9 +248,52 @@ def hydrate_question_dict(
                 }
             )
 
+    ov_fields_set = set(_safe_json(q_row["eff_overridden_fields_json"], []))
     methods: list[str] = []
     motifs: list[str] = []
     traps: list[str] = []
+    if ov_fields_set & {"thinking_methods_json", "classic_motifs_json", "trap_tags_json"}:
+        for ov_r in conn.execute(
+            """
+            SELECT field_name, override_value
+            FROM human_overrides
+            WHERE question_uid = ?
+              AND field_name IN ('thinking_methods_json', 'classic_motifs_json', 'trap_tags_json')
+              AND is_active = 1 AND is_suspended = 0;
+            """,
+            (question_uid,),
+        ).fetchall():
+            fn_ov = str(ov_r["field_name"])
+            parsed_ov = _safe_json(ov_r["override_value"], [])
+            raw_seq = (
+                (parsed_ov.get("items") or parsed_ov.get("tags") or [])
+                if isinstance(parsed_ov, dict)
+                else (parsed_ov if isinstance(parsed_ov, list) else [])
+            )
+            c_kind_ov = (
+                "METHOD"
+                if fn_ov == "thinking_methods_json"
+                else ("MOTIF" if fn_ov == "classic_motifs_json" else "TRAP")
+            )
+            target_list = methods if c_kind_ov == "METHOD" else (motifs if c_kind_ov == "MOTIF" else traps)
+            for item_v in raw_seq:
+                raw_name = str(item_v or "").strip()
+                if not raw_name:
+                    continue
+                canon_row = conn.execute(
+                    """
+                    SELECT COALESCE(m.name, c.name) AS canon_name
+                    FROM concepts c
+                    LEFT JOIN concepts m ON m.concept_id = c.redirect_to_id
+                    WHERE c.kind = ? AND c.name = ?
+                    LIMIT 1;
+                    """,
+                    (c_kind_ov, raw_name),
+                ).fetchone()
+                cname_ov = str(canon_row["canon_name"]) if canon_row else raw_name
+                if cname_ov not in target_list:
+                    target_list.append(cname_ov)
+
     for cr in conn.execute(
         """
         SELECT qc.kind, COALESCE(m.name, c.name) AS canon_name
@@ -263,12 +306,21 @@ def hydrate_question_dict(
         (question_uid,),
     ).fetchall():
         cname = str(cr["canon_name"])
-        if cr["kind"] == "METHOD" and cname not in methods:
-            methods.append(cname)
-        elif cr["kind"] == "MOTIF" and cname not in motifs:
-            motifs.append(cname)
-        elif cr["kind"] == "TRAP" and cname not in traps:
-            traps.append(cname)
+        if cr["kind"] == "METHOD":
+            if "thinking_methods_json" in ov_fields_set:
+                continue
+            if cname not in methods:
+                methods.append(cname)
+        elif cr["kind"] == "MOTIF":
+            if "classic_motifs_json" in ov_fields_set:
+                continue
+            if cname not in motifs:
+                motifs.append(cname)
+        elif cr["kind"] == "TRAP":
+            if "trap_tags_json" in ov_fields_set:
+                continue
+            if cname not in traps:
+                traps.append(cname)
 
     cas_images = _safe_json(q_row["cas_images_json"], [])
     return {

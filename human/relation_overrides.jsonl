@@ -1,0 +1,1 @@
+{"action": "REJECT", "created_at": "2026-11-27 12:00:24", "is_active": 1, "override_id": 1, "pedagogical_note": "", "reason": "AUDIT_REC_V43: 1405 vs 1915 跨阶倒挂且靶向错位", "relation_type": "CONTRASTIVE", "revoked_at": null, "source": "PI_CLI", "source_question_uid": "primary_olympiad:ch17_行程问题初步:ch17_032", "target_question_uid": "primary_olympiad:ch17_行程问题初步:ch17_074"}

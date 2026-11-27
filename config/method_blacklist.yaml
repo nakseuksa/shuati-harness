@@ -11,7 +11,7 @@ blacklist_terms:
   - 观察法
   - 归纳总结
 
-# 10 大预置 TRAP 设错算子（系统 bootstrap 种子，跨学段通用中粒度认知陷阱）
+# 12 大预置 TRAP 设错算子（系统 bootstrap 种子，跨学段通用中粒度认知陷阱）
 seed_traps:
   - code: TRAP_DOMAIN_BOUNDARY
     name: 边界端点与定义域遗漏
@@ -35,11 +35,17 @@ seed_traps:
     name: 调和平均与算术平均混淆
     description: 等距往返、上下坡或等额分批采购中，将调和平均速度/单价误按算术平均值 (v1+v2)/2 计算。
   - code: TRAP_EXTENDED_BODY_LENGTH
-    name: 有长物体车身加减混淆
-    description: 火车过桥/过隧与错车超车中，混淆完全通过（加车长）、整车在桥上（减车长）、地面看双车长和与车上人看单车长。
+    name: 错车超车双车长与参考系混淆
+    description: 两车相向错车、同向超车或运动行人观察火车问题中，混淆地面看双车长之和与车内窗前看对方单车长、或漏加其中一车车长。
+  - code: TRAP_BRIDGE_ON_VS_PASS
+    name: 过桥加车长与在桥减车长混淆
+    description: 单列火车通过静态桥隧问题中，混淆“完全通过桥隧（路程 = 桥长 + 车长）”、“整列火车完全在桥上（路程 = 桥长 - 车长）”或漏算自身车长。
   - code: TRAP_ASYNC_SYNC_CONFUSION
     name: 错时异地盲套同步公式
     description: 存在提前/延后出发或起点偏移时，未剥离先行段便盲目套用同时同端/双端出发的 1S:3S:5S 等同步倍率结论。
   - code: TRAP_DIRECTION_REF_POINT
-    name: 折返参照端与遇追混淆
-    description: 多次往返或偏移问题中，混淆“距A地/距B地/距中点”、混淆已走路程与剩余路程、或混淆迎面速度和与同向追及速度差。
+    name: 参照端点与遇追方向混淆
+    description: 往返相遇或相对运动问题中，混淆“距A地 vs 距B地”参照端点、混淆已走路程与剩余路程、或混淆迎面速度和与同向追及速度差。
+  - code: TRAP_MIDPOINT_OFFSET_DOUBLE
+    name: 中点偏移路程差倍半混淆
+    description: 相向相遇偏离中点或对称点问题中，忽略“两动点路程差 = 2 × 相遇点距中点距离”的倍半关系，误将单倍偏移量当作路程差或将路程差直接当作距中点距离。

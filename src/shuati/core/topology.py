@@ -90,17 +90,43 @@ class QuestionFeature:
 
 
 def _has_extended_body_feature(f: QuestionFeature) -> bool:
-    if any("TRAP_EXTENDED_BODY_LENGTH" in t for t in f.e_traps):
+    if any(("TRAP_EXTENDED_BODY_LENGTH" in t or "TRAP_BRIDGE_ON_VS_PASS" in t) for t in f.e_traps):
         return True
     if any(("火车过桥与错车" in l2 or "矩形重叠区" in l2) for l2 in f.l2_entities):
         return True
     return any("火车过桥" in lbl for lbl in f.tag_labels)
 
 
+def _is_pure_static_bridge_feature(f: QuestionFeature) -> bool:
+    if not _has_extended_body_feature(f):
+        return False
+    txt = f.eff_text
+    if not any(ch in txt for ch in ("桥", "隧道", "涵洞")):
+        return False
+    return not any(
+        w in txt
+        for w in (
+            "行人", "骑车", "散步", "两列", "两辆", "卡车", "慢车", "快车",
+            "相向", "同向", "追上", "超过", "超越", "错车", "窗",
+        )
+    )
+
+
 def _has_escalator_feature(f: QuestionFeature) -> bool:
     if "扶梯" in f.eff_text:
         return True
     return any("扶梯" in lbl.split("/")[-1] for lbl in f.tag_labels)
+
+
+def _has_river_current_feature(f: QuestionFeature) -> bool:
+    if _has_escalator_feature(f):
+        return False
+    txt = f.eff_text
+    if any(w in txt for w in ("顺水", "逆水", "顺流", "逆流", "水速", "水流", "静水")):
+        return True
+    if any("流水行船" in l2 for l2 in f.l2_entities):
+        return True
+    return any(("流水行船" in lbl or "顺逆" in lbl or "水流" in lbl) for lbl in f.tag_labels)
 
 
 def _is_escalator_dir_time_flip_pair(fa: QuestionFeature, fb: QuestionFeature) -> bool:
@@ -129,10 +155,14 @@ def _is_pct_micro_question(f: QuestionFeature) -> bool:
 
 
 def _is_isomorphic_structurally_compatible(fa: QuestionFeature, fb: QuestionFeature) -> bool:
-    """拦截跨物理参考系伪消元同构、有长物体退化为质点追及、以及完整应用题退化为纯百分率小题。"""
+    """拦截跨物理参考系伪消元同构、单车静态过桥跨动态错超、陆地往返跨流水速差、有长物体退化为质点追及及纯百分率小题。"""
     if _has_extended_body_feature(fa) != _has_extended_body_feature(fb):
         return False
+    if _is_pure_static_bridge_feature(fa) != _is_pure_static_bridge_feature(fb):
+        return False
     if _has_escalator_feature(fa) != _has_escalator_feature(fb):
+        return False
+    if _has_river_current_feature(fa) != _has_river_current_feature(fb):
         return False
     if _is_escalator_dir_time_flip_pair(fa, fb):
         return False
@@ -202,11 +232,73 @@ def load_question_features(
     uids = [str(r["question_uid"]) for r in q_rows]
     ph = ",".join("?" for _ in uids)
 
-    # 加载激活的 MOTIF 与 TRAP 概念
+    # 加载激活的 MOTIF 与 TRAP 概念（对存在激活覆写的题目直接读取 human_overrides 权威列表，避免与 MACHINE 主键冲突）
+    trap_ov_uids: set[str] = set()
+    motif_ov_uids: set[str] = set()
+    for r in q_rows:
+        u_k = str(r["question_uid"])
+        try:
+            ov_f = set(json.loads(r["eff_overridden_fields_json"] or "[]"))
+        except ValueError:
+            ov_f = set()
+        if "trap_tags_json" in ov_f:
+            trap_ov_uids.add(u_k)
+        if "classic_motifs_json" in ov_f:
+            motif_ov_uids.add(u_k)
+
     raw_motif_by_q: dict[str, set[str]] = {}
     motif_doc_uids: dict[str, set[str]] = {}
     trap_by_q: dict[str, set[str]] = {}
     motif_names_by_q: dict[str, list[str]] = {}
+
+    concept_ov_uids = sorted(trap_ov_uids | motif_ov_uids)
+    if concept_ov_uids:
+        ov_ph = ",".join("?" for _ in concept_ov_uids)
+        for ov_r in conn.execute(
+            f"""
+            SELECT question_uid, field_name, override_value
+            FROM human_overrides
+            WHERE question_uid IN ({ov_ph})
+              AND field_name IN ('classic_motifs_json', 'trap_tags_json')
+              AND is_active = 1 AND is_suspended = 0;
+            """,
+            concept_ov_uids,
+        ).fetchall():
+            uid_ov = str(ov_r["question_uid"])
+            fn_ov = str(ov_r["field_name"])
+            try:
+                parsed_ov = json.loads(ov_r["override_value"] or "[]")
+                raw_seq = (
+                    (parsed_ov.get("items") or parsed_ov.get("tags") or [])
+                    if isinstance(parsed_ov, dict)
+                    else (parsed_ov if isinstance(parsed_ov, list) else [])
+                )
+            except ValueError:
+                raw_seq = []
+            c_kind_ov = "MOTIF" if fn_ov == "classic_motifs_json" else "TRAP"
+            for item_v in raw_seq:
+                raw_name = str(item_v or "").strip()
+                if not raw_name:
+                    continue
+                c_row = conn.execute(
+                    "SELECT concept_id, name FROM concepts WHERE kind = ? AND name = ? LIMIT 1;",
+                    (c_kind_ov, raw_name),
+                ).fetchone()
+                if c_row is not None:
+                    orig_cid_ov = str(c_row["concept_id"])
+                    cid_ov = _canon_concept(orig_cid_ov) or orig_cid_ov
+                else:
+                    cid_ov = f"{c_kind_ov}:{raw_name}"
+                if c_kind_ov == "MOTIF":
+                    tok_ov = f"M:{cid_ov}"
+                    raw_motif_by_q.setdefault(uid_ov, set()).add(tok_ov)
+                    motif_doc_uids.setdefault(tok_ov, set()).add(uid_ov)
+                    motif_names_by_q.setdefault(uid_ov, []).append(raw_name)
+                else:
+                    if raw_name == "TRAP_ARITHMETIC_SLIP" or cid_ov == "TRAP:TRAP_ARITHMETIC_SLIP":
+                        continue
+                    trap_by_q.setdefault(uid_ov, set()).add(f"T:{cid_ov}")
+
     qc_rows = conn.execute(
         f"""
         SELECT qc.question_uid, qc.concept_id, qc.kind, c.name
@@ -221,11 +313,15 @@ def load_question_features(
         orig_cid = str(r["concept_id"])
         cid = _canon_concept(orig_cid) or orig_cid
         if r["kind"] == "MOTIF":
+            if uid in motif_ov_uids:
+                continue
             tok = f"M:{cid}"
             raw_motif_by_q.setdefault(uid, set()).add(tok)
             motif_doc_uids.setdefault(tok, set()).add(uid)
             motif_names_by_q.setdefault(uid, []).append(str(r["name"]))
         else:
+            if uid in trap_ov_uids:
+                continue
             # D-Audit-3：纯四则笔误 TRAP_ARITHMETIC_SLIP 不参与跨题 SHARED_TRAP 织网
             if (
                 str(r["name"]).strip() == "TRAP_ARITHMETIC_SLIP"

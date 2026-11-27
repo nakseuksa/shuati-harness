@@ -528,9 +528,17 @@ def render_batch_markdown_report(
         lines.append(f"- **知识定位**：{diag.get('primary_l1_module')} / {l2_txt}")
         sub_inv = diag.get("submodel_inventory")
         if isinstance(sub_inv, dict) and sub_inv.get("submodel_label"):
-            lines.append(
-                f"- **细分模型题库覆盖**：当前题库「{sub_inv['submodel_label']}」细分模型共收录 **{sub_inv.get('total_in_db', 0)}** 道匹配题"
-            )
+            tot_db = int(sub_inv.get("total_in_db") or 0)
+            compat_iso = sub_inv.get("compatible_isomorphic_peers")
+            if tot_db > 3 and compat_iso is not None:
+                lines.append(
+                    f"- **细分模型题库覆盖**：当前题库「{sub_inv['submodel_label']}」算子共关联 **{tot_db}** 道题"
+                    f"（同物理子模型有效非原题变式 **{int(compat_iso)}** 道）"
+                )
+            else:
+                lines.append(
+                    f"- **细分模型题库覆盖**：当前题库「{sub_inv['submodel_label']}」细分模型共收录 **{tot_db}** 道匹配题"
+                )
         lines.append(f"- **参考答案**：{_format_answers_inline(diag.get('final_answers') or [])}")
         if isinstance(matched_db, dict) and matched_db.get("answer_conflict"):
             lines.append(
