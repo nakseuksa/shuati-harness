@@ -20,17 +20,21 @@ import yaml
 from pydantic import ValidationError
 
 from shuati.config import Settings
+from shuati.core import difficulty
 from shuati.core.text_norm import normalize_text
 from shuati.db.connection import PreconditionError
 from shuati.db.schema import SEED_TRAPS
 from shuati.llm.gateway import LLMGatewayError
 from shuati.models.schemas import ExternalDiagnosisOutput
 from shuati.services.mistake import (
+    RECOMMENDATION_ENGINE_VERSION,
     _prune_expired_drafts,
+    build_diagnose_recommendations_async,
     compute_diagnose_content_hash,
     diagnose_external_mistake_async,
     find_duplicate_candidates,
 )
+from shuati.verify.answer_parts import normalize_answer_parts
 
 _HR_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
 _HEADING_RE = re.compile(r"^\s*#{2,3}\s+(.+?)\s*$")
@@ -493,10 +497,40 @@ def render_batch_markdown_report(
 
         diag = it["result"]
         lines.append(f"- **草稿 ID**：`{diag.get('draft_id')}`（可执行 `shuati ingest-mistake --draft-id {diag.get('draft_id')} --log-wrong` 入库）")
-        lines.append(f"- **难度定级**：`{diag.get('tier')}` ｜ `base_elo = {diag.get('base_elo')}`")
+        cal_src = str(diag.get("elo_calibration_source") or "")
+        raw_elo = diag.get("raw_draft_base_elo")
+        raw_tier = diag.get("raw_draft_tier")
+        matched_db = diag.get("matched_db_question") or {}
+        if (
+            cal_src == "DB_VERIFIED_MATCH"
+            and raw_elo is not None
+            and int(raw_elo) != int(diag.get("base_elo") or 0)
+        ):
+            lines.append(
+                f"- **难度定级**：`{diag.get('tier')}` ｜ `base_elo = {diag.get('base_elo')}`"
+                f"（已借用库内已验真原题 `{matched_db.get('source_id', '')}` 定级定窗；单路初评 `{raw_tier}` / {raw_elo} Elo）"
+            )
+        elif cal_src == "KNN_ANCHOR_BLEND" and raw_elo is not None and int(raw_elo) != int(diag.get("base_elo") or 0):
+            lines.append(
+                f"- **难度定级**：`{diag.get('tier')}` ｜ `base_elo = {diag.get('base_elo')}`"
+                f"（结合库内同子模型近邻校准；单路初评 {raw_elo} Elo）"
+            )
+        else:
+            lines.append(f"- **难度定级**：`{diag.get('tier')}` ｜ `base_elo = {diag.get('base_elo')}`")
         l2_txt = "、".join(diag.get("matched_l2") or []) or "（无）"
         lines.append(f"- **知识定位**：{diag.get('primary_l1_module')} / {l2_txt}")
+        sub_inv = diag.get("submodel_inventory")
+        if isinstance(sub_inv, dict) and sub_inv.get("submodel_label"):
+            lines.append(
+                f"- **细分模型题库覆盖**：当前题库「{sub_inv['submodel_label']}」细分模型共收录 **{sub_inv.get('total_in_db', 0)}** 道匹配题"
+            )
         lines.append(f"- **参考答案**：{_format_answers_inline(diag.get('final_answers') or [])}")
+        if isinstance(matched_db, dict) and matched_db.get("answer_conflict"):
+            lines.append(
+                f"- **⚠️ 库内验真答案冲突告警**：单路草稿答案与库内已验真原题 `{matched_db.get('source_id')}`"
+                f"（`{matched_db.get('verification_status')}`）不一致！库内标准答案为 **{matched_db.get('db_answer_display')}**，"
+                "请警惕单路视觉/建模偏差并以库内验真结果为准。"
+            )
         if diag.get("method_summary"):
             lines.append(f"- **核心思路**：{diag['method_summary']}")
         if diag.get("trap_tags"):
@@ -513,12 +547,14 @@ def render_batch_markdown_report(
                 )
 
         recs = diag.get("recommendations") or {}
+        rec_notes = diag.get("recommendation_notes") if isinstance(diag.get("recommendation_notes"), dict) else {}
         for label, key in (
             ("前置铺垫题", "scaffold_foundations"),
             ("同构变式题", "isomorphic_variants"),
             ("辨析/同坑排雷题", "contrastive_and_traps"),
         ):
             rec_list = recs.get(key) or []
+            col_note = str(rec_notes.get(key) or "").strip()
             if rec_list:
                 lines.append(f"- **推荐{label}**：")
                 for rec_idx, r in enumerate(rec_list[:3], start=1):
@@ -534,6 +570,13 @@ def render_batch_markdown_report(
                         f"  {rec_idx}. `{sid}`（{r.get('tier', '')} / {r.get('base_elo', '')} Elo，sim={r.get('similarity', '')}）{img_badge}"
                     )
                     lines.extend(_format_rec_quote_lines(q_txt, opts))
+                    reason_txt = str(r.get("match_reason") or "").strip()
+                    if reason_txt:
+                        lines.append(f"     - *推荐理由：{reason_txt}*")
+                if col_note and len(rec_list[:3]) < 3:
+                    lines.append(f"  - *注：{col_note}*")
+            elif col_note:
+                lines.append(f"- **推荐{label}**：*（{col_note}）*")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -610,10 +653,51 @@ async def diagnose_external_file_async(
 
                 chash = compute_diagnose_content_hash(grade_subject, norm_text, item.image_paths)
 
-                # 2. 断点续跑复用已有未过期草稿
+                # 2. 断点续跑复用已有未过期草稿（若旧版草稿未走 rec_v2 推荐引擎则自动原位重算推荐）
                 if not force and chash in reusable_index:
                     df_path, payload = reusable_index[chash]
                     diag_dict = payload["diagnosis"]
+                    eff_mock_reuse = settings.pipeline.use_mock_llm if use_mock is None else bool(use_mock)
+                    if payload.get("recommendation_engine_version") != RECOMMENDATION_ENGINE_VERSION:
+                        diag_model = ExternalDiagnosisOutput.model_validate(diag_dict)
+                        diag_parts = normalize_answer_parts(diag_model.final_answers)
+                        diff_res = difficulty.compute_difficulty(
+                            diag_model.difficulty.C_concept_count.score,
+                            diag_model.difficulty.S_chain_length.score,
+                            diag_model.difficulty.T_trickiness.score,
+                            diag_model.difficulty.L_computation_load.score,
+                        )
+                        rec_bundle = await build_diagnose_recommendations_async(
+                            conn,
+                            settings,
+                            grade_subject=grade_subject,
+                            scope_slug=str(gs_row["slug"]),
+                            norm_text=norm_text,
+                            image_count=len(item.image_paths),
+                            diag=diag_model,
+                            diag_parts=diag_parts,
+                            diff_res=diff_res,
+                            vectors_dir=vectors_dir,
+                            use_mock=eff_mock_reuse,
+                        )
+                        payload = {
+                            **payload,
+                            "recommendation_engine_version": RECOMMENDATION_ENGINE_VERSION,
+                            "base_elo": int(rec_bundle["effective_base_elo"]),
+                            "tier": str(rec_bundle["effective_tier"]),
+                            "tier_rank": int(rec_bundle["effective_tier_rank"]),
+                            "raw_draft_base_elo": diff_res.base_elo,
+                            "raw_draft_tier": diff_res.tier,
+                            "elo_calibration_source": rec_bundle["elo_calibration_source"],
+                            "matched_db_question": rec_bundle["matched_db_question"],
+                            "submodel_inventory": rec_bundle["submodel_inventory"],
+                            "duplicate_candidates": rec_bundle["duplicate_candidates"],
+                            "recommendations": rec_bundle["recommendations"],
+                            "recommendation_notes": rec_bundle["recommendation_notes"],
+                            "warnings": rec_bundle["warnings"],
+                        }
+                        _atomic_write_text(df_path, json.dumps(payload, ensure_ascii=False, indent=2))
+
                     dups = payload.get("duplicate_candidates")
                     if dups is None:
                         dups = find_duplicate_candidates(
@@ -627,10 +711,16 @@ async def diagnose_external_file_async(
                     reused_res = {
                         "draft_id": payload["draft_id"],
                         "draft_file": str(df_path.resolve()),
+                        "recommendation_engine_version": payload.get("recommendation_engine_version", ""),
                         "unverified_single_pass": bool(payload.get("unverified_single_pass", True)),
                         "grade_subject": grade_subject,
                         "base_elo": int(payload["base_elo"]),
                         "tier": payload["tier"],
+                        "raw_draft_base_elo": payload.get("raw_draft_base_elo"),
+                        "raw_draft_tier": payload.get("raw_draft_tier"),
+                        "elo_calibration_source": payload.get("elo_calibration_source", ""),
+                        "matched_db_question": payload.get("matched_db_question"),
+                        "submodel_inventory": payload.get("submodel_inventory"),
                         "primary_l1_module": diag_dict.get("primary_l1_module", ""),
                         "matched_l2": diag_dict.get("matched_l2", []),
                         "visual_facts": diag_dict.get("visual_facts", ""),
@@ -647,6 +737,8 @@ async def diagnose_external_file_async(
                             "recommendations",
                             {"scaffold_foundations": [], "isomorphic_variants": [], "contrastive_and_traps": []},
                         ),
+                        "recommendation_notes": payload.get("recommendation_notes", {}),
+                        "warnings": payload.get("warnings", []),
                     }
                     print(
                         f"[diagnose {item.index}/{total}] 复用草稿: {payload['draft_id']} ({payload['tier']} / {payload['base_elo']} Elo)",

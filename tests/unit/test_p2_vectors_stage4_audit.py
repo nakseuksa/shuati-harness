@@ -319,7 +319,7 @@ def test_topology_onesided_near_threshold_and_pretruncate_refine_candidates(tmp_
             [0.0, 0.0, 1.0, 0.0],          # q_high
             [1.0, 0.0, 0.0, 0.0],          # q_iso1
             [0.78, 0.6258, 0.0, 0.0],      # q_iso2 (与 q_iso1 k_sim=0.78，刚过 0.76 硬阈值)
-            [0.0, 0.0, 0.0, 1.0],          # q_mid2
+            [0.0, 0.0, 0.92, 0.3919],      # q_mid2 (与 q_high k_sim=0.92，刚过 skeleton_pct_min=0.90 硬阈值)
         ],
         dtype=np.float32,
     )

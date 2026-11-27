@@ -1,6 +1,6 @@
 # 刷题 Harness v2（纯理科题库知识编译器 & `pi` 智能刷题底座）— 会话入口
 
-**开始工作前先读 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 与 [docs/records/INDEX.md](docs/records/INDEX.md)**。
+**开始工作前先读 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) 与 [docs/records/INDEX.md](docs/records/INDEX.md)**（注：若当前会话仅执行 `.agents/teamwork/external_review/B*_task.md` 专项切片审查，严格按任务单白名单直奔目标源码，免读上述全局长文档）。
 
 ## 核心约定
 

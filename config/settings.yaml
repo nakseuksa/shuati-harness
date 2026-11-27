@@ -50,6 +50,7 @@ pipeline:
   dual_vlm_policy: "always"
   sympy_timeout_seconds: 5.0
   enable_stage4_llm_refine: true
+  enable_diagnose_llm_rerank: true
   use_mock_llm: false
   max_stage_attempts: 3
   sympy_memory_limit_mb: 512

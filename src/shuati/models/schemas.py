@@ -273,6 +273,28 @@ class Stage4RefineBatchOutput(BaseModel):
     decisions: list[Stage4RefineItem]
 
 
+DiagnoseRecSlot = Literal[
+    "SCAFFOLD",
+    "ISOMORPHIC",
+    "CONTRASTIVE_TRAP",
+    "REJECT",
+]
+
+
+class DiagnoseRerankItem(BaseModel):
+    """外部错题推荐候选二级轻量精裁单项裁决。"""
+
+    candidate_id: str = Field(min_length=1)
+    verdict: DiagnoseRecSlot
+    pedagogical_reason: str = ""
+
+
+class DiagnoseRerankBatchOutput(BaseModel):
+    """外部错题推荐候选二级轻量精裁批量输出。"""
+
+    decisions: list[DiagnoseRerankItem] = Field(default_factory=list)
+
+
 class ExternalDiagnosisOutput(BaseModel):
     """外部新错题实时单路诊断输出（visual_facts 必须排首位）。"""
 

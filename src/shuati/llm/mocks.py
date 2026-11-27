@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from shuati.models.schemas import (
+    DiagnoseRerankBatchOutput,
     ExternalDiagnosisOutput,
     MergeJudgeBatchOutput,
     MultiSolutionJudgeOutput,
@@ -160,6 +161,8 @@ def _default_payload_for_schema(schema: type[BaseModel], slot: str) -> dict[str,
     if schema is PrerequisiteDagOutput:
         return {"edges": []}
     if schema is Stage4RefineBatchOutput:
+        return {"decisions": []}
+    if schema is DiagnoseRerankBatchOutput:
         return {"decisions": []}
     if schema is ExternalDiagnosisOutput:
         return {

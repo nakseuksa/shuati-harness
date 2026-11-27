@@ -107,6 +107,7 @@ class PipelineConfig(BaseModel):
     dual_vlm_policy: str = "always"
     sympy_timeout_seconds: float = 5.0
     enable_stage4_llm_refine: bool = True
+    enable_diagnose_llm_rerank: bool = True
     use_mock_llm: bool = False
     max_stage_attempts: int = 3
     sympy_memory_limit_mb: int = 512

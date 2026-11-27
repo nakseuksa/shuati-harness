@@ -611,6 +611,7 @@ def generate_candidate_edges(
             )
 
         # (3) SCAFFOLD：有向边 source(低阶子题) -> target(高阶母题)，D_target - D_source >= min_elo_diff (D-Audit-2 & D-Audit-5)
+        has_both_skel = (ua in skel_pos) and (ub in skel_pos)
         for high_f, low_f, low_in_high, high_in_low in (
             (fa, fb, cont_b_in_a, cont_a_in_b),
             (fb, fa, cont_a_in_b, cont_b_in_a),
@@ -621,8 +622,13 @@ def generate_candidate_edges(
                 len(low_f.k_union) >= th.scaffold.min_k_size
                 and high_in_low < th.scaffold.reverse_containment_max
             )
+            skel_core_ok = (not has_both_skel) or (k_pct >= th.scaffold.skeleton_pct_min)
+            skel_band_ok = (not has_both_skel) or (
+                k_pct >= round(th.scaffold.skeleton_pct_min * (1.0 - sc_band), 12)
+            )
             sc_core = (
                 core_eligible
+                and skel_core_ok
                 and low_in_high >= th.scaffold.containment_min
                 and elo_gap >= th.scaffold.min_elo_diff
             )
@@ -631,6 +637,7 @@ def generate_candidate_edges(
                 and not sc_core
                 and sc_band > 0
                 and elo_gap > 0
+                and skel_band_ok
                 and low_in_high >= round(th.scaffold.containment_min * (1.0 - sc_band), 12)
                 and elo_gap >= round(th.scaffold.min_elo_diff * (1.0 - sc_band), 12)
             )
@@ -662,6 +669,7 @@ def generate_candidate_edges(
                     near_b = sc_boundary_hit or (
                         _near_threshold(low_in_high, th.scaffold.containment_min, sc_band)
                         or _near_threshold(float(elo_gap), float(th.scaffold.min_elo_diff), sc_band)
+                        or (has_both_skel and _near_threshold(k_pct, th.scaffold.skeleton_pct_min, sc_band))
                     )
                     needs_ref = near_b
                     ref_reason = "BOUNDARY_BAND" if near_b else ""

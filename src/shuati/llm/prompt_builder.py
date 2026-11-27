@@ -1119,18 +1119,23 @@ def build_external_diagnose_messages(
 
     system_text = (
         f"你是严谨的{grade_subject}学科错题诊断专家。请阅读题干与配图，严格输出一个合法 JSON 对象（不要输出 Markdown 代码块包裹），并遵守以下全部硬性契约（教研细则见下方【学科与接缝补充规范】）：\n"
-        "1. `visual_facts` 必须排在 JSON 顶层首位（无图题置空字符串 \"\"），仅写客观视觉事实，严禁写入未画出的辅助线或推导结论。\n"
+        "1. `visual_facts` 必须排在 JSON 顶层首位（无图题置空字符串 \"\"），仅写客观视觉事实，严禁写入未画出的辅助线或推导结论；"
+        "遇到正多边形、星形或网格配图时，必须先用对称性或投影严格核对内部对角线/跨段虚线与外周短边的真实倍数关系（例如正六角星相对凹顶点连线等于中间正六边形主对角线即 2 倍短边，切勿凭直觉误判为 1 倍）。\n"
         "2. 必须输出非空的 `method_summary`（≥2字）与 `solution_markdown`（≥5字），严禁留空。\n"
         "3. `sympy_code`（存在 `verify_mode == \"SYMBOLIC\"` 小问时必填，否则置 `null`）：仅允许导入 sympy / math / fractions；"
         "严禁调用 sympify / parse_expr / lambdify / S(<字符串>) / eval / exec / open；"
         "**必须定义 `def verify():`** 返回字典（键为归一后小问标签如 `'主问'` 或 `'(1)'`，值为通过真实运算得出的字符串或列表，禁止仅用 print(...) 或硬编码常量）。\n"
         "4. `steps`（1~5 个有教学意义的逻辑推理步，`step_index` 从 1 连续递增）：\n"
         "   - 必填 `sub_goal`、`core_formula`、`hint`（设问式零泄密，严禁剧透终值）；\n"
+        "   - **严禁凑步膨胀**：单一基础公式直推题（如基础追及超车 `(L1+L2)÷(v1-v2)`、单次往返时间按速度反比分配、扶梯两次顺行级数差除时间差）必须控制在 **1~2 个核心逻辑步**，严禁把求差、求和、代入除法拆成 3~4 个微步骤；\n"
         "   - `raw_l1`（**必须取自下方标准词表的 L1**）、`raw_l2`（**优先取自下方标准词表的 L2**）、`raw_l3`（**4~14 字脱壳原子转化算子短语**，严禁数字/人名道具/整句解说）。\n"
         "5. `abstract_skeleton`（三段式去情境抽象骨架）、`primary_l1_module`、`secondary_l1_modules`、`matched_l2` 严格从下方标准词表选取；`thinking_methods`（1~3 个具体技法，禁用万金油泛词）、`classic_motifs`（未命中置 `[]`）。\n"
         f"6. {_TRAP_ENUM_SPEC_TEXT}\n"
-        f"7. {_DIFFICULTY_RUBRIC_SPEC_TEXT}{seam_section}\n\n"
-        "【输出 JSON 顶层结构模板】\n"
+        f"7. {_DIFFICULTY_RUBRIC_SPEC_TEXT}\n"
+        "   - **反 `[2,2,2,1]` 均值坍缩硬红线**：单公式/单模型基础题必须果断打 `C=1, S=1, T=1`（L1_基础直达）；"
+        "凡涉及**多体同步节点联立消元、变动起点双比例消元、错时往返截取对称段、或需反证判定折返区间（直觉极易误判首末段状态）**的题目，必须客观评定 `C=3`（强反直觉陷阱同步评 `T=3`），严禁一律折中塞入 `C=2, S=2`！"
+        f"{seam_section}\n\n"
+        "【输出 JSON 顶层结构模板（注意：difficulty 中各维 score 仅为合法整数类型示意，请严格按实际复杂度在允许区间内拉开的档位打分，严禁照抄示意数字）】\n"
         "{\n"
         '  "visual_facts": "",\n'
         '  "visual_ambiguity_flag": false,\n'
@@ -1148,10 +1153,10 @@ def build_external_diagnose_messages(
         '  "classic_motifs": ["经典母题"],\n'
         '  "trap_tags": ["TRAP_FRAME_SHIFT"],\n'
         '  "difficulty": {\n'
-        '    "C_concept_count": {"evidence": "...", "score": 2},\n'
-        '    "S_chain_length": {"evidence": "...", "score": 2},\n'
-        '    "T_trickiness": {"evidence": "...", "score": 2},\n'
-        '    "L_computation_load": {"evidence": "...", "score": 1}\n'
+        '    "C_concept_count": {"evidence": "点明核心模型层级（基础单模型打1，常规串联打2，深层不变量/反证/多体消元打3，非标构造打4）", "score": 1},\n'
+        '    "S_chain_length": {"evidence": "点明合并纯算术后的真实逻辑步数或独立分类分支数（1~2步打1，3~4步打2，≥5步或多分支打3）", "score": 1},\n'
+        '    "T_trickiness": {"evidence": "点明条件是否直白（直白打1，含1处隐含转译打2，强反直觉/极易漏解陷阱打3）", "score": 1},\n'
+        '    "L_computation_load": {"evidence": "点明运算负荷（短题心算打1，常规列式消元打2，繁算多联立打3）", "score": 1}\n'
         "  }\n"
         "}\n\n"
         "【`final_answers` 元素 `AnswerPart` 规范】\n"
@@ -1183,6 +1188,71 @@ def build_external_diagnose_messages(
     return [
         {"role": "system", "content": system_text},
         {"role": "user", "content": user_content},
+    ]
+
+
+def build_diagnose_rerank_messages(
+    *,
+    grade_subject: str,
+    mistake_summary: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """构造外部错题在线推荐候选池（Top-12）轻量纯文本精裁消息（严格脱敏白名单，零 uid/source_id/chapter）。"""
+    system_text = (
+        f"你是资深{grade_subject}教研推荐审校专家。学生刚做错一道原题，系统已从题库初筛出一批脱敏候选题。\n"
+        "请逐一严格审查每道候选题与原错题的**底层数学子模型、核心转化算子及易错陷阱**，将其精准归入以下四类之一（宁缺毋滥，不达标一律判 `\"REJECT\"`）：\n"
+        "1. `\"SCAFFOLD\"`（推荐前置铺垫题）：必须精准拆解原题的某一个核心子技能/前置步骤，且认知负荷低于原题。"
+        "**严禁放行**：比例方向相反（如原题是等速异时正比差倍、候选却是定路程变速反比）、子模型错位（如原题是动态扶梯级数守恒、候选是火车过桥或质点追及；原题是静水几何周长拆份、候选是流水行船）、或计算复杂度反超原题的题目。\n"
+        "2. `\"ISOMORPHIC\"`（推荐同构变式题）：必须与原题共享**完全一致的底层核心数学子模型与等量关系骨架**，仅更换场景、数值、设问方向或合理递进。"
+        "**严禁放行**：被表层字面词误召回的跨模型题（如因“阶/楼”召回等差数列登塔、因“船”召回流水行船、因“火车”把双车错车塞给单车过静桥、把中途分段变速塞给整程往返反比）。\n"
+        "3. `\"CONTRASTIVE_TRAP\"`（推荐辨析/同坑排雷题）：必须**精准命中原题的真实核心易错坑**（如：越过交点漏算第二解、混淆路程差与距中点距离、误把跨折返点首小时当全程顺水、盲套同时出发 3S 公式到异时出发、混淆车长和与车长差、算术平均与调和平均混淆、打破中心会合思维定式的瓶颈极值思想），"
+        "或与原题**表皮高度相似但因一处关键条件变化导致解法分叉**。"
+        "**严禁放行**：仅撞上表层数字/名词（如“2015 米”“正六边形”跳蚤计数、“楼层”植树间隔）却无共同陷阱或辨析价值的题，以及难度远超原题导致认知断层的压轴题。\n"
+        "4. `\"REJECT\"`：不符合上述三类严苛教研标准的一切候选题（宁可某栏目返回 0~2 题，绝不拿弱相关题凑数）。\n\n"
+        "输出要求：\n"
+        "- 允许纠正栏目：若某候选的 `proposed_slot` 不够贴切，但完美符合另一栏目的标准且满足难度关系，可直接将其 `verdict` 改判为更合适的栏目。\n"
+        "- `decisions` 必须覆盖输入的全部 `candidate_id`；当 `verdict != \"REJECT\"` 时，`pedagogical_reason` 用 15~45 字点明具体铺垫环节/同构核/排雷辨析点（**严禁泄露候选题答案数值**）；`verdict == \"REJECT\"` 时 `pedagogical_reason` 置 `\"\"`。\n"
+        "- 仅返回合法 JSON：`{\"decisions\": [{\"candidate_id\": \"c01\", \"verdict\": \"SCAFFOLD\"|\"ISOMORPHIC\"|\"CONTRASTIVE_TRAP\"|\"REJECT\", \"pedagogical_reason\": \"...\"}]}`。"
+    )
+
+    clean_mistake = {
+        "question_text": str(mistake_summary.get("question_text") or "")[:600],
+        "abstract_skeleton": str(mistake_summary.get("abstract_skeleton") or "")[:300],
+        "primary_l1_module": str(mistake_summary.get("primary_l1_module") or ""),
+        "matched_l2": list(mistake_summary.get("matched_l2") or []),
+        "step_operators": list(mistake_summary.get("step_operators") or []),
+        "thinking_methods": list(mistake_summary.get("thinking_methods") or []),
+        "classic_motifs": list(mistake_summary.get("classic_motifs") or []),
+        "trap_tags": list(mistake_summary.get("trap_tags") or []),
+        "ref_elo": int(mistake_summary.get("ref_elo") or 1500),
+        "ref_tier": str(mistake_summary.get("ref_tier") or ""),
+    }
+    clean_candidates = [
+        {
+            "candidate_id": str(c["candidate_id"]),
+            "proposed_slot": str(c.get("proposed_slot") or ""),
+            "base_elo": int(c.get("base_elo") or 1500),
+            "tier": str(c.get("tier") or ""),
+            "primary_l1_module": str(c.get("primary_l1_module") or ""),
+            "l2_entities": list(c.get("l2_entities") or []),
+            "l3_operators": list(c.get("l3_operators") or []),
+            "thinking_methods": list(c.get("thinking_methods") or []),
+            "trap_tags": list(c.get("trap_tags") or []),
+            "surface_sim": round(float(c.get("surface_sim", 0.0)), 3),
+            "skeleton_sim": round(float(c.get("skeleton_sim", 0.0)), 3),
+            "question_text": str(c.get("question_text") or "")[:450],
+            "abstract_skeleton": str(c.get("abstract_skeleton") or "")[:260],
+        }
+        for c in candidates
+    ]
+    user_payload = {
+        "grade_subject": grade_subject,
+        "mistake": clean_mistake,
+        "candidates": clean_candidates,
+    }
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
 
 
