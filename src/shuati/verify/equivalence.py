@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -958,11 +959,33 @@ async def compare_answer_parts(
                     sa_sym = normalize_symbol_fill(s.canonical or s.answer)
                     dual_equal = bool(pa_sym and pa_sym == sa_sym)
                 elif p.collection_mode == s.collection_mode and p.items and s.items and len(p.items) == len(s.items):
-                    dual_equal = all(
-                        normalize_symbol_fill(_extract_item_info(ia)[1])
-                        == normalize_symbol_fill(_extract_item_info(ib)[1])
-                        for ia, ib in zip(p.items, s.items, strict=True)
-                    )
+                    if p.collection_mode == "ORDERED_TUPLE":
+                        pa_list = [normalize_symbol_fill(_extract_item_info(ia)[1]) for ia in p.items]
+                        sa_list = [normalize_symbol_fill(_extract_item_info(ib)[1]) for ib in s.items]
+                        dual_equal = all(
+                            bool(a) and a == b for a, b in zip(pa_list, sa_list, strict=True)
+                        )
+                    elif p.collection_mode == "UNORDERED_MULTISET":
+                        pa_list = [normalize_symbol_fill(_extract_item_info(ia)[1]) for ia in p.items]
+                        sa_list = [normalize_symbol_fill(_extract_item_info(ib)[1]) for ib in s.items]
+                        dual_equal = all(bool(a) for a in pa_list) and Counter(pa_list) == Counter(sa_list)
+                    elif p.collection_mode == "LABELED_MAP":
+                        map_a = _extract_labeled_map(p.items)
+                        map_b = _extract_labeled_map(s.items)
+                        if (
+                            map_a is not None
+                            and map_b is not None
+                            and set(map_a.keys()) == set(map_b.keys())
+                        ):
+                            dual_equal = all(
+                                (va := normalize_symbol_fill(map_a[k][1])) != ""
+                                and va == normalize_symbol_fill(map_b[k][1])
+                                for k in map_a
+                            )
+                        else:
+                            dual_equal = False
+                    else:
+                        dual_equal = False
                 else:
                     dual_equal = False
                 if not dual_equal:

@@ -19,7 +19,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TextIO
+from typing import Any, Literal, TextIO, cast, overload
 
 from shuati import __version__
 
@@ -83,6 +83,45 @@ def _validate_reveal_mode(raw: Any) -> Literal["quiz", "hint", "full"]:
     return val  # type: ignore[return-value]
 
 
+@overload
+def _parse_bool(
+    raw: Any,
+    *,
+    default: bool,
+    name: str,
+    allow_none: Literal[False] = False,
+) -> bool: ...
+
+
+@overload
+def _parse_bool(
+    raw: Any,
+    *,
+    default: bool | None,
+    name: str,
+    allow_none: Literal[True],
+) -> bool | None: ...
+
+
+def _parse_bool(
+    raw: Any,
+    *,
+    default: bool | None,
+    name: str,
+    allow_none: bool = False,
+) -> bool | None:
+    """严格布尔参数校验：仅接受 None（回退默认值）与真实 bool，拒绝字符串/整型等静默强转。"""
+    if raw is None:
+        if default is None and not allow_none:
+            raise ValueError(f"参数 '{name}' 必须为布尔值，收到 null")
+        return default
+    if isinstance(raw, bool):
+        return raw
+    raise ValueError(
+        f"参数 '{name}' 必须为布尔值（true/false），收到 {type(raw).__name__}: {raw!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Worker 工具（严格零 DB / 零 sqlite3）
 # ---------------------------------------------------------------------------
@@ -123,6 +162,8 @@ def _tool_validate_draft(args: dict[str, Any], cfg: McpServerConfig) -> dict[str
     if verified_final_answers is not None and not isinstance(verified_final_answers, list):
         raise ValueError("verified_final_answers 必须为数组或 null")
 
+    run_sympy = _parse_bool(args.get("run_sympy"), default=True, name="run_sympy")
+
     return validate_draft_payload(
         mode=mode,  # type: ignore[arg-type]
         candidate=candidate,
@@ -130,7 +171,7 @@ def _tool_validate_draft(args: dict[str, Any], cfg: McpServerConfig) -> dict[str
         grade_subject=str(args.get("grade_subject") or "小学奥数"),
         options={str(k): str(v) for k, v in options.items()} if options else None,
         verified_final_answers=verified_final_answers,
-        run_sympy=bool(args.get("run_sympy", True)),
+        run_sympy=run_sympy,
         config_dir=cfg.config_dir,
     )
 
@@ -210,6 +251,8 @@ def _tool_ingest_dry_run(args: dict[str, Any], cfg: McpServerConfig) -> dict[str
         settings = load_settings(cfg.config_dir / "settings.yaml")
         resolved_roots = [Path(r) for r in (settings.ingest.roots or ["题库"])]
     gs = args.get("grade_subject")
+    dedup_near = _parse_bool(args.get("dedup_near"), default=False, name="dedup_near")
+    apply_retire = _parse_bool(args.get("apply_retire"), default=False, name="apply_retire")
     report = run_stage0_ingest(
         db_path=cfg.db_path,
         root_dir=resolved_roots[0] if resolved_roots else Path("题库"),
@@ -217,8 +260,8 @@ def _tool_ingest_dry_run(args: dict[str, Any], cfg: McpServerConfig) -> dict[str
         config_dir=cfg.config_dir,
         assets_dir=cfg.assets_dir,
         grade_subject_override=str(gs) if gs is not None else None,
-        dedup_near=bool(args.get("dedup_near", False)),
-        apply_retire=bool(args.get("apply_retire", False)),
+        dedup_near=dedup_near,
+        apply_retire=apply_retire,
         dry_run=True,
     )
     return report.to_dict()
@@ -227,12 +270,13 @@ def _tool_ingest_dry_run(args: dict[str, Any], cfg: McpServerConfig) -> dict[str
 def _tool_doctor(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
     from shuati.services.compiler_tools import run_doctor
 
-    raw_mock = args.get("mock")
+    check_llm_api = _parse_bool(args.get("check_llm_api"), default=False, name="check_llm_api")
+    use_mock = _parse_bool(args.get("mock"), default=None, name="mock", allow_none=True)
     return run_doctor(
         db_path=cfg.db_path,
         config_dir=cfg.config_dir,
-        check_llm_api=bool(args.get("check_llm_api", False)),
-        use_mock=bool(raw_mock) if raw_mock is not None else None,
+        check_llm_api=check_llm_api,
+        use_mock=use_mock,
     )
 
 
@@ -307,6 +351,11 @@ def _tool_search(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
     from shuati.services import facade
 
     rev_mode = _validate_reveal_mode(args.get("reveal", "quiz"))
+    exclude_solved = _parse_bool(args.get("exclude_solved"), default=False, name="exclude_solved")
+    include_vf = _parse_bool(
+        args.get("include_visual_facts"), default=False, name="include_visual_facts"
+    )
+    use_mock = _parse_bool(args.get("mock"), default=None, name="mock", allow_none=True)
     settings = load_settings(cfg.config_dir / "settings.yaml")
     conn = get_connection(cfg.db_path, readonly=True)
     try:
@@ -325,15 +374,15 @@ def _tool_search(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
             elo_max=int(args["elo_max"]) if args.get("elo_max") is not None else None,
             query=args.get("query"),
             semantic=args.get("semantic"),
-            exclude_solved=bool(args.get("exclude_solved", False)),
+            exclude_solved=exclude_solved,
             learner_id=args.get("learner"),
             reveal=rev_mode,
             hint_level=int(args.get("hint_level", 1)),
-            include_visual_facts=bool(args.get("include_visual_facts", False)),
+            include_visual_facts=include_vf,
             limit=int(args.get("limit", 20)),
             assets_dir=cfg.assets_dir,
             vectors_dir=cfg.vectors_dir,
-            use_mock=args.get("mock"),
+            use_mock=use_mock,
         )
     finally:
         conn.close()
@@ -347,6 +396,10 @@ def _tool_related(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
     if not uid:
         raise ValueError("uid 不能为空")
     rev_mode = _validate_reveal_mode(args.get("reveal", "quiz"))
+    exclude_solved = _parse_bool(args.get("exclude_solved"), default=False, name="exclude_solved")
+    include_vf = _parse_bool(
+        args.get("include_visual_facts"), default=False, name="include_visual_facts"
+    )
     raw_types = args.get("types")
     type_list: list[str] | None = None
     if isinstance(raw_types, list):
@@ -361,11 +414,11 @@ def _tool_related(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
             uid,
             types=type_list,
             direction=str(args.get("direction") or "both"),
-            exclude_solved=bool(args.get("exclude_solved", False)),
+            exclude_solved=exclude_solved,
             learner_id=args.get("learner"),
             reveal=rev_mode,
             hint_level=int(args.get("hint_level", 1)),
-            include_visual_facts=bool(args.get("include_visual_facts", False)),
+            include_visual_facts=include_vf,
             limit=int(args.get("limit", 20)),
             assets_dir=cfg.assets_dir,
         )
@@ -381,6 +434,9 @@ def _tool_detail(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
     if not uid:
         raise ValueError("uid 不能为空")
     rev_mode = _validate_reveal_mode(args.get("reveal", "quiz"))
+    include_vf = _parse_bool(
+        args.get("include_visual_facts"), default=False, name="include_visual_facts"
+    )
     conn = get_connection(cfg.db_path, readonly=True)
     try:
         return facade.get_question_detail(
@@ -389,7 +445,7 @@ def _tool_detail(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
             assets_dir=cfg.assets_dir,
             reveal=rev_mode,
             hint_level=int(args.get("hint_level", 1)),
-            include_visual_facts=bool(args.get("include_visual_facts", False)),
+            include_visual_facts=include_vf,
         )
     finally:
         conn.close()
@@ -407,30 +463,34 @@ def _tool_check(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
     if "answer" not in args or args.get("answer") is None:
         raise ValueError("answer 不能为空")
     answer_input = str(args["answer"])
-    do_log = bool(args.get("log", False))
+    do_log = _parse_bool(args.get("log"), default=False, name="log")
+    use_mock = _parse_bool(args.get("mock"), default=None, name="mock", allow_none=True)
+    hint_level = int(args.get("hint_level", 0))
     settings = load_settings(cfg.config_dir / "settings.yaml")
-    conn = get_connection(cfg.db_path, readonly=not do_log)
-    try:
-        if do_log:
-            init_db(conn, config_dir=cfg.config_dir)
-        return _run_coro_sync(
-            facade.check_answer_async(
+
+    async def _run() -> dict[str, Any]:
+        conn = get_connection(cfg.db_path, readonly=not do_log)
+        try:
+            if do_log:
+                init_db(conn, config_dir=cfg.config_dir)
+            return await facade.check_answer_async(
                 conn,
                 settings,
                 uid,
                 answer_input=answer_input,
                 learner_id=args.get("learner"),
-                hint_level=int(args.get("hint_level", 0)),
+                hint_level=hint_level,
                 log=do_log,
                 request_id=args.get("request_id"),
                 quiz_batch_id=args.get("quiz_batch_id"),
                 judge_override_json=args.get("judge_verdict"),
                 human_dir=cfg.human_dir,
-                use_mock=args.get("mock"),
+                use_mock=use_mock,
             )
-        )
-    finally:
-        conn.close()
+        finally:
+            conn.close()
+
+    return cast(dict[str, Any], _run_coro_sync(_run()))
 
 
 def _tool_compose_quiz(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, Any]:
@@ -441,6 +501,9 @@ def _tool_compose_quiz(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, 
     from shuati.services.reveal import apply_reveal
 
     rev_mode = _validate_reveal_mode(args.get("reveal", "quiz"))
+    include_vf = _parse_bool(
+        args.get("include_visual_facts"), default=False, name="include_visual_facts"
+    )
     settings = load_settings(cfg.config_dir / "settings.yaml")
     conn = get_connection(cfg.db_path)
     try:
@@ -473,7 +536,6 @@ def _tool_compose_quiz(args: dict[str, Any], cfg: McpServerConfig) -> dict[str, 
             ),
             target_elo=int(args["target_elo"]) if args.get("target_elo") is not None else None,
         )
-        include_vf = bool(args.get("include_visual_facts", False))
         hydrated_items: list[dict[str, Any]] = []
         for it in res["items"]:
             raw_d = facade.hydrate_question_dict(
@@ -853,7 +915,7 @@ def dispatch_jsonrpc_message(
     req_id = msg.get("id")
     method = msg.get("method")
     if not isinstance(method, str) or not method:
-        return _jsonrpc_error(req_id, -32600, "Invalid Request: missing method") if has_id else None
+        return _jsonrpc_error(req_id if has_id else None, -32600, "Invalid Request: missing method")
 
     params = msg.get("params")
     if params is None:
@@ -861,9 +923,7 @@ def dispatch_jsonrpc_message(
     if not isinstance(params, dict):
         return _jsonrpc_error(req_id, -32602, "Invalid params: expected object") if has_id else None
 
-    # Notifications (no id) or explicit notifications/*
-    if method == "notifications/initialized" or (not has_id and method.startswith("notifications/")):
-        return None
+    # Pure notifications (no id) receive no JSON-RPC response
     if not has_id:
         return None
 

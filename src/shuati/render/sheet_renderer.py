@@ -22,6 +22,8 @@ from shuati.db import repository
 
 _KATEX_ASSETS_DIR = Path(__file__).resolve().parent / "assets" / "katex"
 _FONT_URL_RE = re.compile(r"url\((?:['\"]?)fonts/([^)'\"]+\.woff2)(?:['\"]?)\)")
+_SAFE_IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ALLOWED_IMAGE_EXTS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
 
 
 def _load_inline_katex_assets() -> tuple[str, str, str]:
@@ -50,14 +52,172 @@ def _load_inline_katex_assets() -> tuple[str, str, str]:
 
 
 def _encode_cas_image(img_name: str, assets_dir: Path, embed_images: bool) -> str:
-    img_path = (assets_dir / img_name).resolve()
-    if not embed_images or not img_path.exists():
-        return img_path.as_uri() if img_path.exists() else html.escape(str(img_path))
-    mime, _ = mimetypes.guess_type(str(img_path))
-    if not mime:
+    """安全加载 assets_dir 内的单段图片文件；拒绝越界、符号链接、目录及非图片扩展名。"""
+    raw_name = (img_name or "").strip()
+    if (
+        not raw_name
+        or raw_name in (".", "..")
+        or "/" in raw_name
+        or "\\" in raw_name
+        or "\x00" in raw_name
+        or not _SAFE_IMAGE_NAME_RE.fullmatch(raw_name)
+    ):
+        return ""
+
+    p_name = Path(raw_name)
+    if (
+        p_name.is_absolute()
+        or p_name.drive
+        or p_name.name != raw_name
+        or p_name.suffix.lower() not in _ALLOWED_IMAGE_EXTS
+    ):
+        return ""
+
+    try:
+        assets_root = assets_dir.resolve()
+        candidate = assets_root / raw_name
+        if candidate.is_symlink():
+            return ""
+        resolved = candidate.resolve()
+        if (
+            resolved.parent != assets_root
+            or not resolved.is_relative_to(assets_root)
+            or not resolved.is_file()
+        ):
+            return ""
+    except OSError:
+        return ""
+
+    if not embed_images:
+        return resolved.as_uri()
+
+    mime, _ = mimetypes.guess_type(str(resolved))
+    if not mime or not mime.startswith("image/"):
         mime = "image/png"
-    b64 = base64.b64encode(img_path.read_bytes()).decode("ascii")
+    try:
+        raw_bytes = resolved.read_bytes()
+    except OSError:
+        return ""
+    b64 = base64.b64encode(raw_bytes).decode("ascii")
     return f"data:{mime};base64,{b64}"
+
+
+def _is_escaped(text: str, pos: int) -> bool:
+    """判断 text[pos] 前是否紧跟奇数个反斜杠。"""
+    bs = 0
+    j = pos - 1
+    while j >= 0 and text[j] == "\\":
+        bs += 1
+        j -= 1
+    return (bs % 2) == 1
+
+
+def _nl2br_preserving_math(text: str) -> str:
+    """HTML 转义并将非数学区换行转为 <br/>，保留 $...$ 与 $$...$$ 内的原始换行。"""
+    norm = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    out: list[str] = []
+    n = len(norm)
+    i = 0
+    plain_start = 0
+
+    while i < n:
+        if norm[i] == "$" and not _is_escaped(norm, i):
+            delim = "$$" if (i + 1 < n and norm[i + 1] == "$") else "$"
+            dlen = len(delim)
+            search_pos = i + dlen
+            close_pos = -1
+            while search_pos < n:
+                idx = norm.find(delim, search_pos)
+                if idx == -1:
+                    break
+                if not _is_escaped(norm, idx):
+                    close_pos = idx
+                    break
+                search_pos = idx + 1
+            if close_pos != -1:
+                if i > plain_start:
+                    out.append(html.escape(norm[plain_start:i]).replace("\n", "<br/>"))
+                span_end = close_pos + dlen
+                out.append(html.escape(norm[i:span_end]))
+                i = span_end
+                plain_start = span_end
+                continue
+            i += dlen
+            continue
+        i += 1
+
+    if plain_start < n:
+        out.append(html.escape(norm[plain_start:]).replace("\n", "<br/>"))
+    return "".join(out)
+
+
+def _extract_item_display_value(item: dict[str, Any]) -> str:
+    """按展示优先级从 AnswerPart.items 的字典元素中提取可读答案值。"""
+    for field in ("answer", "canonical", "choice_label", "sympy_expr", "expr", "value"):
+        raw = item.get(field)
+        if raw is not None and str(raw).strip():
+            return str(raw).strip()
+    return ""
+
+
+def _format_answer_part_display(p: dict[str, Any]) -> str:
+    """按不变量 I4 格式化单个 AnswerPart 展示文本（支持 items 多值与 sympy_expr 回退）。"""
+    val = str(p.get("answer") or "").strip()
+
+    if not val:
+        raw_items = p.get("items")
+        if isinstance(raw_items, list) and raw_items:
+            collection_mode = str(p.get("collection_mode") or "SINGLE").strip().upper()
+            formatted: list[str] = []
+            for it in raw_items:
+                if collection_mode == "LABELED_MAP":
+                    if isinstance(it, dict):
+                        raw_key: Any = None
+                        for k_field in ("key", "label", "name", "entity"):
+                            cand_k = it.get(k_field)
+                            if cand_k is not None and str(cand_k).strip():
+                                raw_key = cand_k
+                                break
+                        if raw_key is not None:
+                            iv = _extract_item_display_value(it)
+                            k_str = str(raw_key).strip()
+                            formatted.append(f"{k_str}={iv}" if iv else k_str)
+                        elif len(it) == 1:
+                            k_only, v_only = next(iter(it.items()))
+                            formatted.append(f"{str(k_only).strip()}={str(v_only).strip()}")
+                        else:
+                            iv = _extract_item_display_value(it)
+                            if iv:
+                                formatted.append(iv)
+                    else:
+                        s_it = str(it).strip()
+                        if s_it:
+                            formatted.append(s_it)
+                else:
+                    if isinstance(it, dict):
+                        iv = _extract_item_display_value(it)
+                        if not iv and len(it) == 1:
+                            k_only, v_only = next(iter(it.items()))
+                            iv = f"{str(k_only).strip()}={str(v_only).strip()}"
+                        if iv:
+                            formatted.append(iv)
+                    else:
+                        s_it = str(it).strip()
+                        if s_it:
+                            formatted.append(s_it)
+            val = ", ".join(formatted)
+
+    if not val:
+        for field in ("choice_label", "canonical", "sympy_expr"):
+            cand = str(p.get(field) or "").strip()
+            if cand:
+                val = cand
+                break
+
+    unit = str(p.get("unit") or "").strip()
+    if unit and val and unit not in val:
+        return f"{val} {unit}"
+    return val
 
 
 def _print_blank_cm(fmt: str, has_images: bool) -> float:
@@ -246,7 +406,7 @@ def render_practice_sheet(
     appendix_html: list[str] = []
 
     for idx, item in enumerate(items, start=1):
-        esc_text = html.escape(item["question_text"]).replace("\n", "<br/>")
+        esc_text = _nl2br_preserving_math(item["question_text"])
         meta_badges = (
             f"<span class='badge'>{html.escape(item['source_id'] or item['question_uid'])}</span>"
             f"<span class='badge tier'>{html.escape(item['tier'])}</span>"
@@ -277,8 +437,12 @@ def render_practice_sheet(
                 src_uri = _encode_cas_image(str(cas_img), img_base, embed_images)
                 cap_txt = captions[i_img - 1] if i_img - 1 < len(captions) else ""
                 cap_label = f"配图 {i_img}" + (f" · {cap_txt}" if cap_txt else "")
+                if src_uri:
+                    img_body = f"<img src='{html.escape(src_uri, quote=True)}' alt='{html.escape(cap_label)}' />"
+                else:
+                    img_body = "<div class='fig-missing'>（配图缺失或路径不可用）</div>"
                 figs.append(
-                    f"<figure class='fig-box'><img src='{src_uri}' alt='{html.escape(cap_label)}' />"
+                    f"<figure class='fig-box'>{img_body}"
                     f"<figcaption>{html.escape(cap_label)}</figcaption></figure>"
                 )
             imgs_html = f"<div class='fig-row'>{''.join(figs)}</div>"
@@ -298,10 +462,10 @@ def render_practice_sheet(
         ans_rows = []
         ans_compact = []
         for p in item["final_answers"]:
+            if not isinstance(p, dict):
+                continue
             lbl = str(p.get("label") or "主问")
-            val = str(p.get("answer") or p.get("choice_label") or p.get("canonical") or "")
-            unit = str(p.get("unit") or "")
-            full_val = f"{val} {unit}".strip()
+            full_val = _format_answer_part_display(p)
             ans_rows.append(f"<li><strong>{html.escape(lbl)}：</strong>{html.escape(full_val)}</li>")
             ans_compact.append(f"{lbl}: {full_val}")
         ans_html = f"<ul>{''.join(ans_rows) or '<li>暂无答案</li>'}</ul>"
@@ -326,7 +490,7 @@ def render_practice_sheet(
                 + "</li>"
                 for st in br["steps"]
             )
-            sol_md = html.escape(br["solution_markdown"]).replace("\n", "<br/>")
+            sol_md = _nl2br_preserving_math(br["solution_markdown"])
             tab_panels.append(
                 f"<div id='q{idx}-b{b_idx}' class='tab-panel {active_cls}'>"
                 f"<div class='method-sum'><em>思路概述：</em>{html.escape(br['method_summary'])}</div>"
@@ -451,6 +615,7 @@ def render_practice_sheet(
   .fig-box {{ margin: 0; border: 1px solid var(--border); padding: 6px; border-radius: 6px; background: #fff; text-align: center; }}
   .fig-box img {{ max-width: 340px; max-height: 240px; display: block; margin: 0 auto; }}
   .fig-box figcaption {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
+  .fig-missing {{ font-size: 12px; color: var(--muted); padding: 12px 16px; background: var(--soft); border-radius: 4px; }}
   .screen-details details {{
     margin-top: 8px; border: 1px solid var(--border); border-radius: 6px;
     padding: 8px 12px; background: var(--soft);
@@ -468,6 +633,7 @@ def render_practice_sheet(
   .print-scratchpad {{ display: none; border: 1px dashed #94a3b8; border-radius: 6px; margin-top: 10px; position: relative; }}
   .scratch-label {{ position: absolute; top: 6px; left: 10px; font-size: 11px; color: #94a3b8; }}
   .print-answer-appendix {{
+    display: none;
     margin-top: 24px; background: var(--card); border: 1px solid var(--border);
     border-radius: 10px; padding: 16px 20px;
   }}
@@ -479,7 +645,7 @@ def render_practice_sheet(
     .no-print {{ display: none !important; }}
     .q-card {{ border: 1px solid #cbd5e1; box-shadow: none; margin-bottom: 12px; padding: 12px; }}
     .print-scratchpad {{ display: block; }}
-    .print-answer-appendix {{ page-break-before: always; border: 0; padding: 0; }}
+    .print-answer-appendix {{ display: block; page-break-before: always; border: 0; padding: 0; }}
   }}
 </style>
 </head>

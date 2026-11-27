@@ -44,7 +44,9 @@ def _compute_actual_score(
     elo_cfg: LearnerEloConfig,
 ) -> float:
     """按 DESIGN.md §5.1-1 计算实际得分 A ∈ [0, 1]。"""
-    has_hint = hint_level_used is not None and int(hint_level_used) >= 1
+    has_hint = (outcome == "SOLVED_WITH_HINT") or (
+        hint_level_used is not None and int(hint_level_used) >= 1
+    )
     hint_lvl = max(1, int(hint_level_used or 1))
     hint_mult = max(0.2, float(elo_cfg.hint_score) - 0.1 * (hint_lvl - 1))
 

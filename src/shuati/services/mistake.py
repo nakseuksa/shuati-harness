@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import sqlite3
 import time
 import uuid
@@ -50,7 +52,7 @@ from shuati.verify.answer_parts import (
     normalize_symbol_fill,
 )
 from shuati.verify.equivalence import compare_answer_parts
-from shuati.verify.sympy_sandbox import run_verify_script
+from shuati.verify.sympy_sandbox import run_verify_script, split_top_level
 
 DIAGNOSE_PROMPT_VERSION = "diag_v3"
 
@@ -75,11 +77,28 @@ def _resolve_diagnose_prompt_version(
 _DRAFT_TTL_SECONDS = 7 * 86400
 
 
+def _atomic_write_text(target: Path, content: str) -> None:
+    """通过同目录 pid+uuid 临时文件 + os.replace 原子落盘，失败时清理临时文件。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.parent / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def _prune_expired_drafts(drafts_dir: Path) -> None:
     if not drafts_dir.exists():
         return
     now = time.time()
-    for p in drafts_dir.glob("*.json"):
+    for p in drafts_dir.glob("drf_*.json"):
         try:
             if now - p.stat().st_mtime > _DRAFT_TTL_SECONDS:
                 p.unlink(missing_ok=True)
@@ -88,15 +107,31 @@ def _prune_expired_drafts(drafts_dir: Path) -> None:
 
 
 def _build_taxonomy_enum_summary(conn: sqlite3.Connection, grade_subject: str) -> str:
-    rows = conn.execute(
-        """
-        SELECT DISTINCT l1_module, l2_entity
-        FROM knowledge_nodes
-        WHERE grade_subject = ? AND redirect_to_id IS NULL
-        ORDER BY l1_module, l2_entity;
-        """,
+    gs_row = conn.execute(
+        "SELECT taxonomy_version FROM grade_subjects WHERE grade_subject = ?;",
         (grade_subject,),
-    ).fetchall()
+    ).fetchone()
+    tax_ver = str(gs_row["taxonomy_version"] or "").strip() if gs_row else ""
+    if tax_ver:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT l1_module, l2_entity
+            FROM knowledge_nodes
+            WHERE grade_subject = ? AND taxonomy_version = ? AND redirect_to_id IS NULL
+            ORDER BY l1_module, l2_entity;
+            """,
+            (grade_subject, tax_ver),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT l1_module, l2_entity
+            FROM knowledge_nodes
+            WHERE grade_subject = ? AND redirect_to_id IS NULL
+            ORDER BY l1_module, l2_entity;
+            """,
+            (grade_subject,),
+        ).fetchall()
     if not rows:
         return "（当前学段暂无已初始化标准 L1/L2 词表，请使用合理学科模块名）"
     grouped: dict[str, list[str]] = {}
@@ -105,92 +140,279 @@ def _build_taxonomy_enum_summary(conn: sqlite3.Connection, grade_subject: str) -
     return "\n".join(f"- {l1}: {', '.join(l2s)}" for l1, l2s in grouped.items())
 
 
+def _has_wrapping_delimiters(text: str, left: str, right: str) -> bool:
+    if len(text) < 2 or text[0] != left or text[-1] != right:
+        return False
+    depth = 0
+    for idx, ch in enumerate(text):
+        if ch == left:
+            depth += 1
+        elif ch == right:
+            depth -= 1
+            if depth == 0 and idx < len(text) - 1:
+                return False
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _split_collection_tokens(val: str, *, allow_unwrap_parens: bool) -> list[str]:
+    inner = val.strip()
+    if _has_wrapping_delimiters(inner, "{", "}"):
+        inner = inner[1:-1].strip()
+    elif allow_unwrap_parens and _has_wrapping_delimiters(inner, "(", ")"):
+        inner = inner[1:-1].strip()
+    tokens = split_top_level(inner.replace("，", ",").replace("、", ","), ",")
+    return tokens or [val.strip()]
+
+
+_LABELED_EQ_RE = re.compile(r"^\s*([^=＝<>＞＜!！+\-*/×÷:：]+?)\s*[=＝]\s*(.+)$")
+
+
+def _split_labeled_map_token(
+    tok: str,
+    *,
+    answer_type: str,
+    ref_label_set: set[str],
+    require_known_key_for_eq: bool = False,
+) -> tuple[str | None, str]:
+    """解析 LABELED_MAP 单项：优先 `：`/`:`（排除键侧含 `=`/`＝` 并保 RATIO 数值比值守卫），再谨慎按 `=` 拆分。"""
+    if "：" in tok:
+        k_cand, v_cand = tok.split("：", 1)
+        k_clean = k_cand.strip()
+        if k_clean and "=" not in k_clean and "＝" not in k_clean:
+            return k_clean, v_cand.strip()
+    if ":" in tok:
+        k_cand, v_cand = tok.split(":", 1)
+        k_clean = k_cand.strip()
+        if k_clean and "=" not in k_clean and "＝" not in k_clean:
+            if answer_type != "RATIO" or (
+                re.sub(r"\s+", "", k_clean) in ref_label_set
+                or not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", k_clean)
+            ):
+                return k_clean, v_cand.strip()
+    m_eq = _LABELED_EQ_RE.match(tok)
+    if m_eq:
+        k_clean = m_eq.group(1).strip()
+        v_clean = m_eq.group(2).strip()
+        if k_clean and v_clean:
+            norm_k = re.sub(r"\s+", "", k_clean)
+            must_match_ref = require_known_key_for_eq or (
+                bool(ref_label_set) and answer_type in ("EXPRESSION", "SET_OR_INTERVAL")
+            )
+            if not must_match_ref or norm_k in ref_label_set:
+                return k_clean, v_clean
+    return None, tok.strip()
+
+
+def _extract_ref_map_schema(ref: AnswerPart) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for it in ref.items or []:
+        if isinstance(it, dict):
+            rk = it.get("label") or it.get("key") or it.get("name") or it.get("entity")
+            rtype = str(it.get("item_type") or it.get("answer_type") or "NUMERIC").upper()
+            if rk is not None and str(rk).strip():
+                entries.append((str(rk).strip(), rtype))
+            elif len(it) == 1:
+                k0 = next(iter(it.keys()))
+                entries.append((str(k0).strip(), rtype))
+    return entries
+
+
+def _build_known_part(ref: AnswerPart, val: str) -> AnswerPart:
+    val = val.strip()
+    if ref.answer_type == "CHOICE":
+        norm_ch = normalize_choice_label(val) or "INVALID"
+        if ref.collection_mode == "SINGLE":
+            return AnswerPart(
+                label=ref.label,
+                answer_type="CHOICE",
+                verify_mode="EXACT",
+                collection_mode="SINGLE",
+                answer=val,
+                choice_label=norm_ch,
+            )
+        tokens = _split_collection_tokens(val, allow_unwrap_parens=True)
+        return AnswerPart(
+            label=ref.label,
+            answer_type="CHOICE",
+            verify_mode="EXACT",
+            collection_mode=ref.collection_mode,
+            answer=val,
+            choice_label=norm_ch,
+            items=[{"choice_label": normalize_choice_label(t) or "INVALID"} for t in tokens],
+        )
+
+    if ref.answer_type == "SYMBOL_FILL":
+        if ref.collection_mode == "SINGLE":
+            return AnswerPart(
+                label=ref.label,
+                answer_type="SYMBOL_FILL",
+                verify_mode="EXACT",
+                collection_mode="SINGLE",
+                answer=val,
+                canonical=normalize_symbol_fill(val) or "INVALID",
+            )
+        if ref.collection_mode == "LABELED_MAP":
+            ref_entries = _extract_ref_map_schema(ref)
+            ref_labels = [lbl for lbl, _ in ref_entries]
+            ref_label_set = {re.sub(r"\s+", "", lbl) for lbl in ref_labels}
+            raw_tokens = _split_collection_tokens(val, allow_unwrap_parens=True)
+            map_items: list[dict[str, str]] = []
+            for idx, tok in enumerate(raw_tokens):
+                key_str, val_str = _split_labeled_map_token(
+                    tok,
+                    answer_type=ref.answer_type,
+                    ref_label_set=ref_label_set,
+                    require_known_key_for_eq=True,
+                )
+                if not key_str:
+                    key_str = ref_labels[idx] if idx < len(ref_labels) else f"k{idx + 1}"
+                map_items.append(
+                    {
+                        "label": key_str,
+                        "item_type": "SYMBOL_FILL",
+                        "canonical": normalize_symbol_fill(val_str) or "INVALID",
+                    }
+                )
+            norm_ref_keys = [re.sub(r"\s+", "", rk) for rk in ref_labels]
+            if (
+                ref_labels
+                and len(ref_labels) == len(map_items)
+                and len(set(norm_ref_keys)) == len(ref_labels)
+            ):
+                by_key = {re.sub(r"\s+", "", it["label"]): it for it in map_items}
+                if len(by_key) == len(map_items) and set(by_key.keys()) == set(norm_ref_keys):
+                    map_items = [by_key[rk] for rk in norm_ref_keys]
+            return AnswerPart(
+                label=ref.label,
+                answer_type="SYMBOL_FILL",
+                verify_mode="EXACT",
+                collection_mode="LABELED_MAP",
+                answer=val,
+                items=map_items,
+            )
+        tokens = _split_collection_tokens(val, allow_unwrap_parens=True)
+        return AnswerPart(
+            label=ref.label,
+            answer_type="SYMBOL_FILL",
+            verify_mode="EXACT",
+            collection_mode=ref.collection_mode,
+            answer=val,
+            items=[
+                {"item_type": "SYMBOL_FILL", "canonical": normalize_symbol_fill(t) or "INVALID"}
+                for t in tokens
+            ],
+        )
+
+    if ref.verify_mode == "SYMBOLIC":
+        if ref.collection_mode == "SINGLE":
+            return AnswerPart(
+                label=ref.label,
+                answer_type=ref.answer_type,
+                verify_mode="SYMBOLIC",
+                collection_mode="SINGLE",
+                answer=val,
+                sympy_expr=val,
+            )
+        if ref.collection_mode == "LABELED_MAP":
+            ref_entries = _extract_ref_map_schema(ref)
+            ref_label_set = {re.sub(r"\s+", "", lbl) for lbl, _ in ref_entries}
+            ref_type_by_label = {re.sub(r"\s+", "", lbl): t for lbl, t in ref_entries}
+            raw_tokens = _split_collection_tokens(val, allow_unwrap_parens=False)
+            sym_map_items: list[dict[str, str]] = []
+            for idx, tok in enumerate(raw_tokens):
+                key_str, val_str = _split_labeled_map_token(
+                    tok,
+                    answer_type=ref.answer_type,
+                    ref_label_set=ref_label_set,
+                    require_known_key_for_eq=False,
+                )
+                if not key_str:
+                    key_str = ref_entries[idx][0] if idx < len(ref_entries) else f"k{idx + 1}"
+                norm_k = re.sub(r"\s+", "", key_str)
+                expected_itype = ref_type_by_label.get(
+                    norm_k, ref_entries[idx][1] if idx < len(ref_entries) else "NUMERIC"
+                )
+                if expected_itype == "SYMBOL_FILL":
+                    sym_map_items.append(
+                        {
+                            "label": key_str,
+                            "item_type": "SYMBOL_FILL",
+                            "canonical": normalize_symbol_fill(val_str) or "INVALID",
+                        }
+                    )
+                else:
+                    sym_map_items.append({"label": key_str, "expr": val_str})
+            return AnswerPart(
+                label=ref.label,
+                answer_type=ref.answer_type,
+                verify_mode="SYMBOLIC",
+                collection_mode="LABELED_MAP",
+                answer=val,
+                items=sym_map_items,
+            )
+
+        allow_parens = ref.answer_type != "SET_OR_INTERVAL"
+        tokens = _split_collection_tokens(val, allow_unwrap_parens=allow_parens)
+        seq_items: list[dict[str, str]] = []
+        ref_items_list = ref.items or []
+        for idx, tok in enumerate(tokens):
+            ref_it = ref_items_list[idx] if ref.collection_mode == "ORDERED_TUPLE" and idx < len(ref_items_list) else None
+            if (
+                isinstance(ref_it, dict)
+                and str(ref_it.get("item_type") or ref_it.get("answer_type") or "").upper() == "SYMBOL_FILL"
+            ):
+                seq_items.append(
+                    {
+                        "item_type": "SYMBOL_FILL",
+                        "canonical": normalize_symbol_fill(tok) or "INVALID",
+                    }
+                )
+            else:
+                seq_items.append({"expr": tok})
+        return AnswerPart(
+            label=ref.label,
+            answer_type=ref.answer_type,
+            verify_mode="SYMBOLIC",
+            collection_mode=ref.collection_mode,
+            answer=val,
+            items=seq_items,
+        )
+
+    if ref.collection_mode == "SINGLE":
+        return AnswerPart(
+            label=ref.label,
+            answer_type=ref.answer_type,
+            verify_mode="QUALITATIVE",
+            collection_mode="SINGLE",
+            answer=val,
+        )
+    tokens = _split_collection_tokens(val, allow_unwrap_parens=True)
+    return AnswerPart(
+        label=ref.label,
+        answer_type=ref.answer_type,
+        verify_mode="QUALITATIVE",
+        collection_mode=ref.collection_mode,
+        answer=val,
+        items=[{"answer": t} for t in tokens],
+    )
+
+
 def _parse_single_known_answer(raw_answer: str, reference_parts: list[AnswerPart]) -> list[AnswerPart]:
     """将命令行 --answer 解析为与 reference_parts 对齐的 AnswerPart 列表用于一致性比对。"""
-    ref0 = reference_parts[0]
+    if not reference_parts:
+        return []
     cleaned = raw_answer.strip()
     if len(reference_parts) == 1:
-        if ref0.answer_type == "CHOICE":
-            return [
-                AnswerPart(
-                    label=ref0.label,
-                    answer_type="CHOICE",
-                    verify_mode="EXACT",
-                    collection_mode="SINGLE",
-                    answer=cleaned,
-                    choice_label=normalize_choice_label(cleaned) or cleaned.upper(),
-                )
-            ]
-        if ref0.answer_type == "SYMBOL_FILL" and ref0.collection_mode == "SINGLE":
-            return [
-                AnswerPart(
-                    label=ref0.label,
-                    answer_type="SYMBOL_FILL",
-                    verify_mode="EXACT",
-                    collection_mode="SINGLE",
-                    answer=cleaned,
-                    canonical=normalize_symbol_fill(cleaned) or cleaned,
-                )
-            ]
-        if ref0.verify_mode == "SYMBOLIC" and ref0.collection_mode == "SINGLE":
-            return [
-                AnswerPart(
-                    label=ref0.label,
-                    answer_type=ref0.answer_type,
-                    verify_mode="SYMBOLIC",
-                    collection_mode="SINGLE",
-                    answer=cleaned,
-                    sympy_expr=cleaned,
-                )
-            ]
-        if ref0.verify_mode == "QUALITATIVE":
-            return [
-                AnswerPart(
-                    label=ref0.label,
-                    answer_type=ref0.answer_type,
-                    verify_mode="QUALITATIVE",
-                    collection_mode="SINGLE",
-                    answer=cleaned,
-                )
-            ]
+        return normalize_answer_parts([_build_known_part(reference_parts[0], cleaned)])
 
-    # 多小问分号切分兜底
-    segs = [s.strip() for s in cleaned.replace("；", ";").split(";") if s.strip()]
+    # 多小问顶层分号切分
+    segs = [s.strip() for s in split_top_level(cleaned.replace("；", ";"), ";") if s.strip()]
     out: list[AnswerPart] = []
     for idx, ref in enumerate(reference_parts):
         val = segs[idx] if idx < len(segs) else cleaned
-        if ref.answer_type == "CHOICE":
-            out.append(
-                AnswerPart(
-                    label=ref.label,
-                    answer_type="CHOICE",
-                    verify_mode="EXACT",
-                    collection_mode="SINGLE",
-                    answer=val,
-                    choice_label=normalize_choice_label(val) or val.upper(),
-                )
-            )
-        elif ref.verify_mode == "SYMBOLIC" and ref.collection_mode == "SINGLE":
-            out.append(
-                AnswerPart(
-                    label=ref.label,
-                    answer_type=ref.answer_type,
-                    verify_mode="SYMBOLIC",
-                    collection_mode="SINGLE",
-                    answer=val,
-                    sympy_expr=val,
-                )
-            )
-        else:
-            out.append(
-                AnswerPart(
-                    label=ref.label,
-                    answer_type="TEXT",
-                    verify_mode="QUALITATIVE",
-                    collection_mode="SINGLE",
-                    answer=val,
-                )
-            )
+        out.append(_build_known_part(ref, val))
     return normalize_answer_parts(out)
 
 
@@ -355,7 +577,7 @@ async def diagnose_external_mistake_async(
     preprocessed_imgs: list[Path] = []
     for idx, raw_img in enumerate(image_paths or [], start=1):
         src_p = Path(raw_img)
-        if not src_p.exists():
+        if not src_p.is_file():
             raise PreconditionError(f"找不到传入的错题图片: {src_p}")
         raw_img_paths.append(src_p)
         dst_p = draft_img_dir / f"{draft_id}_{idx}.jpg"
@@ -505,11 +727,22 @@ async def diagnose_external_mistake_async(
             f"""
             SELECT DISTINCT qc.question_uid
             FROM question_concepts qc
-            JOIN concepts c ON c.concept_id = qc.concept_id
-            WHERE qc.kind = 'TRAP' AND c.name IN ({t_ph})
-            LIMIT 10;
+            JOIN questions q ON q.question_uid = qc.question_uid
+            JOIN concepts member ON member.concept_id = qc.concept_id
+            JOIN concepts master
+              ON (member.concept_id = master.concept_id OR member.redirect_to_id = master.concept_id)
+            WHERE qc.kind = 'TRAP'
+              AND master.kind = 'TRAP'
+              AND master.redirect_to_id IS NULL
+              AND master.name IN ({t_ph})
+              AND q.grade_subject = ?
+              AND q.is_retired = 0
+              AND q.eff_is_excluded = 0
+              AND q.eff_is_servable = 1
+            ORDER BY qc.question_uid ASC
+            LIMIT 20;
             """,
-            diag_traps,
+            [*diag_traps, grade_subject],
         ).fetchall()
         for tr in trap_rows:
             tuid = str(tr["question_uid"])
@@ -550,7 +783,7 @@ async def diagnose_external_mistake_async(
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     draft_file = draft_root / f"{draft_id}.json"
-    draft_file.write_text(json.dumps(draft_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(draft_file, json.dumps(draft_payload, ensure_ascii=False, indent=2))
 
     return {
         "draft_id": draft_id,
@@ -625,6 +858,14 @@ async def ingest_external_mistake_async(
         raise PreconditionError(f"PRECONDITION_FAILED: 学段学科 '{eff_gs}' 未注册")
     scope_slug = str(gs_row["slug"])
 
+    if log_wrong:
+        lr_row = conn.execute(
+            "SELECT 1 FROM learners WHERE learner_id = ?;",
+            (learner_id,),
+        ).fetchone()
+        if not lr_row:
+            raise PreconditionError(f"PRECONDITION_FAILED: 学习者 '{learner_id}' 不存在，无法记录错题日志")
+
     eff_known_answer = known_answer if known_answer is not None else (draft_data.get("known_answer") if draft_data else None)
     eff_mock = settings.pipeline.use_mock_llm if use_mock is None else bool(use_mock)
     gw_settings = settings.model_copy(deep=True)
@@ -663,9 +904,21 @@ async def ingest_external_mistake_async(
         raw_imgs = [Path(p) for p in draft_data.get("preprocessed_images", [])]
 
     plain_fp = compute_plain_fingerprint(eff_text, len(raw_imgs))
-    raw_content_hash = hashlib.sha256(
-        json.dumps({"text": eff_text, "gs": eff_gs, "imgs": [str(p.name) for p in raw_imgs]}, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    draft_chash = str(draft_data.get("content_hash") or "").strip() if draft_data else ""
+    draft_unmodified = (
+        draft_data is not None
+        and bool(draft_chash)
+        and not image_paths
+        and eff_gs == draft_data.get("grade_subject")
+        and eff_text == normalize_text(str(draft_data.get("question_text") or "")).normalized_text
+    )
+    if draft_unmodified:
+        raw_content_hash = draft_chash
+    else:
+        for src_p in raw_imgs:
+            if not src_p.is_file():
+                raise PreconditionError(f"错题图片不存在: {src_p}")
+        raw_content_hash = compute_diagnose_content_hash(eff_gs, eff_text, raw_imgs)
     uid = f"{scope_slug}:ext:{raw_content_hash[:12]}"
     source_id = f"ext_{raw_content_hash[:10]}"
 
@@ -688,7 +941,7 @@ async def ingest_external_mistake_async(
         tmp_img_dir = Path(drafts_dir) / "cas_prep"
         tmp_img_dir.mkdir(parents=True, exist_ok=True)
         for idx, src_p in enumerate(raw_imgs, start=1):
-            if not src_p.exists():
+            if not src_p.is_file():
                 raise PreconditionError(f"错题图片不存在: {src_p}")
             prepped = prepare_external_image(src_p, tmp_img_dir / f"{uid.replace(':', '_')}_{idx}.jpg", max_px=settings.pipeline.max_external_image_px)
             cas_names.append(archive_image(prepped, assets_dir))
@@ -708,7 +961,12 @@ async def ingest_external_mistake_async(
             cas_images=cas_names,
             has_images=has_images,
         )
-        s1_msgs = build_stage1_messages(s1_inp, role="SECONDARY", assets_dir=Path(assets_dir))
+        s1_msgs = build_stage1_messages(
+            s1_inp,
+            role="SECONDARY",
+            assets_dir=Path(assets_dir),
+            config_dir=Path(config_dir),
+        )
         gw = LLMGateway(gw_settings, conn=None)
         try:
             sec_res = await gw.call_structured(
@@ -737,7 +995,14 @@ async def ingest_external_mistake_async(
     gw_judge = LLMGateway(gw_settings, conn=conn)
 
     async def _qual_judge(lbl: str, a_str: str, b_str: str) -> QualitativeJudgeOutput:
-        jmsgs = build_qualitative_judge_messages(lbl, a_str, b_str, question_text=eff_text)
+        jmsgs = build_qualitative_judge_messages(
+            lbl,
+            a_str,
+            b_str,
+            question_text=eff_text,
+            grade_subject=eff_gs,
+            config_dir=Path(config_dir),
+        )
         jr = await gw_judge.call_structured(
             slot="judge_llm",
             stage="STAGE1_JUDGE",
@@ -799,20 +1064,68 @@ async def ingest_external_mistake_async(
         diag.difficulty.L_computation_load.score,
     )
 
+    cas_images_str = json.dumps(cas_names, ensure_ascii=False)
+    logged_id: int | None = None
+    woven_edges = 0
+    weave_warning: str | None = None
+    is_servable = False
+
     with CompileLock(lock_path):
         with conn:
+            # 0. 加载当前活跃词表（若有），提前归一题级主/次 L1 模块
+            tax_status = str(gs_row["taxonomy_status"] or "NONE")
+            tax_ver = str(gs_row["taxonomy_version"] or "draft-0")
+            tax_spec = None
+            tax_lookup = None
+            try:
+                _, tax_ver, tax_spec, tax_lookup = _load_active_taxonomy(conn, eff_gs)
+            except PreconditionError:
+                tax_spec = None
+                tax_lookup = None
+
+            norm_primary_l1 = diag.primary_l1_module.strip()
+            norm_secondary_l1s: list[str] = []
+            if tax_lookup is not None and tax_spec is not None:
+                resolved_prim = tax_lookup.resolve_l1(norm_primary_l1)
+                if resolved_prim is None:
+                    for st in diag.steps:
+                        pair_hit = tax_lookup.resolve_l2(st.raw_l1.strip(), st.raw_l2.strip())
+                        if pair_hit is not None:
+                            resolved_prim = pair_hit[0]
+                            break
+                        st_l1_hit = tax_lookup.resolve_l1(st.raw_l1.strip())
+                        if st_l1_hit is not None:
+                            resolved_prim = st_l1_hit
+                            break
+                if resolved_prim is None and tax_spec.modules:
+                    resolved_prim = tax_spec.modules[0].name
+                if resolved_prim:
+                    norm_primary_l1 = resolved_prim
+                for s_l1 in diag.secondary_l1_modules:
+                    r_sec = tax_lookup.resolve_l1(s_l1.strip())
+                    if r_sec and r_sec != norm_primary_l1 and r_sec not in norm_secondary_l1s:
+                        norm_secondary_l1s.append(r_sec)
+            else:
+                for s_l1 in diag.secondary_l1_modules:
+                    s_clean = s_l1.strip()
+                    if s_clean and s_clean != norm_primary_l1 and s_clean not in norm_secondary_l1s:
+                        norm_secondary_l1s.append(s_clean)
+
             # 1. 写入 raw_questions & questions
             conn.execute(
                 """
                 INSERT INTO raw_questions(
                     question_uid, grade_subject, source_type, source_collection, source_id,
-                    raw_question, raw_images_json, content_hash, plain_fingerprint
+                    raw_question, raw_images_json, cas_images_json, content_hash, plain_fingerprint, updated_at
                 )
-                VALUES (?, ?, 'EXTERNAL_MISTAKE', 'external_mistake', ?, ?, ?, ?, ?)
+                VALUES (?, ?, 'EXTERNAL_MISTAKE', 'external_mistake', ?, ?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(question_uid) DO UPDATE SET
                     raw_question = excluded.raw_question,
                     raw_images_json = excluded.raw_images_json,
-                    content_hash = excluded.content_hash;
+                    cas_images_json = excluded.cas_images_json,
+                    content_hash = excluded.content_hash,
+                    plain_fingerprint = excluded.plain_fingerprint,
+                    updated_at = datetime('now');
                 """,
                 (
                     uid,
@@ -820,6 +1133,7 @@ async def ingest_external_mistake_async(
                     source_id,
                     eff_text,
                     json.dumps([str(p) for p in raw_imgs], ensure_ascii=False),
+                    cas_images_str,
                     raw_content_hash,
                     plain_fp,
                 ),
@@ -863,14 +1177,14 @@ async def ingest_external_mistake_async(
                     ",".join(review_reasons),
                     answers_json,
                     diag.abstract_skeleton.strip(),
-                    diag.primary_l1_module.strip(),
-                    json.dumps(diag.secondary_l1_modules, ensure_ascii=False),
+                    norm_primary_l1,
+                    json.dumps(norm_secondary_l1s, ensure_ascii=False),
                     diag.difficulty.C_concept_count.score,
                     diag.difficulty.S_chain_length.score,
                     diag.difficulty.T_trickiness.score,
                     diag.difficulty.L_computation_load.score,
                     int(has_images),
-                    json.dumps(cas_names, ensure_ascii=False),
+                    cas_images_str,
                     json.dumps(sorted({s.raw_l1 for s in diag.steps}), ensure_ascii=False),
                     json.dumps(sorted({s.raw_l2 for s in diag.steps}), ensure_ascii=False),
                     json.dumps(diag.thinking_methods, ensure_ascii=False),
@@ -942,19 +1256,10 @@ async def ingest_external_mistake_async(
             )
 
             # 3. Stage 3c/3d 挂载：对齐当前词表（若有）并写入步骤 + 概念
-            tax_status = str(gs_row["taxonomy_status"] or "NONE")
-            tax_ver = str(gs_row["taxonomy_version"] or "draft-0")
-            tax_spec = None
-            tax_lookup = None
-            try:
-                _, tax_ver, tax_spec, tax_lookup = _load_active_taxonomy(conn, eff_gs)
-            except PreconditionError:
-                tax_spec = None
-                tax_lookup = None
             node_ids_mounted: list[str] = []
             conn.execute("DELETE FROM question_steps WHERE question_uid = ? AND branch_id = 'branch_1';", (uid,))
             for st in diag.steps:
-                l1_m = st.raw_l1.strip() or diag.primary_l1_module.strip()
+                l1_m = st.raw_l1.strip() or norm_primary_l1
                 l2_m = st.raw_l2.strip()
                 if tax_lookup is not None and tax_spec is not None:
                     resolved_pair = tax_lookup.resolve_l2(l1_m, l2_m)
@@ -964,6 +1269,8 @@ async def ingest_external_mistake_async(
                         resolved_l1 = tax_lookup.resolve_l1(l1_m)
                         if resolved_l1:
                             l1_m = resolved_l1
+                        elif norm_primary_l1:
+                            l1_m = norm_primary_l1
                         elif tax_spec.modules:
                             l1_m = tax_spec.modules[0].name
                         l2_fb = _best_fallback_l2(tax_lookup, l1_m, l2_m)
@@ -1067,32 +1374,65 @@ async def ingest_external_mistake_async(
                         (uid, fname, fval, bnd, raw_content_hash),
                     )
 
-            # 5. compile_state 全阶段写入 + effective.recompute + FTS5 刷新
-            for stg in ("S1", "S2", "S3C", "S3D", "S4"):
-                stg_status = "OK" if (stg != "S4" or ver_status == "VERIFIED_CONSENSUS" or human_verified_by_known) else "BLOCKED"
+            # 5. compile_state(S1..S3D) + effective.recompute + S4 初始状态 + 不可服务清理旧机器边 + FTS5 + 可选 --log-wrong
+            for stg in ("S1", "S2", "S3C", "S3D"):
                 conn.execute(
                     """
                     INSERT INTO compile_state(question_uid, stage, status, input_hash, updated_at)
-                    VALUES (?, ?, ?, ?, datetime('now'))
+                    VALUES (?, ?, 'OK', ?, datetime('now'))
                     ON CONFLICT(question_uid, stage) DO UPDATE SET
                         status = excluded.status, input_hash = excluded.input_hash, updated_at = datetime('now');
                     """,
-                    (uid, stg, stg_status, raw_content_hash),
+                    (uid, stg, raw_content_hash),
                 )
 
             effective.recompute(conn, uid)
+            q_check = conn.execute(
+                "SELECT eff_is_servable, eff_question_text, eff_visual_facts, eff_abstract_skeleton FROM questions WHERE question_uid = ?;",
+                (uid,),
+            ).fetchone()
+            is_servable = bool(q_check and q_check["eff_is_servable"] == 1)
+            s4_init_status = "PENDING" if is_servable else "BLOCKED"
+            conn.execute(
+                """
+                INSERT INTO compile_state(question_uid, stage, status, input_hash, updated_at)
+                VALUES (?, 'S4', ?, ?, datetime('now'))
+                ON CONFLICT(question_uid, stage) DO UPDATE SET
+                    status = excluded.status, input_hash = excluded.input_hash, updated_at = datetime('now');
+                """,
+                (uid, s4_init_status, raw_content_hash),
+            )
+            if not is_servable:
+                conn.execute(
+                    """
+                    DELETE FROM question_relations
+                    WHERE (source_question_uid = ? OR target_question_uid = ?)
+                      AND confidence_source != 'HUMAN_VERIFIED';
+                    """,
+                    (uid, uid),
+                )
+
             repository.refresh_search_index(conn, uid)
 
-        # 6. 若可出题，追加 .npz 向量与 weave_single_question 增量建五边
-        q_check = conn.execute(
-            "SELECT eff_is_servable, eff_question_text, eff_visual_facts, eff_abstract_skeleton FROM questions WHERE question_uid = ?;",
-            (uid,),
-        ).fetchone()
-        is_servable = bool(q_check and q_check["eff_is_servable"] == 1)
-        woven_edges = 0
-        weave_warning: str | None = None
+            if log_wrong:
+                cur = conn.execute(
+                    """
+                    INSERT INTO practice_log(learner_id, question_uid, outcome, score_ratio, user_note)
+                    VALUES (?, ?, 'WRONG', 0.0, ?);
+                    """,
+                    (learner_id, uid, user_note),
+                )
+                logged_id = int(cur.lastrowid or 0)
 
-        if is_servable:
+        # 主事务提交后立即双写人工资产镜像，防止后续向量/织网异常导致 DB 与镜像漂移
+        human_mirror.export_snapshot(
+            conn,
+            human_dir=human_dir,
+            include_practice_log=settings.human_mirror.include_practice_log,
+        )
+
+        # 6. 若可出题，追加 .npz 向量与 weave_single_question 增量建五边，成功后再将 S4 置为 OK
+        if is_servable and q_check is not None:
             store = VectorStore(vectors_dir)
             emb_client = EmbeddingClient(settings, conn=None, use_mock=eff_mock)
             try:
@@ -1108,28 +1448,18 @@ async def ingest_external_mistake_async(
                     w_res = weave_single_question(
                         conn, store, question_uid=uid, topology_cfg=settings.topology
                     )
+                    conn.execute(
+                        """
+                        INSERT INTO compile_state(question_uid, stage, status, input_hash, updated_at)
+                        VALUES (?, 'S4', 'OK', ?, datetime('now'))
+                        ON CONFLICT(question_uid, stage) DO UPDATE SET
+                            status = excluded.status, input_hash = excluded.input_hash, updated_at = datetime('now');
+                        """,
+                        (uid, raw_content_hash),
+                    )
                 woven_edges = int(w_res.get("written", 0))
             else:
                 weave_warning = "向量分位表尚未初始化，已暂缓五边增量织网（可执行 reindex --quantiles 后重织）"
-
-        # 7. 可选 --log-wrong
-        logged_id: int | None = None
-        if log_wrong:
-            cur = conn.execute(
-                """
-                INSERT INTO practice_log(learner_id, question_uid, outcome, score_ratio, user_note)
-                VALUES (?, ?, 'WRONG', 0.0, ?);
-                """,
-                (learner_id, uid, user_note),
-            )
-            logged_id = int(cur.lastrowid or 0)
-            conn.commit()
-
-        human_mirror.export_snapshot(
-            conn,
-            human_dir=human_dir,
-            include_practice_log=settings.human_mirror.include_practice_log,
-        )
 
     return {
         "dry_run": False,

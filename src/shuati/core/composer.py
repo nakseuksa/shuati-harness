@@ -10,7 +10,7 @@ from typing import Any
 
 from shuati.config import ComposerConfig, LearnerEloConfig
 from shuati.core.knowledge_graph import expand_canonical_concept_ids, expand_canonical_node_ids
-from shuati.core.profiler import compute_learner_profile
+from shuati.core.profiler import _parse_utc_dt, compute_learner_profile
 from shuati.db.connection import PreconditionError
 
 
@@ -63,13 +63,15 @@ def _resolve_filter_l1(
         if len(l1s) == 1:
             return l1s[0], warnings
     if l3:
+        l3_clean = l3.strip()
         rows = conn.execute(
             """
-            SELECT DISTINCT l1_module
-            FROM knowledge_nodes
-            WHERE grade_subject = ? AND (node_id = ? OR l3_operator = ?) AND redirect_to_id IS NULL;
+            SELECT DISTINCT COALESCE(m.l1_module, kn.l1_module) AS l1_module
+            FROM knowledge_nodes kn
+            LEFT JOIN knowledge_nodes m ON m.node_id = kn.redirect_to_id
+            WHERE kn.grade_subject = ? AND (kn.node_id = ? OR kn.l3_operator = ?);
             """,
-            (grade_subject, l3.strip(), l3.strip()),
+            (grade_subject, l3_clean, l3_clean),
         ).fetchall()
         l1s = sorted({str(r["l1_module"]) for r in rows if r["l1_module"]})
         if len(l1s) == 1:
@@ -84,23 +86,29 @@ def _match_node_uids(
     l2: str | None,
     l3: str | None,
 ) -> set[str] | None:
-    """按 l2 / l3（含并查集展开）返回匹配的 question_uid 集合。"""
-    if not l2 and not l3:
+    """按 l2 / l3（含并查集展开）返回匹配的 question_uid 集合（严格只读 eff_node_ids_json）。"""
+    l2_clean = (l2 or "").strip()
+    l3_clean = (l3 or "").strip()
+    if not l2_clean and not l3_clean:
         return None
 
-    target_node_ids: set[str] = set()
-    if l2:
+    target_node_ids: set[str] | None = None
+    if l2_clean:
         rows = conn.execute(
             """
             SELECT node_id FROM knowledge_nodes
             WHERE grade_subject = ? AND l2_entity = ?;
             """,
-            (grade_subject, l2.strip()),
+            (grade_subject, l2_clean),
         ).fetchall()
+        matched_l2: set[str] = set()
         for r in rows:
-            target_node_ids.update(expand_canonical_node_ids(conn, str(r["node_id"])))
-    if l3:
-        l3_clean = l3.strip()
+            matched_l2.update(expand_canonical_node_ids(conn, str(r["node_id"])))
+        if not matched_l2:
+            return set()
+        target_node_ids = matched_l2
+
+    if l3_clean:
         rows = conn.execute(
             """
             SELECT node_id FROM knowledge_nodes
@@ -111,7 +119,7 @@ def _match_node_uids(
         matched_l3: set[str] = set()
         for r in rows:
             matched_l3.update(expand_canonical_node_ids(conn, str(r["node_id"])))
-        if target_node_ids:
+        if target_node_ids is not None:
             target_node_ids &= matched_l3
         else:
             target_node_ids = matched_l3
@@ -136,13 +144,6 @@ def _match_node_uids(
         if nids & target_node_ids:
             matched_uids.add(str(qr["question_uid"]))
 
-    ph = ",".join("?" for _ in target_node_ids)
-    st_rows = conn.execute(
-        f"SELECT DISTINCT question_uid FROM question_steps WHERE m_knowledge_node_id IN ({ph});",
-        sorted(target_node_ids),
-    ).fetchall()
-    for sr in st_rows:
-        matched_uids.add(str(sr["question_uid"]))
     return matched_uids
 
 
@@ -212,7 +213,12 @@ def compose_quiz(
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """生成自适应梯度专题小卷并落盘 quiz_batches。"""
-    now_dt = now_utc or datetime.now(UTC)
+    if now_utc is None:
+        now_dt = datetime.now(UTC)
+    elif now_utc.tzinfo is None:
+        now_dt = now_utc.replace(tzinfo=UTC)
+    else:
+        now_dt = now_utc.astimezone(UTC)
     warnings: list[str] = []
 
     q_solid, q_stretch, q_trap = _parse_mix(mix, count)
@@ -334,51 +340,71 @@ def compose_quiz(
         (learner_id,),
     ).fetchall()
 
-    cutoff_solved = (now_dt - timedelta(days=solved_days)).strftime("%Y-%m-%d %H:%M:%S")
-    cutoff_clone = (now_dt - timedelta(days=clone_days)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_solved_dt = now_dt - timedelta(days=solved_days)
+    cutoff_clone_dt = now_dt - timedelta(days=clone_days)
 
     solved_recent_uids: set[str] = set()
     practiced_clone_window_uids: set[str] = set()
     latest_outcome_by_q: dict[str, str] = {}
-    practiced_times_by_q: dict[str, list[str]] = {}
+    practiced_times_by_q: dict[str, list[datetime]] = {}
     logged_batch_pairs: set[tuple[str, str]] = set()
 
-    for pr in pl_rows:
-        if int(pr["log_id"]) in voided_ids:
-            continue
+    # 按 UTC 时间点与 log_id 升序重放，消除 ISO-8601 与 SQLite 空格时间混合时的字典序误差
+    ordered_pl_rows = sorted(
+        (pr for pr in pl_rows if int(pr["log_id"]) not in voided_ids),
+        key=lambda pr: (
+            _parse_utc_dt(str(pr["practiced_at"]))
+            if pr["practiced_at"]
+            else datetime.min.replace(tzinfo=UTC),
+            int(pr["log_id"]),
+        ),
+    )
+
+    for pr in ordered_pl_rows:
         uid = str(pr["question_uid"])
-        ts = str(pr["practiced_at"] or "")
+        raw_ts = pr["practiced_at"]
+        ts_dt = _parse_utc_dt(str(raw_ts)) if raw_ts else None
         out = str(pr["outcome"])
         if out != "SKIPPED":
             latest_outcome_by_q[uid] = out
-        practiced_times_by_q.setdefault(uid, []).append(ts)
+        if ts_dt is not None:
+            practiced_times_by_q.setdefault(uid, []).append(ts_dt)
         if pr["quiz_batch_id"]:
             logged_batch_pairs.add((str(pr["quiz_batch_id"]), uid))
-        if out == "SOLVED_SOLO" and ts >= cutoff_solved:
-            solved_recent_uids.add(uid)
-        if ts >= cutoff_clone:
-            practiced_clone_window_uids.add(uid)
+        if ts_dt is not None:
+            if out == "SOLVED_SOLO" and ts_dt >= cutoff_solved_dt:
+                solved_recent_uids.add(uid)
+            if ts_dt >= cutoff_clone_dt:
+                practiced_clone_window_uids.add(uid)
 
     unredeemed_uids = {
         uid for uid, out in latest_outcome_by_q.items() if out in ("WRONG", "SOLVED_WITH_HINT")
     }
 
-    # 最近 N 份 quiz_batches 未作答避重
+    # 最近 N 份非空 quiz_batches 未作答避重（按 UTC 时间点降序排列，避免 ASCII 'T' > ' ' 与时区偏移倒置）
     unlogged_batch_uids: set[str] = set()
     if recent_batches_n > 0:
-        qb_rows = conn.execute(
+        all_qb_rows = conn.execute(
             """
             SELECT quiz_batch_id, items_json, created_at
             FROM quiz_batches
-            WHERE learner_id = ? AND grade_subject = ?
-            ORDER BY created_at DESC, quiz_batch_id DESC
-            LIMIT ?;
+            WHERE learner_id = ? AND grade_subject = ? AND items_json != '[]' AND TRIM(items_json) != '[]';
             """,
-            (learner_id, grade_subject, recent_batches_n),
+            (learner_id, grade_subject),
         ).fetchall()
+        qb_rows = sorted(
+            all_qb_rows,
+            key=lambda qb: (
+                _parse_utc_dt(str(qb["created_at"]))
+                if qb["created_at"]
+                else datetime.min.replace(tzinfo=UTC),
+                str(qb["quiz_batch_id"]),
+            ),
+            reverse=True,
+        )[:recent_batches_n]
         for qb in qb_rows:
             qbid = str(qb["quiz_batch_id"])
-            qb_ts = str(qb["created_at"] or "")
+            qb_dt = _parse_utc_dt(str(qb["created_at"])) if qb["created_at"] else None
             try:
                 items = json.loads(qb["items_json"] or "[]")
             except ValueError:
@@ -387,8 +413,8 @@ def compose_quiz(
                 quid = str(it.get("question_uid") or "") if isinstance(it, dict) else ""
                 if not quid:
                     continue
-                is_logged = (qbid, quid) in logged_batch_pairs or any(
-                    t >= qb_ts for t in practiced_times_by_q.get(quid, ())
+                is_logged = (qbid, quid) in logged_batch_pairs or (
+                    qb_dt is not None and any(t >= qb_dt for t in practiced_times_by_q.get(quid, ()))
                 )
                 if not is_logged:
                     unlogged_batch_uids.add(quid)
@@ -423,24 +449,30 @@ def compose_quiz(
             shared_trap_neighbors.setdefault(u, []).append(v)
             shared_trap_neighbors.setdefault(v, []).append(u)
 
+    cooldown_orig_uids: set[str] = set(practiced_clone_window_uids)
     cooldown_clone_uids: set[str] = set()
     for seed_uid in practiced_clone_window_uids | unlogged_batch_uids:
         cooldown_clone_uids.update(clone_neighbors.get(seed_uid, ()))
+    cooldown_all_uids = cooldown_orig_uids | cooldown_clone_uids
 
-    # 题目 TRAP 概念映射（排除 TRAP_ARITHMETIC_SLIP）
+    # 题目 TRAP 概念映射（按单跳并查集归集主概念，排除 TRAP_ARITHMETIC_SLIP）
     pool_ph = ",".join("?" for _ in pool)
     traps_by_q: dict[str, set[str]] = {}
     for tr_row in conn.execute(
         f"""
-        SELECT qc.question_uid, qc.concept_id, c.name
+        SELECT
+            qc.question_uid,
+            COALESCE(c.redirect_to_id, qc.concept_id) AS canon_id,
+            COALESCE(m.name, c.name) AS canon_name
         FROM question_concepts qc
         JOIN concepts c ON c.concept_id = qc.concept_id
+        LEFT JOIN concepts m ON m.concept_id = c.redirect_to_id
         WHERE qc.question_uid IN ({pool_ph}) AND qc.kind = 'TRAP';
         """,
         sorted(pool.keys()),
     ).fetchall():
-        cid = str(tr_row["concept_id"])
-        cname = str(tr_row["name"])
+        cid = str(tr_row["canon_id"])
+        cname = str(tr_row["canon_name"])
         if cname == "TRAP_ARITHMETIC_SLIP" or cid == "TRAP:TRAP_ARITHMETIC_SLIP":
             continue
         traps_by_q.setdefault(str(tr_row["question_uid"]), set()).add(cid)
@@ -458,13 +490,21 @@ def compose_quiz(
     intra_clone_blocked: set[str] = set()
     slot_counts = {"SOLID": 0, "STRETCH": 0, "TRAP": 0}
 
-    def _can_pick(uid: str, *, allow_cooldown_clone: bool = False) -> bool:
+    def _can_pick(
+        uid: str,
+        *,
+        allow_cooldown_clone: bool = False,
+        allow_cooldown_orig: bool = False,
+    ) -> bool:
         if uid not in pool or uid in selected_uids or uid in hard_excluded_uids:
             return False
         if uid in intra_clone_blocked:
             return False
-        if not allow_cooldown_clone and uid in cooldown_clone_uids:
-            return False
+        if not allow_cooldown_clone:
+            if uid in cooldown_clone_uids:
+                return False
+            if not allow_cooldown_orig and uid in cooldown_orig_uids:
+                return False
         return True
 
     def _pick(
@@ -474,14 +514,20 @@ def compose_quiz(
         reason_public: str,
         reason_full: str,
         used_cooldown_fallback: bool = False,
-    ) -> None:
+    ) -> bool:
+        # 防御性同卷硬互斥与防重入守卫
+        if uid not in pool or uid in selected_uids or uid in hard_excluded_uids or uid in intra_clone_blocked:
+            return False
         q = pool[uid]
         selected_uids.add(uid)
         intra_clone_blocked.add(uid)
         intra_clone_blocked.update(clone_neighbors.get(uid, ()))
         slot_counts[slot] += 1
         if used_cooldown_fallback:
-            warnings.append(f"候选不足：已启用 CLONE 冷却邻域题 {q['source_id']} 兜底")
+            if uid in cooldown_clone_uids:
+                warnings.append(f"候选不足：已启用 CLONE 冷却邻域题 {q['source_id']} 兜底")
+            else:
+                warnings.append(f"候选不足：已启用 14 天冷却窗内原题 {q['source_id']} 兜底")
         selected_items.append(
             {
                 "question_uid": uid,
@@ -494,6 +540,7 @@ def compose_quiz(
                 "reason_full": reason_full,
             }
         )
+        return True
 
     def _select_by_window(
         *,
@@ -518,14 +565,14 @@ def compose_quiz(
                 if not _can_pick(uid, allow_cooldown_clone=allow_cooldown_clone):
                     continue
                 if lo <= pool[uid]["elo"] <= hi:
-                    _pick(
+                    if _pick(
                         uid,
                         slot=slot,
                         reason_public=reason_public,
                         reason_full=reason_full_tpl.format(elo=pool[uid]["elo"], tier=pool[uid]["tier"]),
-                        used_cooldown_fallback=allow_cooldown_clone and uid in cooldown_clone_uids,
-                    )
-                    picked_now += 1
+                        used_cooldown_fallback=allow_cooldown_clone and uid in cooldown_all_uids,
+                    ):
+                        picked_now += 1
         if picked_now >= limit:
             return picked_now
 
@@ -539,31 +586,34 @@ def compose_quiz(
         for uid in cands:
             if picked_now >= limit:
                 break
-            _pick(
+            if not _can_pick(uid, allow_cooldown_clone=allow_cooldown_clone):
+                continue
+            if _pick(
                 uid,
                 slot=slot,
                 reason_public=reason_public,
                 reason_full=reason_full_tpl.format(elo=pool[uid]["elo"], tier=pool[uid]["tier"]),
-                used_cooldown_fallback=allow_cooldown_clone and uid in cooldown_clone_uids,
-            )
-            picked_now += 1
+                used_cooldown_fallback=allow_cooldown_clone and uid in cooldown_all_uids,
+            ):
+                picked_now += 1
         return picked_now
 
     # ---- A. 稳固槽 ----
     if q_solid > 0:
-        # 最多 1 题错题/提示题回练
+        # 最多 1 题错题/提示题回练（仅此单题槽显式放行 14 天冷却窗内的未转正原题）
         retry_cands = sorted(
-            [u for u in unredeemed_uids if _can_pick(u)],
+            [u for u in unredeemed_uids if _can_pick(u, allow_cooldown_orig=True)],
             key=lambda u: (abs(pool[u]["elo"] - base_r), u),
         )
         if retry_cands:
             ru = retry_cands[0]
-            _pick(
-                ru,
-                slot="SOLID",
-                reason_public="稳固错题回练 · 巩固近期薄弱项",
-                reason_full=f"历史 WRONG/SOLVED_WITH_HINT 未转正回练（Elo={pool[ru]['elo']}，R={int(round(base_r))}）",
-            )
+            if _can_pick(ru, allow_cooldown_orig=True):
+                _pick(
+                    ru,
+                    slot="SOLID",
+                    reason_public="稳固错题回练 · 巩固近期薄弱项",
+                    reason_full=f"历史 WRONG/SOLVED_WITH_HINT 未转正回练（Elo={pool[ru]['elo']}，R={int(round(base_r))}）",
+                )
         rem_solid = q_solid - slot_counts["SOLID"]
         solid_lo = max(1120.0, base_r - 150.0)
         solid_hi = max(1200.0, base_r + 50.0)
@@ -604,29 +654,54 @@ def compose_quiz(
         rem_stretch = q_stretch - slot_counts["STRETCH"]
         if rem_stretch > 0:
             if base_r >= 1800.0:
-                # v2.6 高水位护栏：{L4-B(5), L5-1(6)} 合并按 Elo 选拔 -> L5-2(7) -> L5-3(8) -> 模块最高分兜底
-                high_band = [
-                    u for u in pool
-                    if _can_pick(u) and pool[u]["tier_rank"] in (5, 6)
-                ]
-                high_band.sort(key=lambda u: (abs(pool[u]["elo"] - (base_r + 100.0)), pool[u]["elo"], u))
-                for u in high_band:
-                    if slot_counts["STRETCH"] >= q_stretch:
-                        break
-                    _pick(
-                        u,
-                        slot="STRETCH",
-                        reason_public="拔高冲刺 · 进阶巧思与压轴挑战",
-                        reason_full=f"高水位合并池 {{L4-B, L5-1}} 选拔（{pool[u]['tier']}，Elo={pool[u]['elo']}）",
+                # v2.6/v2.7 高水位护栏：
+                # 1800 <= R < 2350 时先在 {L4-B(5), L5-1(6)} 合并池选拔不倒挂题（elo >= base_r - 50，优先 >= base_r）；
+                # R >= 2350 或合并池无合适推进题时直接向 L5-2(7) / L5-3(8) 按接近 base_r + 100 爬坡；
+                # 仍不足再回退当前专题未刷最高 Elo 题（自然优先剩余较高分 {L4-B, L5-1}）。
+                if base_r < 2350.0:
+                    high_band = [
+                        u
+                        for u in pool
+                        if _can_pick(u)
+                        and pool[u]["tier_rank"] in (5, 6)
+                        and pool[u]["elo"] >= base_r - 50.0
+                    ]
+                    high_band.sort(
+                        key=lambda u: (
+                            0 if pool[u]["elo"] >= base_r else 1,
+                            abs(pool[u]["elo"] - (base_r + 100.0)),
+                            pool[u]["elo"],
+                            u,
+                        )
                     )
-                for climb_rank in (7, 8):
-                    if slot_counts["STRETCH"] >= q_stretch:
-                        break
-                    climb_cands = [u for u in pool if _can_pick(u) and pool[u]["tier_rank"] == climb_rank]
-                    climb_cands.sort(key=lambda u: (pool[u]["elo"], u))
+                    for u in high_band:
+                        if slot_counts["STRETCH"] >= q_stretch:
+                            break
+                        if not _can_pick(u):
+                            continue
+                        _pick(
+                            u,
+                            slot="STRETCH",
+                            reason_public="拔高冲刺 · 进阶巧思与压轴挑战",
+                            reason_full=f"高水位合并池 {{L4-B, L5-1}} 选拔（{pool[u]['tier']}，Elo={pool[u]['elo']}）",
+                        )
+                if slot_counts["STRETCH"] < q_stretch:
+                    climb_cands = [
+                        u for u in pool if _can_pick(u) and pool[u]["tier_rank"] in (7, 8)
+                    ]
+                    climb_cands.sort(
+                        key=lambda u: (
+                            0 if pool[u]["elo"] >= base_r else 1,
+                            abs(pool[u]["elo"] - (base_r + 100.0)),
+                            pool[u]["elo"],
+                            u,
+                        )
+                    )
                     for u in climb_cands:
                         if slot_counts["STRETCH"] >= q_stretch:
                             break
+                        if not _can_pick(u):
+                            continue
                         _pick(
                             u,
                             slot="STRETCH",
@@ -639,6 +714,8 @@ def compose_quiz(
                     for u in fallback_high:
                         if slot_counts["STRETCH"] >= q_stretch:
                             break
+                        if not _can_pick(u):
+                            continue
                         _pick(
                             u,
                             slot="STRETCH",
@@ -678,6 +755,8 @@ def compose_quiz(
             for u in radar_cands:
                 if slot_counts["TRAP"] >= q_trap:
                     break
+                if not _can_pick(u):
+                    continue
                 matched_t = sorted(traps_by_q.get(u, set()) & weak_set)
                 _pick(
                     u,
@@ -719,6 +798,8 @@ def compose_quiz(
             for u in non_slip_cands:
                 if slot_counts["TRAP"] >= q_trap:
                     break
+                if not _can_pick(u):
+                    continue
                 _pick(
                     u,
                     slot="TRAP",
@@ -769,34 +850,36 @@ def compose_quiz(
             f"专题可出题候选不足：目标 {count} 题，实际组出 {len(selected_items)} 题（已跳过近期已做及未登记在途卷题目）"
         )
 
-    quiz_batch_id = f"qz_{now_dt.strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}"
-    params_snapshot = {
-        "grade_subject": grade_subject,
-        "l1": l1,
-        "l2": l2,
-        "l3": l3,
-        "motif": motif,
-        "method": method,
-        "trap": trap,
-        "count": count,
-        "mix": mix,
-        "base_elo_used": round(base_r, 1),
-        "rating_source": rating_source,
-    }
-    conn.execute(
-        """
-        INSERT INTO quiz_batches(quiz_batch_id, learner_id, grade_subject, params_json, items_json)
-        VALUES (?, ?, ?, ?, ?);
-        """,
-        (
-            quiz_batch_id,
-            learner_id,
-            grade_subject,
-            json.dumps(params_snapshot, ensure_ascii=False),
-            json.dumps(selected_items, ensure_ascii=False),
-        ),
-    )
-    conn.commit()
+    quiz_batch_id: str | None = None
+    if selected_items:
+        quiz_batch_id = f"qz_{now_dt.strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}"
+        params_snapshot = {
+            "grade_subject": grade_subject,
+            "l1": l1,
+            "l2": l2,
+            "l3": l3,
+            "motif": motif,
+            "method": method,
+            "trap": trap,
+            "count": count,
+            "mix": mix,
+            "base_elo_used": round(base_r, 1),
+            "rating_source": rating_source,
+        }
+        conn.execute(
+            """
+            INSERT INTO quiz_batches(quiz_batch_id, learner_id, grade_subject, params_json, items_json)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                quiz_batch_id,
+                learner_id,
+                grade_subject,
+                json.dumps(params_snapshot, ensure_ascii=False),
+                json.dumps(selected_items, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
 
     return {
         "quiz_batch_id": quiz_batch_id,

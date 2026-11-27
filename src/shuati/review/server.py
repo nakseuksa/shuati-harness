@@ -81,7 +81,29 @@ def _make_handler(app_ctx: ReviewServerApp) -> type[BaseHTTPRequestHandler]:
                 raise ValueError("JSON body must be an object")
             return data
 
+        def _validate_host(self) -> bool:
+            """校验 Host 白名单，防御 DNS rebinding 读写攻击。"""
+            server_port = cast(ThreadingHTTPServer, self.server).server_address[1]
+            allowed_hosts = {
+                f"127.0.0.1:{server_port}",
+                f"localhost:{server_port}",
+                "127.0.0.1",
+                "localhost",
+            }
+            host_hdr = (self.headers.get("Host") or "").strip().lower()
+            if host_hdr and host_hdr not in allowed_hosts:
+                self._send_error_json(
+                    HTTPStatus.FORBIDDEN,
+                    "FORBIDDEN_HOST",
+                    f"非法 Host 头: {host_hdr}",
+                )
+                return False
+            return True
+
         def do_GET(self) -> None:  # noqa: N802
+            if not self._validate_host():
+                return
+
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
 
@@ -122,16 +144,20 @@ def _make_handler(app_ctx: ReviewServerApp) -> type[BaseHTTPRequestHandler]:
                 return
 
             if path == "/api/queue":
-                qs = urllib.parse.parse_qs(parsed.query)
-                gs_param = qs.get("grade_subject", [None])[0]
-                grade_subject = gs_param if gs_param is not None else app_ctx.default_grade_subject
-                audit_param = qs.get("audit", [None])[0]
-                if audit_param is None:
+                qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+                gs_vals = qs.get("grade_subject")
+                if gs_vals is not None:
+                    grade_subject: str | None = gs_vals[0].strip() or None
+                else:
+                    grade_subject = app_ctx.default_grade_subject
+                audit_vals = qs.get("audit")
+                if not audit_vals or not audit_vals[0]:
                     audit_mode = app_ctx.default_audit_mode
                 else:
-                    audit_mode = audit_param.lower() in ("1", "true", "yes")
+                    audit_mode = audit_vals[0].lower() in ("1", "true", "yes")
+                limit_vals = qs.get("limit")
                 try:
-                    limit = int(qs.get("limit", ["100"])[0])
+                    limit = int(limit_vals[0]) if limit_vals and limit_vals[0] else 100
                 except ValueError:
                     limit = 100
 
@@ -181,7 +207,7 @@ def _make_handler(app_ctx: ReviewServerApp) -> type[BaseHTTPRequestHandler]:
             self._send_error_json(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Unknown route: {path}")
 
         def _validate_post_security(self) -> bool:
-            """校验 POST 写请求的 Content-Type、Host 与 Origin，防御 CSRF 与 DNS rebinding。"""
+            """校验 POST 写请求的 Content-Type 与 Origin，防御 CSRF 攻击。"""
             raw_ct = self.headers.get("Content-Type", "")
             media_type = raw_ct.split(";", 1)[0].strip().lower()
             if media_type != "application/json":
@@ -193,22 +219,13 @@ def _make_handler(app_ctx: ReviewServerApp) -> type[BaseHTTPRequestHandler]:
                 return False
 
             server_port = cast(ThreadingHTTPServer, self.server).server_address[1]
-            allowed_hosts = {f"127.0.0.1:{server_port}", f"localhost:{server_port}"}
-
-            host_hdr = (self.headers.get("Host") or "").strip().lower()
-            if host_hdr and host_hdr not in allowed_hosts:
-                self._send_error_json(
-                    HTTPStatus.FORBIDDEN,
-                    "FORBIDDEN_HOST",
-                    f"非法 Host 头: {host_hdr}",
-                )
-                return False
+            allowed_origins = {f"127.0.0.1:{server_port}", f"localhost:{server_port}"}
 
             origin_hdr = (self.headers.get("Origin") or "").strip()
             if origin_hdr:
                 parsed_origin = urllib.parse.urlparse(origin_hdr)
                 origin_host = (parsed_origin.netloc or "").lower()
-                if parsed_origin.scheme != "http" or origin_host not in allowed_hosts:
+                if parsed_origin.scheme != "http" or origin_host not in allowed_origins:
                     self._send_error_json(
                         HTTPStatus.FORBIDDEN,
                         "FORBIDDEN_ORIGIN",
@@ -219,6 +236,8 @@ def _make_handler(app_ctx: ReviewServerApp) -> type[BaseHTTPRequestHandler]:
             return True
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._validate_host():
+                return
             if not self._validate_post_security():
                 return
 
@@ -362,18 +381,10 @@ def create_review_server(
     if use_mock is not None:
         settings.pipeline.use_mock_llm = use_mock
 
-    if assets_dir is None:
-        if db_p.name == "shuati.db" and db_p.parent.name == "data":
-            resolved_assets = Path("data/assets/images")
-        else:
-            resolved_assets = db_p.parent / "assets" / "images"
-    else:
-        resolved_assets = Path(assets_dir)
-
-    if db_p.name == "shuati.db" and db_p.parent.name == "data":
-        resolved_llm_raw = Path("data/llm_raw")
-    else:
-        resolved_llm_raw = db_p.parent / "llm_raw"
+    resolved_assets = (
+        Path(assets_dir) if assets_dir is not None else db_p.parent / "assets" / "images"
+    )
+    resolved_llm_raw = db_p.parent / "llm_raw"
 
     resolved_human = Path(human_dir) if human_dir is not None else Path(settings.human_mirror.dir)
 

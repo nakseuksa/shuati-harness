@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from shuati.config import Settings
 from shuati.core import effective, profiler, refresh
@@ -71,8 +72,11 @@ _ALLOWED_OVERRIDE_FIELDS: set[str] = {
     "is_excluded",
 }
 
+_PAREN_EXPR_GUARD = (
+    r"(?!\s*(?:[*/^×÷·]|\\(?:times|cdot|div)\b)\s*\S|\s+[+\-]\s+\S|[+\-]\s*\S|[(（])"
+)
 _PREFIX_LABEL_RE = re.compile(
-    r"^\s*(主问|\(\d+\)|（\d+）|[①-⑳]|\d+[).、]|第\s*\(?\d+\)?\s*问|问\s*\(?\d+\)?)\s*[:：]?\s*(.*)$"
+    rf"^\s*(主问|\(\d+\){_PAREN_EXPR_GUARD}|（\d+）{_PAREN_EXPR_GUARD}|[①-⑳]|\d+\){_PAREN_EXPR_GUARD}|\d+\.(?!\d)(?=\s|[:：]|[^\d.])|\d+、|第\s*\(?\d+\)?\s*问|问\s*\(?\d+\)?)\s*[:：]?\s*(.*)$"
 )
 
 
@@ -249,19 +253,22 @@ def hydrate_question_dict(
     traps: list[str] = []
     for cr in conn.execute(
         """
-        SELECT qc.kind, c.name
+        SELECT qc.kind, COALESCE(m.name, c.name) AS canon_name
         FROM question_concepts qc
         JOIN concepts c ON c.concept_id = qc.concept_id
-        WHERE qc.question_uid = ?;
+        LEFT JOIN concepts m ON m.concept_id = c.redirect_to_id
+        WHERE qc.question_uid = ?
+        ORDER BY qc.kind ASC, canon_name ASC;
         """,
         (question_uid,),
     ).fetchall():
-        if cr["kind"] == "METHOD":
-            methods.append(str(cr["name"]))
-        elif cr["kind"] == "MOTIF":
-            motifs.append(str(cr["name"]))
-        elif cr["kind"] == "TRAP":
-            traps.append(str(cr["name"]))
+        cname = str(cr["canon_name"])
+        if cr["kind"] == "METHOD" and cname not in methods:
+            methods.append(cname)
+        elif cr["kind"] == "MOTIF" and cname not in motifs:
+            motifs.append(cname)
+        elif cr["kind"] == "TRAP" and cname not in traps:
+            traps.append(cname)
 
     cas_images = _safe_json(q_row["cas_images_json"], [])
     return {
@@ -343,7 +350,20 @@ def browse_taxonomy(
         params,
     ).fetchall()
 
-    # 统计可出题挂载题量
+    # 预加载本学段单跳并查集归集映射：node_id -> COALESCE(redirect_to_id, node_id)
+    node_canon_map: dict[str, str] = {
+        str(r["node_id"]): str(r["canon_id"])
+        for r in conn.execute(
+            """
+            SELECT node_id, COALESCE(redirect_to_id, node_id) AS canon_id
+            FROM knowledge_nodes
+            WHERE grade_subject = ?;
+            """,
+            (grade_subject,),
+        ).fetchall()
+    }
+
+    # 统计可出题挂载题量（单题内按归集后主节点去重）
     q_counts_l1: dict[str, int] = {}
     q_counts_l3: dict[str, int] = {}
     for qr in conn.execute(
@@ -357,8 +377,13 @@ def browse_taxonomy(
         pl1 = str(qr["eff_primary_l1_module"] or "")
         if pl1:
             q_counts_l1[pl1] = q_counts_l1.get(pl1, 0) + 1
-        for nid in _safe_json(qr["eff_node_ids_json"], []):
-            q_counts_l3[str(nid)] = q_counts_l3.get(str(nid), 0) + 1
+        seen_canon_nids: set[str] = set()
+        for raw_nid in _safe_json(qr["eff_node_ids_json"], []):
+            nid_str = str(raw_nid)
+            canon_nid = node_canon_map.get(nid_str, nid_str)
+            if canon_nid not in seen_canon_nids:
+                seen_canon_nids.add(canon_nid)
+                q_counts_l3[canon_nid] = q_counts_l3.get(canon_nid, 0) + 1
 
     # 可选叠加学习者水位与薄弱节点热力
     profile_data: dict[str, Any] | None = None
@@ -539,12 +564,6 @@ def search_questions(
                 nids = set(_safe_json(r["eff_node_ids_json"], []))
                 if nids & target_nids:
                     node_matched.add(str(r["question_uid"]))
-            ph = ",".join("?" for _ in target_nids)
-            for sr in conn.execute(
-                f"SELECT DISTINCT question_uid FROM question_steps WHERE m_knowledge_node_id IN ({ph});",
-                sorted(target_nids),
-            ).fetchall():
-                node_matched.add(str(sr["question_uid"]))
             cand_uids = [u for u in cand_uids if u in node_matched]
 
     # 3. 概念过滤（MOTIF / METHOD / TRAP）
@@ -587,36 +606,64 @@ def search_questions(
         }
         cand_uids = [u for u in cand_uids if u not in solved_set]
 
-    # 5. 语义向量重排（--semantic）
+    # 5. 语义向量重排（--semantic，按剩余候选实际学段分组查询后归并排序）
     sim_by_uid: dict[str, float] = {}
     if semantic and semantic.strip() and cand_uids:
-        eff_gs = grade_subject or str(rows[0]["grade_subject"])
-        gs_row = conn.execute("SELECT slug FROM grade_subjects WHERE grade_subject = ?;", (eff_gs,)).fetchone()
-        if gs_row:
+        uid_to_gs = {str(r["question_uid"]): str(r["grade_subject"]) for r in rows}
+        gs_to_uids: dict[str, set[str]] = {}
+        if grade_subject:
+            gs_to_uids[grade_subject] = set(cand_uids)
+        else:
+            for u in cand_uids:
+                gs_name = uid_to_gs.get(u, "")
+                if gs_name:
+                    gs_to_uids.setdefault(gs_name, set()).add(u)
+
+        store = VectorStore(vectors_dir)
+        available_scopes: list[tuple[str, str, set[str]]] = []
+        missing_scopes: list[str] = []
+        for gs_name, scope_uids in gs_to_uids.items():
+            gs_row = conn.execute(
+                "SELECT slug FROM grade_subjects WHERE grade_subject = ?;",
+                (gs_name,),
+            ).fetchone()
+            if not gs_row:
+                continue
             slug = str(gs_row["slug"])
-            store = VectorStore(vectors_dir)
             if store.npz_path("skeleton", slug).exists():
-                eff_mock = settings.pipeline.use_mock_llm if use_mock is None else bool(use_mock)
+                available_scopes.append((gs_name, slug, scope_uids))
+            else:
+                missing_scopes.append(gs_name)
 
-                async def _embed_sem():
-                    client = EmbeddingClient(settings, conn=None, use_mock=eff_mock)
-                    try:
-                        return await client.embed_texts([semantic.strip()], stage="SEARCH_SEMANTIC")
-                    finally:
-                        await client.aclose()
+        if available_scopes:
+            eff_mock = settings.pipeline.use_mock_llm if use_mock is None else bool(use_mock)
 
-                vecs = _run_coro_sync(_embed_sem())
+            async def _embed_sem() -> Any:
+                client = EmbeddingClient(settings, conn=None, use_mock=eff_mock)
+                try:
+                    return await client.embed_texts([semantic.strip()], stage="SEARCH_SEMANTIC")
+                finally:
+                    await client.aclose()
+
+            vecs = _run_coro_sync(_embed_sem())
+            all_hits: list[tuple[str, float]] = []
+            top_k_each = max(limit * 3, 50)
+            for _gs_name, slug, scope_uids in available_scopes:
                 hits = store.query_top_k(
                     "skeleton",
                     vecs[0],
                     scope_slug=slug,
-                    top_k=max(limit * 3, 50),
-                    allowed_uids=set(cand_uids),
+                    top_k=top_k_each,
+                    allowed_uids=scope_uids,
                 )
-                sim_by_uid = {u: round(s, 4) for u, s in hits}
-                cand_uids = [u for u, _ in hits]
-            else:
-                warnings.append("骨架向量文件尚未建立，已跳过语义排序")
+                all_hits.extend((u, float(s)) for u, s in hits)
+            all_hits.sort(key=lambda pair: (-pair[1], pair[0]))
+            sim_by_uid = {u: round(s, 4) for u, s in all_hits}
+            cand_uids = [u for u, _ in all_hits]
+            for ms in missing_scopes:
+                warnings.append(f"学段 '{ms}' 骨架向量文件尚未建立，已跳过其语义排序")
+        elif missing_scopes:
+            warnings.append("骨架向量文件尚未建立，已跳过语义排序")
 
     out_items: list[dict[str, Any]] = []
     for uid in cand_uids[: max(1, int(limit))]:
@@ -774,6 +821,62 @@ def _has_wrapping_delimiters(text: str, left: str, right: str) -> bool:
     return depth == 0
 
 
+def _is_numeric_ratio_lhs(text: str) -> bool:
+    """判断 RATIO 冒号左侧是否为纯数值/分数分量（如 '3'、'1.5'、'1/2'），避免把位置比值 '3:4' 误拆为键值。"""
+    s = text.strip()
+    if not s:
+        return False
+    return re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:\s*/\s*\d+(?:\.\d+)?)?", s) is not None
+
+
+def _try_match_label_prefix(seg: str) -> tuple[str, str] | None:
+    """尝试提取显式小问标签前缀并归一；若前缀非法（如 '0.'）则安全返回 None。"""
+    m = _PREFIX_LABEL_RE.match(seg)
+    if not m:
+        return None
+    try:
+        return normalize_part_label(m.group(1)), m.group(2).strip()
+    except ValueError:
+        return None
+
+
+def _split_labeled_segments(
+    raw: str,
+    expected_parts: list[AnswerPart],
+) -> list[tuple[str, str]]:
+    """按分号切分学生作答，并对齐到小问标签（避免小数/括号算式被误拆为小问号）。"""
+    exp_map = {p.label: p for p in expected_parts}
+    segments = [s.strip() for s in raw.replace("；", ";").split(";") if s.strip()]
+    parsed_pairs: list[tuple[str, str]] = []
+
+    if len(expected_parts) == 1 and len(segments) == 1:
+        matched = _try_match_label_prefix(segments[0])
+        if matched is not None and matched[0] in exp_map:
+            lbl, val = matched
+        else:
+            lbl = expected_parts[0].label
+            val = segments[0]
+        parsed_pairs.append((lbl, val))
+        return parsed_pairs
+
+    matched_segs = [_try_match_label_prefix(s) for s in segments]
+    any_explicit = any(item is not None for item in matched_segs)
+    if any_explicit:
+        for seg, matched in zip(segments, matched_segs, strict=True):
+            if matched is not None:
+                lbl, val = matched
+            else:
+                idx = len(parsed_pairs)
+                lbl = expected_parts[idx].label if idx < len(expected_parts) else f"({idx + 1})"
+                val = seg
+            parsed_pairs.append((lbl, val))
+    else:
+        for idx, seg in enumerate(segments):
+            lbl = expected_parts[idx].label if idx < len(expected_parts) else f"({idx + 1})"
+            parsed_pairs.append((lbl, seg))
+    return parsed_pairs
+
+
 def _parse_student_answer_parts(
     raw_input: str,
     expected_parts: list[AnswerPart],
@@ -784,46 +887,19 @@ def _parse_student_answer_parts(
     if not raw:
         return [], list(exp_map.keys()), []
 
-    segments = [s.strip() for s in raw.replace("；", ";").split(";") if s.strip()]
-    parsed_pairs: list[tuple[str, str]] = []
-
-    if len(expected_parts) == 1 and len(segments) == 1:
-        m = _PREFIX_LABEL_RE.match(segments[0])
-        if m:
-            try:
-                lbl = normalize_part_label(m.group(1))
-                val = m.group(2).strip()
-            except ValueError:
-                lbl = expected_parts[0].label
-                val = segments[0]
-        else:
-            lbl = expected_parts[0].label
-            val = segments[0]
-        parsed_pairs.append((lbl, val))
-    else:
-        any_explicit = any(_PREFIX_LABEL_RE.match(s) for s in segments)
-        if any_explicit:
-            for seg in segments:
-                m = _PREFIX_LABEL_RE.match(seg)
-                if m:
-                    lbl = normalize_part_label(m.group(1))
-                    val = m.group(2).strip()
-                else:
-                    idx = len(parsed_pairs)
-                    lbl = expected_parts[idx].label if idx < len(expected_parts) else f"({idx + 1})"
-                    val = seg
-                parsed_pairs.append((lbl, val))
-        else:
-            for idx, seg in enumerate(segments):
-                lbl = expected_parts[idx].label if idx < len(expected_parts) else f"({idx + 1})"
-                parsed_pairs.append((lbl, seg))
+    parsed_pairs = _split_labeled_segments(raw, expected_parts)
 
     stu_parts: list[AnswerPart] = []
     seen_labels: set[str] = set()
-    for lbl, val in parsed_pairs:
+    for lbl, raw_val in parsed_pairs:
         if lbl in seen_labels:
             raise PreconditionError(f"提交答案存在重复小问标签: {lbl!r}")
         seen_labels.add(lbl)
+        val = raw_val.strip()
+        if not val:
+            # 标签后作答为空时计入缺失小问（incorrect），不构造非法 AnswerPart 触发 ValidationError
+            continue
+
         ref = exp_map.get(lbl)
         if ref is None:
             stu_parts.append(
@@ -850,17 +926,85 @@ def _parse_student_answer_parts(
                     choice_label=norm_ch,
                 )
             )
-        elif ref.answer_type == "SYMBOL_FILL" and ref.collection_mode == "SINGLE":
-            stu_parts.append(
-                AnswerPart(
-                    label=lbl,
-                    answer_type="SYMBOL_FILL",
-                    verify_mode="EXACT",
-                    collection_mode="SINGLE",
-                    answer=val,
-                    canonical=normalize_symbol_fill(val) or val,
+        elif ref.answer_type == "SYMBOL_FILL":
+            if ref.collection_mode == "SINGLE":
+                norm_sym = normalize_symbol_fill(val)
+                if not norm_sym.strip():
+                    continue
+                stu_parts.append(
+                    AnswerPart(
+                        label=lbl,
+                        answer_type="SYMBOL_FILL",
+                        verify_mode="EXACT",
+                        collection_mode="SINGLE",
+                        answer=val,
+                        canonical=norm_sym,
+                    )
                 )
-            )
+            elif ref.collection_mode == "LABELED_MAP":
+                raw_tokens = [t.strip() for t in split_top_level(val.replace("，", ","), ",") if t.strip()]
+                if not raw_tokens:
+                    continue
+                ref_labels = [
+                    str(it.get("label") or it.get("key") or it.get("name") or it.get("entity") or "")
+                    for it in (ref.items or [])
+                    if isinstance(it, dict)
+                ]
+                sym_map_items: list[dict[str, str]] = []
+                for idx, tok in enumerate(raw_tokens):
+                    k_str: str | None = None
+                    v_str: str = tok
+                    if ":" in tok or "：" in tok:
+                        k_part, v_part = re.split(r"[:：]", tok, maxsplit=1)
+                        if k_part.strip():
+                            k_str = k_part.strip()
+                            v_str = v_part.strip()
+                    else:
+                        # 仅在 '=' / '＝' 左侧存在非符号键名时按等号切分，防止把 '=' / '>=' / '<=' / '!=' 误拆
+                        m_eq = re.match(r"^\s*([^=＝<>!+\-*/×÷:：]+?)\s*[=＝]\s*(.+)$", tok)
+                        if m_eq:
+                            k_str = m_eq.group(1).strip()
+                            v_str = m_eq.group(2).strip()
+                    if k_str is None:
+                        k_str = (
+                            ref_labels[idx]
+                            if idx < len(ref_labels) and ref_labels[idx]
+                            else f"k{idx + 1}"
+                        )
+                    norm_v = normalize_symbol_fill(v_str)
+                    sym_map_items.append(
+                        {"label": k_str, "item_type": "SYMBOL_FILL", "canonical": norm_v}
+                    )
+                stu_parts.append(
+                    AnswerPart(
+                        label=lbl,
+                        answer_type="SYMBOL_FILL",
+                        verify_mode="EXACT",
+                        collection_mode="LABELED_MAP",
+                        answer=val,
+                        items=sym_map_items,
+                    )
+                )
+            else:
+                cleaned = val.strip()
+                if _has_wrapping_delimiters(cleaned, "{", "}") or _has_wrapping_delimiters(cleaned, "(", ")"):
+                    cleaned = cleaned[1:-1]
+                raw_tokens = [t.strip() for t in split_top_level(cleaned.replace("，", ","), ",") if t.strip()]
+                if not raw_tokens:
+                    continue
+                stu_parts.append(
+                    AnswerPart(
+                        label=lbl,
+                        answer_type="SYMBOL_FILL",
+                        verify_mode="EXACT",
+                        collection_mode=ref.collection_mode,
+                        answer=val,
+                        items=[
+                            {"item_type": "SYMBOL_FILL", "canonical": normalize_symbol_fill(t)}
+                            for t in raw_tokens
+                        ],
+                    )
+                )
         elif ref.verify_mode == "SYMBOLIC":
             if ref.collection_mode == "SINGLE":
                 stu_parts.append(
@@ -874,15 +1018,52 @@ def _parse_student_answer_parts(
                     )
                 )
             elif ref.collection_mode == "LABELED_MAP":
-                raw_tokens = split_top_level(val.replace("，", ","), ",")
+                raw_tokens = [t.strip() for t in split_top_level(val.replace("，", ","), ",") if t.strip()]
+                if not raw_tokens:
+                    continue
                 map_items: list[dict[str, str]] = []
-                ref_labels = [str(it.get("label") or "") for it in (ref.items or []) if isinstance(it, dict)]
+                ref_labels = [
+                    str(it.get("label") or it.get("key") or it.get("name") or it.get("entity") or "")
+                    for it in (ref.items or [])
+                    if isinstance(it, dict)
+                ]
+                ref_label_set = {re.sub(r"\s+", "", rl) for rl in ref_labels if rl.strip()}
                 for idx, tok in enumerate(raw_tokens):
-                    if "=" in tok or ":" in tok or "：" in tok:
-                        k, v = re.split(r"[=:：]", tok, maxsplit=1)
+                    if ref.answer_type == "RATIO":
+                        if "=" in tok or "＝" in tok:
+                            k, v = re.split(r"[=＝]", tok, maxsplit=1)
+                            map_items.append({"label": k.strip(), "expr": v.strip()})
+                        elif ":" in tok or "：" in tok:
+                            cand_k, cand_v = re.split(r"[:：]", tok, maxsplit=1)
+                            cand_k_clean = cand_k.strip()
+                            norm_cand_k = re.sub(r"\s+", "", cand_k_clean)
+                            if norm_cand_k in ref_label_set or (
+                                cand_k_clean and not _is_numeric_ratio_lhs(cand_k_clean)
+                            ):
+                                map_items.append({"label": cand_k_clean, "expr": cand_v.strip()})
+                            else:
+                                rl = (
+                                    ref_labels[idx]
+                                    if idx < len(ref_labels) and ref_labels[idx]
+                                    else f"k{idx + 1}"
+                                )
+                                map_items.append({"label": rl, "expr": tok})
+                        else:
+                            rl = (
+                                ref_labels[idx]
+                                if idx < len(ref_labels) and ref_labels[idx]
+                                else f"k{idx + 1}"
+                            )
+                            map_items.append({"label": rl, "expr": tok})
+                    elif "=" in tok or "＝" in tok or ":" in tok or "：" in tok:
+                        k, v = re.split(r"[=＝:：]", tok, maxsplit=1)
                         map_items.append({"label": k.strip(), "expr": v.strip()})
                     else:
-                        rl = ref_labels[idx] if idx < len(ref_labels) else f"k{idx + 1}"
+                        rl = (
+                            ref_labels[idx]
+                            if idx < len(ref_labels) and ref_labels[idx]
+                            else f"k{idx + 1}"
+                        )
                         map_items.append({"label": rl, "expr": tok})
                 stu_parts.append(
                     AnswerPart(
@@ -891,14 +1072,20 @@ def _parse_student_answer_parts(
                         verify_mode="SYMBOLIC",
                         collection_mode="LABELED_MAP",
                         answer=val,
-                        items=map_items or [{"label": "empty", "expr": val}],
+                        items=map_items,
                     )
                 )
             else:
                 cleaned = val.strip()
-                if _has_wrapping_delimiters(cleaned, "{", "}") or _has_wrapping_delimiters(cleaned, "(", ")"):
+                if ref.answer_type == "SET_OR_INTERVAL":
+                    # 开区间如 "(1, 3)" 不得剥除首尾圆括号，仅剥除集合花括号 "{...}"
+                    if _has_wrapping_delimiters(cleaned, "{", "}"):
+                        cleaned = cleaned[1:-1]
+                elif _has_wrapping_delimiters(cleaned, "{", "}") or _has_wrapping_delimiters(cleaned, "(", ")"):
                     cleaned = cleaned[1:-1]
-                raw_tokens = split_top_level(cleaned.replace("，", ","), ",")
+                raw_tokens = [t.strip() for t in split_top_level(cleaned.replace("，", ","), ",") if t.strip()]
+                if not raw_tokens:
+                    continue
                 stu_parts.append(
                     AnswerPart(
                         label=lbl,
@@ -906,7 +1093,7 @@ def _parse_student_answer_parts(
                         verify_mode="SYMBOLIC",
                         collection_mode=ref.collection_mode,
                         answer=val,
-                        items=[{"expr": t} for t in (raw_tokens or [val])],
+                        items=[{"expr": t} for t in raw_tokens],
                     )
                 )
         else:
@@ -983,7 +1170,11 @@ async def check_answer_async(
             qual_confidence_map[lbl] = override_judge.confidence
             return override_judge
         msgs = build_qualitative_judge_messages(
-            lbl, exp_ans, stu_ans, question_text=str(q_row["eff_question_text"] or "")
+            lbl,
+            exp_ans,
+            stu_ans,
+            question_text=str(q_row["eff_question_text"] or ""),
+            grade_subject=str(q_row["grade_subject"]),
         )
         jr = await gw.call_structured(
             slot="judge_llm",
@@ -1075,10 +1266,88 @@ async def check_answer_async(
         )
         out_payload["logged"] = True
         out_payload["log_id"] = log_res["log_id"]
-        out_payload["outcome"] = outcome
-        out_payload["score_ratio"] = ratio
+        out_payload["outcome"] = log_res["outcome"]
+        out_payload["score_ratio"] = log_res["score_ratio"]
 
     return apply_check_reveal(out_payload)
+
+
+def _validate_practice_log_args(
+    *,
+    outcome: str,
+    score_ratio: float | None,
+    stuck_step_index: int | None,
+    hint_level_used: int | None,
+    request_id: str | None,
+) -> tuple[str, float | None, int | None, int | None, str | None]:
+    """统一校验单条打卡参数（对齐 practice_log 物理 CHECK/UNIQUE 约束）。"""
+    norm_out = str(outcome or "").strip().upper()
+    if norm_out not in ("SOLVED_SOLO", "SOLVED_WITH_HINT", "WRONG", "SKIPPED"):
+        raise PreconditionError(
+            f"outcome 仅允许 SOLVED_SOLO / SOLVED_WITH_HINT / WRONG / SKIPPED，收到 {outcome!r}"
+        )
+
+    norm_req_id = (str(request_id).strip() or None) if request_id is not None else None
+
+    norm_hint: int | None = None
+    if hint_level_used is not None:
+        if isinstance(hint_level_used, bool):
+            raise PreconditionError(f"hint_level_used 必须为非负整数，收到 {hint_level_used!r}")
+        try:
+            norm_hint = int(hint_level_used)
+        except (TypeError, ValueError) as exc:
+            raise PreconditionError(f"hint_level_used 必须为非负整数，收到 {hint_level_used!r}") from exc
+        if norm_hint < 0:
+            raise PreconditionError(f"hint_level_used 不能为负数，收到 {hint_level_used!r}")
+        if norm_out == "SOLVED_SOLO" and norm_hint > 0:
+            raise PreconditionError("SOLVED_SOLO 不可携带 hint_level_used > 0（请改用 SOLVED_WITH_HINT）")
+
+    norm_ratio: float | None = None
+    if score_ratio is not None:
+        if isinstance(score_ratio, bool):
+            raise PreconditionError(f"score_ratio 必须为 [0.0, 1.0] 实数，收到 {score_ratio!r}")
+        try:
+            norm_ratio = float(score_ratio)
+        except (TypeError, ValueError) as exc:
+            raise PreconditionError(f"score_ratio 必须为 [0.0, 1.0] 实数，收到 {score_ratio!r}") from exc
+        if math.isnan(norm_ratio) or norm_ratio < 0.0 or norm_ratio > 1.0:
+            raise PreconditionError(f"score_ratio 必须在 [0.0, 1.0] 范围内，收到 {score_ratio!r}")
+
+    norm_stuck: int | None = None
+    if stuck_step_index is not None:
+        if isinstance(stuck_step_index, bool):
+            raise PreconditionError(f"stuck_step_index 必须为整数，收到 {stuck_step_index!r}")
+        try:
+            norm_stuck = int(stuck_step_index)
+        except (TypeError, ValueError) as exc:
+            raise PreconditionError(f"stuck_step_index 必须为整数，收到 {stuck_step_index!r}") from exc
+
+    return norm_out, norm_ratio, norm_stuck, norm_hint, norm_req_id
+
+
+def _resolve_stuck_step(
+    conn: sqlite3.Connection,
+    question_uid: str,
+    stuck_step_index: int | None,
+) -> tuple[str | None, str | None]:
+    """按最优解分支（is_optimal DESC, branch_id ASC）解析卡点步骤节点与子目标快照。"""
+    if stuck_step_index is None:
+        return None, None
+    st_row = conn.execute(
+        """
+        SELECT st.m_knowledge_node_id, st.sub_goal
+        FROM question_steps st
+        JOIN question_solutions qs
+          ON qs.question_uid = st.question_uid AND qs.branch_id = st.branch_id
+        WHERE st.question_uid = ? AND st.step_index = ?
+        ORDER BY qs.is_optimal DESC, qs.branch_id ASC
+        LIMIT 1;
+        """,
+        (question_uid, int(stuck_step_index)),
+    ).fetchone()
+    if not st_row:
+        return None, None
+    return st_row["m_knowledge_node_id"], st_row["sub_goal"]
 
 
 def log_practice(
@@ -1099,72 +1368,72 @@ def log_practice(
     include_practice_log: bool = True,
     writer: SingleWriterExecutor | None = None,
 ) -> dict[str, Any]:
-    """登记单题做题足迹（支持 client_request_id 幂等与卡点 stuck_node_id 快照）。"""
-    norm_out = outcome.strip().upper()
-    if norm_out not in ("SOLVED_SOLO", "SOLVED_WITH_HINT", "WRONG", "SKIPPED"):
-        raise PreconditionError(f"outcome 仅允许 SOLVED_SOLO / SOLVED_WITH_HINT / WRONG / SKIPPED，收到 {outcome!r}")
+    """登记单题做题足迹（支持 client_request_id 幂等与最优分支卡点 stuck_node_id 快照）。"""
+    norm_out, norm_ratio, norm_stuck, norm_hint, norm_req_id = _validate_practice_log_args(
+        outcome=outcome,
+        score_ratio=score_ratio,
+        stuck_step_index=stuck_step_index,
+        hint_level_used=hint_level_used,
+        request_id=request_id,
+    )
 
     lid = resolve_learner_id(conn, learner_id)
     uid = repository.resolve_question_uid(conn, uid_or_id)
 
-    if request_id:
+    if norm_req_id is not None:
         existing = conn.execute(
             "SELECT * FROM practice_log WHERE learner_id = ? AND client_request_id = ?;",
-            (lid, request_id),
+            (lid, norm_req_id),
         ).fetchone()
         if existing:
             d = dict(existing)
             d["idempotent_replay"] = True
             return d
 
-    if norm_out == "SOLVED_SOLO" and hint_level_used and int(hint_level_used) > 0:
-        raise PreconditionError("SOLVED_SOLO 不可携带 hint_level_used > 0（请改用 SOLVED_WITH_HINT）")
-
-    stuck_node_id: str | None = None
-    stuck_sub_goal: str | None = None
-    if stuck_step_index is not None:
-        st_row = conn.execute(
-            """
-            SELECT m_knowledge_node_id, sub_goal
-            FROM question_steps
-            WHERE question_uid = ? AND branch_id = 'branch_1' AND step_index = ?
-            LIMIT 1;
-            """,
-            (uid, int(stuck_step_index)),
-        ).fetchone()
-        if st_row:
-            stuck_node_id = st_row["m_knowledge_node_id"]
-            stuck_sub_goal = st_row["sub_goal"]
+    stuck_node_id, stuck_sub_goal = _resolve_stuck_step(conn, uid, norm_stuck)
 
     eff_ts = practiced_at or datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     active_writer = writer or _DEFAULT_WRITER
+    replayed_row: sqlite3.Row | None = None
+    new_id = 0
     with active_writer.transaction(conn):
-        cur = conn.execute(
-            """
-            INSERT INTO practice_log(
-                learner_id, question_uid, practiced_at, outcome, score_ratio,
-                stuck_step_index, stuck_node_id, stuck_sub_goal,
-                hint_level_used, user_note, submitted_answer, quiz_batch_id, client_request_id
+        if norm_req_id is not None:
+            replayed_row = conn.execute(
+                "SELECT * FROM practice_log WHERE learner_id = ? AND client_request_id = ?;",
+                (lid, norm_req_id),
+            ).fetchone()
+        if replayed_row is None:
+            cur = conn.execute(
+                """
+                INSERT INTO practice_log(
+                    learner_id, question_uid, practiced_at, outcome, score_ratio,
+                    stuck_step_index, stuck_node_id, stuck_sub_goal,
+                    hint_level_used, user_note, submitted_answer, quiz_batch_id, client_request_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    lid,
+                    uid,
+                    eff_ts,
+                    norm_out,
+                    norm_ratio,
+                    norm_stuck,
+                    stuck_node_id,
+                    stuck_sub_goal,
+                    norm_hint,
+                    user_note,
+                    submitted_answer,
+                    quiz_batch_id,
+                    norm_req_id,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """,
-            (
-                lid,
-                uid,
-                eff_ts,
-                norm_out,
-                score_ratio,
-                stuck_step_index,
-                stuck_node_id,
-                stuck_sub_goal,
-                hint_level_used,
-                user_note,
-                submitted_answer,
-                quiz_batch_id,
-                request_id,
-            ),
-        )
-        new_id = int(cur.lastrowid or 0)
+            new_id = int(cur.lastrowid or 0)
+
+    if replayed_row is not None:
+        d = dict(replayed_row)
+        d["idempotent_replay"] = True
+        return d
 
     human_mirror.export_snapshot(conn, human_dir=human_dir, include_practice_log=include_practice_log)
     row = conn.execute("SELECT * FROM practice_log WHERE log_id = ?;", (new_id,)).fetchone()
@@ -1182,35 +1451,115 @@ def log_batch_practice(
     request_id_prefix: str | None = None,
     human_dir: Path | str = Path("human"),
     include_practice_log: bool = True,
+    writer: SingleWriterExecutor | None = None,
 ) -> dict[str, Any]:
-    """按 quiz_batch_id 批量登记整卷做题记录（每项支持独立 request_id 幂等）。"""
+    """按 quiz_batch_id 原子批量登记整卷做题记录（全量预检 -> 单事务写入 -> 单次快照导出）。"""
     qb = conn.execute("SELECT * FROM quiz_batches WHERE quiz_batch_id = ?;", (quiz_batch_id,)).fetchone()
     if not qb:
         raise NotFoundError(f"组卷批次 '{quiz_batch_id}' 不存在")
     eff_lid = resolve_learner_id(conn, learner_id or str(qb["learner_id"]))
 
-    logged: list[dict[str, Any]] = []
+    norm_prefix = (request_id_prefix or "").strip() or None
+    default_ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. 全量前置预检（所有条目校验、批内 request_id 去重与外键解析必须在开启写事务前完成）
+    seen_req_ids: set[str] = set()
+    prepared: list[dict[str, Any]] = []
     for idx, item in enumerate(entries, start=1):
+        if not isinstance(item, dict):
+            raise PreconditionError(f"第 {idx} 条批量记录必须为 JSON 对象")
         uid_ref = str(item.get("uid") or item.get("question_uid") or item.get("source_id") or "").strip()
         if not uid_ref:
             raise PreconditionError(f"第 {idx} 条批量记录缺少 question_uid/uid")
-        req_id = item.get("request_id") or (f"{request_id_prefix}:{idx}" if request_id_prefix else None)
-        res = log_practice(
-            conn,
-            uid_or_id=uid_ref,
+        uid = repository.resolve_question_uid(conn, uid_ref)
+
+        raw_item_req = item.get("request_id")
+        clean_item_req = str(raw_item_req).strip() if raw_item_req is not None else ""
+        req_id = clean_item_req or (f"{norm_prefix}:{idx}" if norm_prefix else None)
+
+        norm_out, norm_ratio, norm_stuck, norm_hint, norm_req_id = _validate_practice_log_args(
             outcome=str(item.get("outcome") or "SOLVED_SOLO"),
-            learner_id=eff_lid,
             score_ratio=item.get("score_ratio"),
             stuck_step_index=item.get("stuck_step_index"),
             hint_level_used=item.get("hint_level_used"),
-            user_note=str(item.get("user_note") or ""),
-            submitted_answer=item.get("submitted_answer"),
-            quiz_batch_id=quiz_batch_id,
             request_id=req_id,
-            human_dir=human_dir,
-            include_practice_log=include_practice_log,
         )
-        logged.append(res)
+        if norm_req_id is not None:
+            if norm_req_id in seen_req_ids:
+                raise PreconditionError(f"批量提交存在重复 request_id: {norm_req_id!r}")
+            seen_req_ids.add(norm_req_id)
+        stuck_node_id, stuck_sub_goal = _resolve_stuck_step(conn, uid, norm_stuck)
+        eff_ts = str(item.get("practiced_at") or "").strip() or default_ts
+        prepared.append(
+            {
+                "question_uid": uid,
+                "practiced_at": eff_ts,
+                "outcome": norm_out,
+                "score_ratio": norm_ratio,
+                "stuck_step_index": norm_stuck,
+                "stuck_node_id": stuck_node_id,
+                "stuck_sub_goal": stuck_sub_goal,
+                "hint_level_used": norm_hint,
+                "user_note": str(item.get("user_note") or ""),
+                "submitted_answer": item.get("submitted_answer"),
+                "request_id": norm_req_id,
+            }
+        )
+
+    # 2. 单事务原子执行全部幂等检查与写入
+    active_writer = writer or _DEFAULT_WRITER
+    entry_refs: list[tuple[int, bool]] = []
+    any_inserted = False
+    with active_writer.transaction(conn):
+        for p in prepared:
+            req_key = p["request_id"]
+            if req_key is not None:
+                existing = conn.execute(
+                    "SELECT log_id FROM practice_log WHERE learner_id = ? AND client_request_id = ?;",
+                    (eff_lid, req_key),
+                ).fetchone()
+                if existing:
+                    entry_refs.append((int(existing["log_id"]), True))
+                    continue
+            cur = conn.execute(
+                """
+                INSERT INTO practice_log(
+                    learner_id, question_uid, practiced_at, outcome, score_ratio,
+                    stuck_step_index, stuck_node_id, stuck_sub_goal,
+                    hint_level_used, user_note, submitted_answer, quiz_batch_id, client_request_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    eff_lid,
+                    p["question_uid"],
+                    p["practiced_at"],
+                    p["outcome"],
+                    p["score_ratio"],
+                    p["stuck_step_index"],
+                    p["stuck_node_id"],
+                    p["stuck_sub_goal"],
+                    p["hint_level_used"],
+                    p["user_note"],
+                    p["submitted_answer"],
+                    quiz_batch_id,
+                    req_key,
+                ),
+            )
+            entry_refs.append((int(cur.lastrowid or 0), False))
+            any_inserted = True
+
+    # 3. 事务提交成功后仅导出一次人工资产镜像
+    if any_inserted:
+        human_mirror.export_snapshot(conn, human_dir=human_dir, include_practice_log=include_practice_log)
+
+    logged: list[dict[str, Any]] = []
+    for log_id, is_replay in entry_refs:
+        row = conn.execute("SELECT * FROM practice_log WHERE log_id = ?;", (log_id,)).fetchone()
+        if row:
+            rec = dict(row)
+            rec["idempotent_replay"] = is_replay
+            logged.append(rec)
 
     return {
         "quiz_batch_id": quiz_batch_id,
@@ -1263,6 +1612,23 @@ def void_practice_log(
     }
 
 
+def _mark_override_field_stale(conn: sqlite3.Connection, uid: str, field_name: str) -> None:
+    """按覆写字段影响面统一向下游 compile_state 传播 STALE（覆写与撤回共用）。"""
+    if field_name in (
+        "question_text",
+        "visual_facts",
+        "final_answers_json",
+        "format",
+        "solutions_override_json",
+        "verification_status",
+    ):
+        refresh.mark_stages_stale(conn, uid, ["S2", "S3C", "S3D", "S4"])
+    elif field_name in effective.TAXONOMY_OVERRIDE_FIELDS:
+        refresh.mark_stages_stale(conn, uid, ["S3D", "S4"])
+    elif field_name == "is_excluded" or field_name in effective.ANNOTATION_OVERRIDE_FIELDS:
+        refresh.mark_stages_stale(conn, uid, ["S4"])
+
+
 def apply_single_override(
     conn: sqlite3.Connection,
     uid_or_id: str,
@@ -1292,7 +1658,7 @@ def apply_single_override(
     content_hash = str(raw_row["content_hash"])
 
     if reconfirm:
-        from shuati.services.facade import reconfirm_stale_overrides
+        from shuati.services.facade import OverrideSource, reconfirm_stale_overrides
 
         if dry_run:
             stale_rows = conn.execute(
@@ -1300,7 +1666,25 @@ def apply_single_override(
                 (uid,),
             ).fetchall()
             return {"dry_run": True, "action": "reconfirm", "question_uid": uid, "fields": [r["field_name"] for r in stale_rows]}
-        return reconfirm_stale_overrides(conn, uid, human_dir=human_dir, writer=writer)
+        valid_sources: tuple[OverrideSource, ...] = (
+            "REVIEW_UI",
+            "PI_CLI",
+            "PI_MCP",
+            "MANUAL_YAML",
+            "ANCHOR_CALIBRATION",
+        )
+        if source not in valid_sources:
+            raise PreconditionError(f"不支持的覆写来源 '{source}'，允许范围: {list(valid_sources)}")
+        typed_source = cast(OverrideSource, source)
+        return reconfirm_stale_overrides(
+            conn,
+            uid,
+            reason=reason,
+            source=typed_source,
+            human_dir=human_dir,
+            include_practice_log=include_practice_log,
+            writer=writer,
+        )
 
     if revoke:
         existing = conn.execute(
@@ -1319,19 +1703,25 @@ def apply_single_override(
             )
             effective.recompute(conn, uid)
             repository.refresh_search_index(conn, uid)
+            _mark_override_field_stale(conn, uid, field_name)
         human_mirror.export_snapshot(conn, human_dir=human_dir, include_practice_log=include_practice_log)
         return {"dry_run": False, "action": "revoke", "question_uid": uid, "field_name": field_name}
 
     if value is None:
         raise PreconditionError("写入覆写时必须提供 --value（或使用 --revoke / --reconfirm）")
 
-    # 读取学段词表版本供词表类覆写绑定
-    q_gs = conn.execute("SELECT grade_subject FROM questions WHERE question_uid = ?;", (uid,)).fetchone()
+    # 仅词表类覆写强绑 taxonomy_version，验真类与标注类写 ""；
+    # 全部分组均保留写入时 content_hash 作为 base_fingerprint（标注类供 Stage Q 发出轻度抽检提醒，effective.py 不自动挂起）
     tax_ver = ""
-    if q_gs:
-        gs_row = conn.execute("SELECT taxonomy_version FROM grade_subjects WHERE grade_subject = ?;", (q_gs["grade_subject"],)).fetchone()
-        if gs_row:
-            tax_ver = str(gs_row["taxonomy_version"] or "")
+    if field_name in effective.TAXONOMY_OVERRIDE_FIELDS:
+        q_gs = conn.execute("SELECT grade_subject FROM questions WHERE question_uid = ?;", (uid,)).fetchone()
+        if q_gs:
+            gs_row = conn.execute(
+                "SELECT taxonomy_version FROM grade_subjects WHERE grade_subject = ?;",
+                (q_gs["grade_subject"],),
+            ).fetchone()
+            if gs_row:
+                tax_ver = str(gs_row["taxonomy_version"] or "")
 
     if dry_run:
         return {
@@ -1362,12 +1752,7 @@ def apply_single_override(
         )
         effective.recompute(conn, uid)
         repository.refresh_search_index(conn, uid)
-        if field_name in ("question_text", "visual_facts", "final_answers_json", "format"):
-            refresh.mark_stages_stale(conn, uid, ["S2", "S3C", "S3D", "S4"])
-        elif field_name in ("primary_l1_module", "taxonomy_override_json"):
-            refresh.mark_stages_stale(conn, uid, ["S3D", "S4"])
-        elif field_name in ("abstract_skeleton", "difficulty_override_json", "trap_tags_json", "classic_motifs_json"):
-            refresh.mark_stages_stale(conn, uid, ["S4"])
+        _mark_override_field_stale(conn, uid, field_name)
 
     human_mirror.export_snapshot(conn, human_dir=human_dir, include_practice_log=include_practice_log)
     return {"dry_run": False, "action": "set", "question_uid": uid, "field_name": field_name}

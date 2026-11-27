@@ -686,6 +686,7 @@ def reconfirm_stale_overrides(
     reason: str = "",
     source: OverrideSource = "REVIEW_UI",
     human_dir: Path | str = Path("human"),
+    include_practice_log: bool = True,
     writer: SingleWriterExecutor | None = None,
 ) -> dict[str, Any]:
     """[K] 键：以当前 content_hash 复制重签挂起/过期覆写并停用旧行。"""
@@ -782,7 +783,9 @@ def reconfirm_stale_overrides(
         effective.recompute(conn, uid)
         _sync_s2_state_preserving_unchanged(conn, uid, before_snap)
 
-    human_mirror.export_snapshot(conn, human_dir=human_dir)
+    human_mirror.export_snapshot(
+        conn, human_dir=human_dir, include_practice_log=include_practice_log
+    )
     q_after = conn.execute(
         "SELECT eff_verification_status FROM questions WHERE question_uid = ?",
         (uid,),

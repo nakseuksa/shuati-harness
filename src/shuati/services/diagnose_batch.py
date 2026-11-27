@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -38,7 +39,9 @@ _HEADING_NO_SPACE_RE = re.compile(r"^(\s*#{2,3})([^\s#].*)$")
 _INLINE_BODY_HEADING_RE = re.compile(r"^((?:第\s*\d+\s*题(?:\s*[：:.、])?|\d+\s*[.、)．]))\s*(.+)$")
 _Q_NUM_PREFIX_RE = re.compile(r"^(?:第\s*\d+\s*题(?:\s*[：:.、])?|\d+\s*[.、)．）]?)\s*")
 _H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$")
-_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_MD_IMAGE_RE = re.compile(
+    r"!\[[^\]]*\]\((\s*<[^>\r\n]+>(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*|(?:[^()\r\n]|\([^()\r\n]*\))+)\)"
+)
 _EXPLICIT_IMAGE_LINE_RE = re.compile(r"^\s*(?:图片|配图|图|image)\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
 _EXPLICIT_IMAGE_PREFIX_RE = re.compile(r"^(\s*(?:图片|配图|图|image)\s*[:：]\s*)(.+?)\s*$", re.IGNORECASE)
 
@@ -198,6 +201,23 @@ def parse_question_list_markdown(file_path: Path | str) -> list[ParsedQuestionIt
     return items
 
 
+def _atomic_write_text(target: Path, content: str) -> None:
+    """通过同目录 pid+uuid 临时文件 + os.replace 原子落盘，异常时清理临时文件。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.parent / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def _load_reusable_draft_index(
     drafts_dir: Path,
     grade_subject: str,
@@ -222,12 +242,49 @@ def _load_reusable_draft_index(
             chash = str(payload.get("content_hash") or "").strip()
             if not chash or chash in index:
                 continue
+            draft_id_val = payload.get("draft_id")
+            tier_val = payload.get("tier")
+            raw_elo = payload.get("base_elo")
+            if (
+                not isinstance(draft_id_val, str)
+                or not draft_id_val.strip()
+                or not isinstance(tier_val, str)
+                or not tier_val.strip()
+                or isinstance(raw_elo, bool)
+                or raw_elo is None
+            ):
+                continue
+            int(raw_elo)
             # 确认草稿诊断体满足当前严格 Schema（过滤历史不完整草稿）
             ExternalDiagnosisOutput.model_validate(payload.get("diagnosis"))
             index[chash] = (df, payload)
-        except (OSError, ValueError, ValidationError):
+        except (OSError, ValueError, TypeError, ValidationError):
             continue
     return index
+
+
+def _first_nonempty(mapping: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for k in keys:
+        v = mapping.get(k)
+        if v is not None:
+            s = str(v).strip()
+            if s:
+                return s
+    return ""
+
+
+def _extract_item_display(item: Any, *, labeled: bool = False) -> str:
+    if isinstance(item, dict):
+        val = _first_nonempty(item, ("canonical", "choice_label", "sympy_expr", "expr", "answer", "value"))
+        if labeled:
+            key = _first_nonempty(item, ("label", "key", "name", "entity"))
+            if key:
+                return f"{key}={val}" if val else key
+            if len(item) == 1:
+                k0, v0 = next(iter(item.items()))
+                return f"{str(k0).strip()}={str(v0).strip()}"
+        return val
+    return str(item).strip()
 
 
 def _format_answers_inline(final_answers: list[dict[str, Any]]) -> str:
@@ -236,11 +293,32 @@ def _format_answers_inline(final_answers: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for p in final_answers:
         lbl = str(p.get("label") or "主问")
-        ans = str(p.get("answer") or "")
+        ans = _first_nonempty(p, ("answer",))
+        if not ans:
+            collection_mode = str(p.get("collection_mode") or "SINGLE").upper()
+            raw_items = p.get("items")
+            if collection_mode == "SINGLE":
+                ans = _first_nonempty(p, ("choice_label", "canonical", "sympy_expr"))
+            if not ans and isinstance(raw_items, list) and raw_items:
+                is_labeled = collection_mode == "LABELED_MAP"
+                rendered_items = [
+                    s for s in (_extract_item_display(it, labeled=is_labeled) for it in raw_items) if s
+                ]
+                ans = ", ".join(rendered_items)
+            if not ans:
+                ans = _first_nonempty(p, ("choice_label", "canonical", "sympy_expr"))
         unit = str(p.get("unit") or "").strip()
-        val = f"{ans}{unit}" if unit and not ans.endswith(unit) else ans
+        val = f"{ans}{unit}" if ans and unit and not ans.endswith(unit) else ans
         parts.append(val if lbl == "主问" and len(final_answers) == 1 else f"{lbl}: {val}")
     return "；".join(parts)
+
+
+def _escape_md_cell(val: Any, max_len: int | None = None) -> str:
+    """规范化 GFM 表格单元格：先折叠换行为空格、再可选截断、最后转义 `|` 避免切出孤立 `\\`。"""
+    text = re.sub(r"[\r\n]+", " ", str(val if val is not None else "")).strip()
+    if max_len is not None and max_len >= 0 and len(text) > max_len:
+        text = text[:max_len]
+    return text.replace("|", "\\|")
 
 
 def _build_trap_label_map(config_dir: Path | str | None = None) -> dict[str, str]:
@@ -369,25 +447,29 @@ def render_batch_markdown_report(
     ]
 
     for it in summary["items"]:
-        idx = it["index"]
-        title = str(it["title"]).replace("|", "\\|")
-        st = it["status"]
-        if st == "FAILED":
-            err_msg = str((it.get("error") or {}).get("message") or "未知错误").replace("|", "\\|")[:60]
-            lines.append(f"| {idx} | {title} | `FAILED` | — | — | — | {err_msg} | — |")
+        idx = _escape_md_cell(it["index"])
+        title = _escape_md_cell(it["title"])
+        st_raw = it["status"]
+        st = _escape_md_cell(st_raw)
+        if st_raw == "FAILED":
+            err_msg = _escape_md_cell((it.get("error") or {}).get("message") or "未知错误", max_len=60)
+            lines.append(f"| {idx} | {title} | `{st}` | — | — | — | {err_msg} | — |")
             continue
 
         diag = it["result"]
-        elo_tier = f"{diag.get('tier', '')} ({diag.get('base_elo', '')})"
-        l1 = str(diag.get("primary_l1_module") or "")
-        ans_str = _format_answers_inline(diag.get("final_answers") or []).replace("|", "\\|")
+        elo_tier = _escape_md_cell(f"{diag.get('tier', '')} ({diag.get('base_elo', '')})")
+        l1 = _escape_md_cell(diag.get("primary_l1_module") or "")
+        ans_str = _escape_md_cell(_format_answers_inline(diag.get("final_answers") or []))
         dups = diag.get("duplicate_candidates") or []
         dup_str = (
-            ", ".join(f"`{d['source_id'] or d['question_uid']}` ({d['similarity']})" for d in dups[:2])
+            ", ".join(
+                f"`{_escape_md_cell(d['source_id'] or d['question_uid'])}` ({_escape_md_cell(d['similarity'])})"
+                for d in dups[:2]
+            )
             if dups
             else "无"
         )
-        draft_id = str(diag.get("draft_id") or "")
+        draft_id = _escape_md_cell(diag.get("draft_id") or "")
         lines.append(f"| {idx} | {title} | `{st}` | {elo_tier} | {l1} | {ans_str} | {dup_str} | `{draft_id}` |")
 
     lines.extend(["", "## 二、逐题诊断明细", ""])
@@ -514,94 +596,74 @@ async def diagnose_external_file_async(
     async def _run_one(item: ParsedQuestionItem) -> dict[str, Any]:
         async with sem:
             t_item = time.perf_counter()
+            norm_text = item.question_text
             print(f"[diagnose {item.index}/{total}] 开始诊断: {item.title}", file=sys.stderr, flush=True)
-
-            # 1. 图片存在性预检（单题失败不阻断整批）
-            missing_imgs = [str(p) for p in item.image_paths if not p.exists()]
-            if missing_imgs:
-                msg = f"找不到传入的错题图片: {', '.join(missing_imgs)}"
-                print(f"[diagnose {item.index}/{total}] 失败: {msg}", file=sys.stderr, flush=True)
-                return {
-                    "index": item.index,
-                    "title": item.title,
-                    "question_text": item.question_text,
-                    "image_paths": [str(p) for p in item.image_paths],
-                    "status": "FAILED",
-                    "duration_ms": int((time.perf_counter() - t_item) * 1000),
-                    "error": {"code": "PRECONDITION_FAILED", "message": msg},
-                }
-
-            norm_text = normalize_text(item.question_text or "").normalized_text
-            if not norm_text:
-                msg = "题干 text 不能为空"
-                print(f"[diagnose {item.index}/{total}] 失败: {msg}", file=sys.stderr, flush=True)
-                return {
-                    "index": item.index,
-                    "title": item.title,
-                    "question_text": item.question_text,
-                    "image_paths": [str(p) for p in item.image_paths],
-                    "status": "FAILED",
-                    "duration_ms": int((time.perf_counter() - t_item) * 1000),
-                    "error": {"code": "PRECONDITION_FAILED", "message": msg},
-                }
-
-            chash = compute_diagnose_content_hash(grade_subject, norm_text, item.image_paths)
-
-            # 2. 断点续跑复用已有未过期草稿
-            if not force and chash in reusable_index:
-                df_path, payload = reusable_index[chash]
-                diag_dict = payload["diagnosis"]
-                dups = payload.get("duplicate_candidates")
-                if dups is None:
-                    dups = find_duplicate_candidates(
-                        conn,
-                        grade_subject=grade_subject,
-                        norm_text=norm_text,
-                        image_count=len(item.image_paths),
-                        surf_hits=[],
-                        servable_map={},
-                    )
-                reused_res = {
-                    "draft_id": payload["draft_id"],
-                    "draft_file": str(df_path.resolve()),
-                    "unverified_single_pass": bool(payload.get("unverified_single_pass", True)),
-                    "grade_subject": grade_subject,
-                    "base_elo": int(payload["base_elo"]),
-                    "tier": payload["tier"],
-                    "primary_l1_module": diag_dict.get("primary_l1_module", ""),
-                    "matched_l2": diag_dict.get("matched_l2", []),
-                    "visual_facts": diag_dict.get("visual_facts", ""),
-                    "method_summary": diag_dict.get("method_summary", ""),
-                    "solution_markdown": diag_dict.get("solution_markdown", ""),
-                    "final_answers": diag_dict.get("final_answers", []),
-                    "abstract_skeleton": diag_dict.get("abstract_skeleton", ""),
-                    "thinking_methods": diag_dict.get("thinking_methods", []),
-                    "classic_motifs": diag_dict.get("classic_motifs", []),
-                    "trap_tags": diag_dict.get("trap_tags", []),
-                    "known_answer_match": payload.get("known_answer_match"),
-                    "duplicate_candidates": dups,
-                    "recommendations": payload.get(
-                        "recommendations",
-                        {"scaffold_foundations": [], "isomorphic_variants": [], "contrastive_and_traps": []},
-                    ),
-                }
-                print(
-                    f"[diagnose {item.index}/{total}] 复用草稿: {payload['draft_id']} ({payload['tier']} / {payload['base_elo']} Elo)",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return {
-                    "index": item.index,
-                    "title": item.title,
-                    "question_text": norm_text,
-                    "image_paths": [str(p) for p in item.image_paths],
-                    "status": "REUSED",
-                    "duration_ms": int((time.perf_counter() - t_item) * 1000),
-                    "result": reused_res,
-                }
-
-            # 3. 执行单题实时诊断
             try:
+                # 1. 图片存在性预检（单题失败不阻断整批）
+                missing_imgs = [str(p) for p in item.image_paths if not p.is_file()]
+                if missing_imgs:
+                    raise PreconditionError(f"找不到传入的错题图片: {', '.join(missing_imgs)}")
+
+                norm_text = normalize_text(item.question_text or "").normalized_text
+                if not norm_text:
+                    raise PreconditionError("题干 text 不能为空")
+
+                chash = compute_diagnose_content_hash(grade_subject, norm_text, item.image_paths)
+
+                # 2. 断点续跑复用已有未过期草稿
+                if not force and chash in reusable_index:
+                    df_path, payload = reusable_index[chash]
+                    diag_dict = payload["diagnosis"]
+                    dups = payload.get("duplicate_candidates")
+                    if dups is None:
+                        dups = find_duplicate_candidates(
+                            conn,
+                            grade_subject=grade_subject,
+                            norm_text=norm_text,
+                            image_count=len(item.image_paths),
+                            surf_hits=[],
+                            servable_map={},
+                        )
+                    reused_res = {
+                        "draft_id": payload["draft_id"],
+                        "draft_file": str(df_path.resolve()),
+                        "unverified_single_pass": bool(payload.get("unverified_single_pass", True)),
+                        "grade_subject": grade_subject,
+                        "base_elo": int(payload["base_elo"]),
+                        "tier": payload["tier"],
+                        "primary_l1_module": diag_dict.get("primary_l1_module", ""),
+                        "matched_l2": diag_dict.get("matched_l2", []),
+                        "visual_facts": diag_dict.get("visual_facts", ""),
+                        "method_summary": diag_dict.get("method_summary", ""),
+                        "solution_markdown": diag_dict.get("solution_markdown", ""),
+                        "final_answers": diag_dict.get("final_answers", []),
+                        "abstract_skeleton": diag_dict.get("abstract_skeleton", ""),
+                        "thinking_methods": diag_dict.get("thinking_methods", []),
+                        "classic_motifs": diag_dict.get("classic_motifs", []),
+                        "trap_tags": diag_dict.get("trap_tags", []),
+                        "known_answer_match": payload.get("known_answer_match"),
+                        "duplicate_candidates": dups,
+                        "recommendations": payload.get(
+                            "recommendations",
+                            {"scaffold_foundations": [], "isomorphic_variants": [], "contrastive_and_traps": []},
+                        ),
+                    }
+                    print(
+                        f"[diagnose {item.index}/{total}] 复用草稿: {payload['draft_id']} ({payload['tier']} / {payload['base_elo']} Elo)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return {
+                        "index": item.index,
+                        "title": item.title,
+                        "question_text": norm_text,
+                        "image_paths": [str(p) for p in item.image_paths],
+                        "status": "REUSED",
+                        "duration_ms": int((time.perf_counter() - t_item) * 1000),
+                        "result": reused_res,
+                    }
+
+                # 3. 执行单题实时诊断
                 res = await diagnose_external_mistake_async(
                     conn,
                     settings,
@@ -693,11 +755,10 @@ async def diagnose_external_file_async(
         "items": results,
     }
 
-    batch_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    batch_md_path.write_text(
-        render_batch_markdown_report(summary, conn=conn, config_dir=config_dir),
-        encoding="utf-8",
-    )
+    summary_json_text = json.dumps(summary, ensure_ascii=False, indent=2)
+    summary_md_text = render_batch_markdown_report(summary, conn=conn, config_dir=config_dir)
+    _atomic_write_text(batch_json_path, summary_json_text)
+    _atomic_write_text(batch_md_path, summary_md_text)
 
     # 若全军覆没（0 成功且 0 复用），仍保留已落盘的双汇总报告，但返回非 0 退出码
     if succeeded + reused == 0 and failed > 0:
@@ -737,9 +798,27 @@ def _absolutize_image_line(line: str, base_dir: Path, fixes_applied: list[str]) 
             if not ref or Path(ref).is_absolute():
                 return full
             abs_p = (base_dir / ref).resolve()
-            fixes_applied.append(f"相对图片路径转绝对路径: {ref} -> {abs_p.as_posix()}")
-            new_inside = inside.replace(ref, abs_p.as_posix(), 1)
-            prefix_md = full[: full.index("(") + 1]
+            abs_posix = abs_p.as_posix()
+            fixes_applied.append(f"相对图片路径转绝对路径: {ref} -> {abs_posix}")
+            s_inside = inside.strip()
+            if s_inside.startswith("<") and ">" in s_inside:
+                end_gt = s_inside.find(">")
+                suffix = s_inside[end_gt + 1 :]
+                new_inside = f"<{abs_posix}>{suffix}"
+            else:
+                replacement = (
+                    f"<{abs_posix}>"
+                    if any(ch in abs_posix for ch in (" ", "\t", "(", ")"))
+                    else abs_posix
+                )
+                if (
+                    (s_inside.startswith('"') and s_inside.endswith('"'))
+                    or (s_inside.startswith("'") and s_inside.endswith("'"))
+                ) and s_inside[1:-1].strip() == ref:
+                    new_inside = replacement
+                else:
+                    new_inside = inside.replace(ref, replacement, 1)
+            prefix_md = full[: full.index("](") + 2]
             return f"{prefix_md}{new_inside})"
 
         return _MD_IMAGE_RE.sub(_repl, line)
@@ -845,12 +924,13 @@ def preflight_question_list_markdown(
             if m_inline:
                 title_part = m_inline.group(1).strip()
                 rest_part = m_inline.group(2).strip()
-                looks_like_prose = (
-                    not has_body
-                    or len(rest_part) >= 16
-                    or any(ch in rest_part for ch in "。？！?!，,;；：:")
-                    or bool(re.search(r"\d", rest_part))
-                )
+                if not has_body:
+                    looks_like_prose = True
+                else:
+                    looks_like_prose = (
+                        len(rest_part) >= 24
+                        or any(ch in rest_part for ch in "。？！?!，,")
+                    )
                 if rest_part and looks_like_prose:
                     pass3_lines.append(f"{hashes} {title_part}")
                     pass3_lines.append(rest_part)
@@ -873,8 +953,7 @@ def preflight_question_list_markdown(
     pass4_lines = [_absolutize_image_line(ln, src_base_dir, fixes_applied) for ln in pass3_lines]
     normalized_text = "\n".join(pass4_lines).rstrip() + "\n"
 
-    norm_path.parent.mkdir(parents=True, exist_ok=True)
-    norm_path.write_text(normalized_text, encoding="utf-8")
+    _atomic_write_text(norm_path, normalized_text)
 
     parsed_items = parse_question_list_markdown(norm_path)
     missing_images: list[dict[str, Any]] = []
@@ -887,7 +966,7 @@ def preflight_question_list_markdown(
     for item in parsed_items:
         item_missing: list[str] = []
         for p, raw_ref in zip(item.image_paths, item.raw_image_refs, strict=False):
-            if not p.exists():
+            if not p.is_file():
                 p_str = str(p)
                 item_missing.append(p_str)
                 missing_images.append(
