@@ -158,6 +158,7 @@ class ScaffoldThresholdsConfig(BaseModel):
     containment_min: float = 0.80
     reverse_containment_max: float = 0.60
     min_elo_diff: int = 200
+    max_elo_diff: int = 750
     skeleton_pct_min: float = 0.90
     boundary_band: float = 0.10
     in_degree_cap: int = 5
@@ -333,10 +334,12 @@ def load_settings(config_path: Path | str | None = None, env_path: Path | str | 
 
     settings = Settings.model_validate(raw_dict)
 
-    # 规范与红线：judge_llm 未配置时自动回退复用 text_llm 且 temperature=0.0
+    # 规范与红线：judge_llm 未配置时自动回退复用 text_llm 且 temperature=0.0，保留更高超时裕度
     if not settings.llm.judge_llm.model:
+        orig_judge_timeout = settings.llm.judge_llm.timeout_seconds
         settings.llm.judge_llm = settings.llm.text_llm.model_copy()
         settings.llm.judge_llm.temperature = 0.0
+        settings.llm.judge_llm.timeout_seconds = max(orig_judge_timeout, settings.llm.text_llm.timeout_seconds)
 
     return settings
 

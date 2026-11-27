@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +16,51 @@ from shuati.core.knowledge_graph import find_canonical_concept_id, find_canonica
 from shuati.vectors.store import VectorStore
 
 RELATION_TYPES = ("CLONE", "ISOMORPHIC", "SCAFFOLD", "CONTRASTIVE", "SHARED_TRAP")
+_NUM_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _extract_num_tokens(text: str) -> tuple[str, ...]:
+    out: list[str] = []
+    for m in _NUM_TOKEN_RE.finditer(text or ""):
+        tok = m.group(0)
+        if "." in tok:
+            tok = tok.rstrip("0").rstrip(".").lstrip("0") or "0"
+        else:
+            tok = tok.lstrip("0") or "0"
+        out.append(tok)
+    return tuple(out)
+
+
+def _extract_answers_sig(raw_json: str | None) -> str:
+    if not raw_json:
+        return ""
+    try:
+        arr = json.loads(raw_json)
+    except ValueError:
+        return ""
+    if not isinstance(arr, list) or not arr:
+        return ""
+    segs: list[str] = []
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        lbl = str(it.get("label") or "主问").strip()
+        val = str(
+            it.get("sympy_expr")
+            or it.get("canonical")
+            or it.get("choice_label")
+            or it.get("answer")
+            or ""
+        ).strip()
+        if not val and isinstance(it.get("items"), list):
+            val = ",".join(
+                str(x.get("expr") or x.get("canonical") or x.get("choice_label") or x.get("answer") or "")
+                for x in it["items"]
+                if isinstance(x, dict)
+            )
+        if val:
+            segs.append(f"{lbl}={val}")
+    return ";".join(segs)
 
 
 def normalize_edge_endpoints(relation_type: str, u: str, v: str) -> tuple[str, str]:
@@ -38,6 +84,61 @@ class QuestionFeature:
     eff_skeleton: str
     tag_labels: list[str]
     l2_entities: set[str] = field(default_factory=set)
+    num_tokens: tuple[str, ...] = ()
+    answers_sig: str = ""
+    c_score: int = 2
+
+
+def _has_extended_body_feature(f: QuestionFeature) -> bool:
+    if any("TRAP_EXTENDED_BODY_LENGTH" in t for t in f.e_traps):
+        return True
+    if any(("火车过桥与错车" in l2 or "矩形重叠区" in l2) for l2 in f.l2_entities):
+        return True
+    return any("火车过桥" in lbl for lbl in f.tag_labels)
+
+
+def _has_escalator_feature(f: QuestionFeature) -> bool:
+    if "扶梯" in f.eff_text:
+        return True
+    return any("扶梯" in lbl.split("/")[-1] for lbl in f.tag_labels)
+
+
+def _is_escalator_dir_time_flip_pair(fa: QuestionFeature, fb: QuestionFeature) -> bool:
+    if not (_has_escalator_feature(fa) and _has_escalator_feature(fb)):
+        return False
+
+    def _has_time_unit(txt: str) -> bool:
+        return ("秒" in txt) or ("分钟" in txt) or ("小时" in txt)
+
+    def _is_bidir(txt: str) -> bool:
+        return ("上下" in txt) or ("上电梯" in txt and "下电梯" in txt) or ("上扶梯" in txt and "下扶梯" in txt)
+
+    ta, tb = _has_time_unit(fa.eff_text), _has_time_unit(fb.eff_text)
+    ba, bb = _is_bidir(fa.eff_text), _is_bidir(fb.eff_text)
+    return (ta != tb) and (ba != bb)
+
+
+def _is_pct_micro_question(f: QuestionFeature) -> bool:
+    if f.c_score != 1:
+        return False
+    if "%" not in f.eff_text and "％" not in f.eff_text and "百分之" not in f.eff_text:
+        return False
+    if not any("分数与百分数应用题" in l2 for l2 in f.l2_entities):
+        return False
+    return not any(u in f.eff_text for u in ("米", "千米", "小时", "分钟", "秒"))
+
+
+def _is_isomorphic_structurally_compatible(fa: QuestionFeature, fb: QuestionFeature) -> bool:
+    """拦截跨物理参考系伪消元同构、有长物体退化为质点追及、以及完整应用题退化为纯百分率小题。"""
+    if _has_extended_body_feature(fa) != _has_extended_body_feature(fb):
+        return False
+    if _has_escalator_feature(fa) != _has_escalator_feature(fb):
+        return False
+    if _is_escalator_dir_time_flip_pair(fa, fb):
+        return False
+    if (fa.c_score >= 2 and _is_pct_micro_question(fb)) or (fb.c_score >= 2 and _is_pct_micro_question(fa)):
+        return False
+    return True
 
 
 @dataclass
@@ -73,8 +174,9 @@ def load_question_features(
     where_serve = "" if include_unservable else "AND eff_is_servable = 1"
     q_rows = conn.execute(
         f"""
-        SELECT question_uid, grade_subject, eff_base_elo, eff_primary_l1_module,
-               eff_node_ids_json, eff_question_text, eff_abstract_skeleton, eff_overridden_fields_json
+        SELECT question_uid, grade_subject, eff_base_elo, eff_c_score, eff_primary_l1_module,
+               eff_node_ids_json, eff_question_text, eff_abstract_skeleton,
+               eff_overridden_fields_json, eff_final_answers_json
         FROM questions
         WHERE grade_subject = ? AND is_retired = 0 AND eff_is_excluded = 0 {where_serve}
         ORDER BY question_uid;
@@ -232,6 +334,9 @@ def load_question_features(
             eff_skeleton=str(r["eff_abstract_skeleton"] or ""),
             tag_labels=labels,
             l2_entities=l2_set,
+            num_tokens=_extract_num_tokens(str(r["eff_question_text"] or "")),
+            answers_sig=_extract_answers_sig(r["eff_final_answers_json"]),
+            c_score=int(r["eff_c_score"] if r["eff_c_score"] is not None else 2),
         )
 
     return features
@@ -502,13 +607,23 @@ def generate_candidate_edges(
         kr_ab = skel_rank_uid.get(ua, {}).get(ub)
         kr_ba = skel_rank_uid.get(ub, {}).get(ua)
 
-        # (1) CLONE：表皮与骨架均极似（互 Top-k + 分位 + 硬下界 + Elo 接近）
+        # 同参数反结论守卫：题干数值序列完全一致但核定答案不同（如“距A地500米”vs“距B地500米”），严禁误判为 CLONE，转入 CONTRASTIVE 精裁
+        is_same_nums_diff_ans = (
+            bool(fa.num_tokens)
+            and fa.num_tokens == fb.num_tokens
+            and bool(fa.answers_sig)
+            and bool(fb.answers_sig)
+            and fa.answers_sig != fb.answers_sig
+        )
+
+        # (1) CLONE：表皮与骨架均极似（互 Top-k + 分位 + 硬下界 + Elo 接近，排除同数异答形似神异对）
         is_mutual_clone = (
             sr_ab is not None and sr_ba is not None and sr_ab <= th.clone.knn_k and sr_ba <= th.clone.knn_k
             and kr_ab is not None and kr_ba is not None and kr_ab <= th.clone.knn_k and kr_ba <= th.clone.knn_k
         )
         is_clone_hit = (
             is_mutual_clone
+            and not is_same_nums_diff_ans
             and s_pct >= th.clone.surface_pct
             and s_sim >= th.clone.surface_sim_min
             and k_pct >= th.clone.skeleton_pct
@@ -535,16 +650,20 @@ def generate_candidate_edges(
                 )
             )
 
-        # (2) ISOMORPHIC（D-Audit-2）：剔除 CLONE 级极高表皮，核心高置信直通 + 宽进候选带送 LLM 精裁
-        is_clone_level_surface = is_clone_hit or (
-            s_pct >= th.clone.surface_pct and s_sim >= th.clone.surface_sim_min
+        # (2) ISOMORPHIC（D-Audit-2）：剔除 CLONE 级极高表皮（及同数异答对比对、物理子模型异构退化对），核心高置信直通 + 宽进候选带送 LLM 精裁
+        iso_domain_compat = _is_isomorphic_structurally_compatible(fa, fb)
+        is_clone_level_surface = (
+            is_clone_hit
+            or is_same_nums_diff_ans
+            or (s_pct >= th.clone.surface_pct and s_sim >= th.clone.surface_sim_min)
         )
         is_mutual_iso = (
             kr_ab is not None and kr_ba is not None and kr_ab <= th.isomorphic.knn_k and kr_ba <= th.isomorphic.knn_k
         )
         iso_boundary = th.isomorphic.boundary_band
         iso_struct_ok = (
-            is_mutual_iso
+            iso_domain_compat
+            and is_mutual_iso
             and not is_clone_level_surface
             and elo_diff <= th.isomorphic.max_elo_diff
         )
@@ -568,7 +687,8 @@ def generate_candidate_edges(
             or (kr_ba is not None and kr_ba <= th.isomorphic.knn_k)
         )
         iso_wide_hit = (
-            not iso_core_hit
+            iso_domain_compat
+            and not iso_core_hit
             and not iso_band_hit
             and not is_clone_level_surface
             and elo_diff <= th.isomorphic.max_elo_diff
@@ -610,13 +730,16 @@ def generate_candidate_edges(
                 )
             )
 
-        # (3) SCAFFOLD：有向边 source(低阶子题) -> target(高阶母题)，D_target - D_source >= min_elo_diff (D-Audit-2 & D-Audit-5)
+        # (3) SCAFFOLD：有向边 source(低阶子题) -> target(高阶母题)，min_elo_diff <= D_target - D_source <= max_elo_diff (D-Audit-2 & D-Audit-5)
         has_both_skel = (ua in skel_pos) and (ub in skel_pos)
+        max_sc_gap = int(getattr(th.scaffold, "max_elo_diff", 750))
         for high_f, low_f, low_in_high, high_in_low in (
             (fa, fb, cont_b_in_a, cont_a_in_b),
             (fb, fa, cont_a_in_b, cont_b_in_a),
         ):
             elo_gap = high_f.elo - low_f.elo
+            if elo_gap > max_sc_gap:
+                continue
             sc_band = th.scaffold.boundary_band
             core_eligible = (
                 len(low_f.k_union) >= th.scaffold.min_k_size
@@ -695,11 +818,15 @@ def generate_candidate_edges(
                     )
                 )
 
-        # (4) CONTRASTIVE：表皮互 Top-K 极似但考点体系迥异（全量送 LLM 精裁验证教学区分度）
+        # (4) CONTRASTIVE：表皮互 Top-K 极似但考点体系迥异、同数异答一词翻转或扶梯顺逆/显隐时间条件翻转（全量送 LLM 精裁验证教学区分度）
+        is_esc_flip = _is_escalator_dir_time_flip_pair(fa, fb)
         is_mutual_surf = (
             sr_ab is not None and sr_ba is not None and sr_ab <= th.contrastive.knn_k and sr_ba <= th.contrastive.knn_k
         )
-        if is_mutual_surf and s_pct >= th.contrastive.surface_pct_min and k_jacc < th.contrastive.k_jaccard_max:
+        if (is_mutual_surf and s_pct >= th.contrastive.surface_pct_min and (
+            k_jacc < th.contrastive.k_jaccard_max or is_same_nums_diff_ans
+        )) or is_esc_flip:
+            ct_rank = s_sim if (is_same_nums_diff_ans or is_esc_flip) else s_sim * (1.0 - k_jacc)
             out_edges.append(
                 CandidateEdge(
                     source_uid=ua,
@@ -713,7 +840,7 @@ def generate_candidate_edges(
                     skeleton_pct=k_pct,
                     containment_score=k_jacc,
                     trap_overlap=trap_ov,
-                    rank_score=s_sim * (1.0 - k_jacc),
+                    rank_score=ct_rank,
                     k_jaccard=k_jacc,
                     needs_llm_refine=True,
                     refine_reason="CONTRASTIVE",
@@ -797,8 +924,29 @@ def pretruncate_refine_candidates(
     return kept
 
 
+def prune_transitive_scaffolds(scaffold_edges: list[CandidateEdge]) -> list[CandidateEdge]:
+    """对有向 SCAFFOLD 边执行局部传递约简：若同时存在 u->v 与 v->w，剪除跨阶冗余跳跃边 u->w（保留 HUMAN_VERIFIED）。"""
+    if len(scaffold_edges) < 3:
+        return scaffold_edges
+    adj: dict[str, set[str]] = {}
+    for e in scaffold_edges:
+        if e.source_uid != e.target_uid:
+            adj.setdefault(e.source_uid, set()).add(e.target_uid)
+    pruned: list[CandidateEdge] = []
+    for e in scaffold_edges:
+        if e.confidence_source == "HUMAN_VERIFIED":
+            pruned.append(e)
+            continue
+        u, w = e.source_uid, e.target_uid
+        mid_nodes = adj.get(u, ())
+        if any(v != u and v != w and w in adj.get(v, ()) for v in mid_nodes):
+            continue
+        pruned.append(e)
+    return pruned
+
+
 def apply_degree_caps(edges: list[CandidateEdge], topology_cfg: TopologyConfig) -> list[CandidateEdge]:
-    """按边类型度数上限截断（无向边贪心双端均不超限；SCAFFOLD 区分出度/入度上限）。"""
+    """按边类型度数上限截断（SCAFFOLD 先做传递约简再区分出度/入度上限；无向边贪心双端均不超限）。"""
     th = topology_cfg.thresholds
     undirected_caps = {
         "CLONE": th.clone.degree_cap,
@@ -813,8 +961,9 @@ def apply_degree_caps(edges: list[CandidateEdge], topology_cfg: TopologyConfig) 
 
     kept: list[CandidateEdge] = []
     for rtype, group in by_type.items():
+        eff_group = prune_transitive_scaffolds(group) if rtype == "SCAFFOLD" else group
         ranked = sorted(
-            group,
+            eff_group,
             key=lambda x: (-float(x.rank_score), x.source_uid, x.target_uid),
         )
         if rtype == "SCAFFOLD":

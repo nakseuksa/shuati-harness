@@ -738,14 +738,14 @@ def test_fix_7_guard_format_override_l3_taxonomy(tmp_path: Path):
 
 
 def test_fix_8_method_blacklist_not_containing_daidingxishu():
-    """#8: config/method_blacklist.yaml 移除误列的“待定系数法”，且 6 大 seed_traps 完备。"""
+    """#8: config/method_blacklist.yaml 移除误列的“待定系数法”，且 10 大中粒度 seed_traps 完备。"""
     cfg_file = Path("config/method_blacklist.yaml")
     data = yaml.safe_load(cfg_file.read_text(encoding="utf-8"))
     blacklist = data.get("blacklist_terms", [])
     assert "待定系数法" not in blacklist
     assert "转化与化归" in blacklist
     seed_traps = data.get("seed_traps", [])
-    assert len(seed_traps) == 6
+    assert len(seed_traps) == 10
 
 
 # ==================== 9. [P2] LaTeX $$...$$ Block Protection ====================

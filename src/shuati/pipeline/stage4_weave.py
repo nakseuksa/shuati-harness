@@ -24,6 +24,7 @@ from shuati.core.topology import (
     merge_relation_overrides,
     normalize_edge_endpoints,
     pretruncate_refine_candidates,
+    prune_transitive_scaffolds,
     write_relations_for_scope,
 )
 from shuati.db import repository
@@ -142,6 +143,10 @@ def _cap_incremental_target_edges(
 
     kept_target: list[CandidateEdge] = []
     for rtype, group in target_by_type.items():
+        if rtype == "SCAFFOLD":
+            combined_sc = prune_transitive_scaffolds([*untouched_by_type.get(rtype, ()), *group])
+            surviving_pairs = {(e.source_uid, e.target_uid) for e in combined_sc}
+            group = [e for e in group if (e.source_uid, e.target_uid) in surviving_pairs]
         ranked = sorted(
             group,
             key=lambda x: (-float(x.rank_score), x.source_uid, x.target_uid),
@@ -772,6 +777,14 @@ async def run_stage4_weave_async(
             (normalize_edge_endpoints(e.relation_type, e.source_uid, e.target_uid), e.relation_type)
             for e in raw_candidates
         }
+        auto_edge_keys = {
+            (normalize_edge_endpoints(e.relation_type, e.source_uid, e.target_uid), e.relation_type)
+            for e in auto_edges
+        }
+        verified_refine_keys = {
+            (normalize_edge_endpoints(e.relation_type, e.source_uid, e.target_uid), e.relation_type)
+            for e in verified_refine_edges
+        }
         untouched_edges: list[CandidateEdge] = []
         target_pool: dict[tuple[tuple[str, str], str], CandidateEdge] = {}
         for row in existing_rows:
@@ -783,7 +796,10 @@ async def run_stage4_weave_async(
                 untouched_edges.append(rec_edge)
             elif str(row["confidence_source"]) == "LLM_VERIFIED":
                 ep_key = (normalize_edge_endpoints(rtype, su, tu), rtype)
-                if ep_key in raw_candidate_keys and ep_key not in rejected_refine_keys:
+                # 仅当该边在本次重织中无需精裁直通（auto_edge_keys）或已通过最新精裁（verified_refine_keys）时才保留旧记录，杜绝被预截断的陈旧误判边复活
+                if ep_key in raw_candidate_keys and ep_key not in rejected_refine_keys and (
+                    ep_key in auto_edge_keys or ep_key in verified_refine_keys
+                ):
                     target_pool[ep_key] = rec_edge
 
         for e in [*auto_edges, *verified_refine_edges]:

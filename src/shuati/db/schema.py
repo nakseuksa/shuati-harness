@@ -563,7 +563,7 @@ SEED_TRAPS = [
     {
         "code": "TRAP_DOMAIN_BOUNDARY",
         "name": "边界端点与定义域遗漏",
-        "description": "忽视端点取值、除数不能为0、几何图形中点线重合或退化、实际情境中变量取值范围受限。",
+        "description": "忽视端点取值、除数不能为0、几何图形中点线重合或退化、分段区间临界归属误判、实际情境中变量取值范围受限。",
     },
     {
         "code": "TRAP_SIGN_DIRECTION",
@@ -573,7 +573,7 @@ SEED_TRAPS = [
     {
         "code": "TRAP_EXTRANEOUS_ROOT",
         "name": "增根虚解与几何不可行",
-        "description": "方程变形引入不符合原方程的增根、代数解无法构成真实几何图形（如三角形三边关系不满足）。",
+        "description": "方程变形引入不符合原方程的增根、分类讨论后未舍去负时间/越界虚解、代数解无法构成真实几何图形。",
     },
     {
         "code": "TRAP_FRAME_SHIFT",
@@ -583,12 +583,32 @@ SEED_TRAPS = [
     {
         "code": "TRAP_APPROX_CONDITION",
         "name": "近似条件滥用与循环论证",
-        "description": "未说明时滥用π近似值、小量近似超出适用范围、用待证结论作为前置条件。",
+        "description": "未说明时滥用π近似值、中间步过早四舍五入、进一/去尾法混淆、用待证结论作为前置条件。",
     },
     {
         "code": "TRAP_ARITHMETIC_SLIP",
         "name": "纯四则计算与抄写笔误",
         "description": "进位借位错误、乘法口诀失误、漏抄负号或下标、题目数据抄错。",
+    },
+    {
+        "code": "TRAP_AVERAGE_HARMONIC",
+        "name": "调和平均与算术平均混淆",
+        "description": "等距往返、上下坡或等额分批采购中，将调和平均速度/单价误按算术平均值 (v1+v2)/2 计算。",
+    },
+    {
+        "code": "TRAP_EXTENDED_BODY_LENGTH",
+        "name": "有长物体车身加减混淆",
+        "description": "火车过桥/过隧与错车超车中，混淆完全通过（加车长）、整车在桥上（减车长）、地面看双车长和与车上人看单车长。",
+    },
+    {
+        "code": "TRAP_ASYNC_SYNC_CONFUSION",
+        "name": "错时异地盲套同步公式",
+        "description": "存在提前/延后出发或起点偏移时，未剥离先行段便盲目套用同时同端/双端出发的 1S:3S:5S 等同步倍率结论。",
+    },
+    {
+        "code": "TRAP_DIRECTION_REF_POINT",
+        "name": "折返参照端与遇追混淆",
+        "description": "多次往返或偏移问题中，混淆“距A地/距B地/距中点”、混淆已走路程与剩余路程、或混淆迎面速度和与同向追及速度差。",
     },
 ]
 

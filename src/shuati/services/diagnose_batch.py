@@ -29,6 +29,7 @@ from shuati.models.schemas import ExternalDiagnosisOutput
 from shuati.services.mistake import (
     RECOMMENDATION_ENGINE_VERSION,
     _prune_expired_drafts,
+    _resolve_diagnose_prompt_version,
     build_diagnose_recommendations_async,
     compute_diagnose_content_hash,
     diagnose_external_mistake_async,
@@ -463,7 +464,11 @@ def render_batch_markdown_report(
         diag = it["result"]
         elo_tier = _escape_md_cell(f"{diag.get('tier', '')} ({diag.get('base_elo', '')})")
         l1 = _escape_md_cell(diag.get("primary_l1_module") or "")
-        ans_str = _escape_md_cell(_format_answers_inline(diag.get("final_answers") or []))
+        raw_ans_str = _format_answers_inline(diag.get("final_answers") or [])
+        matched_db_row = diag.get("matched_db_question")
+        if isinstance(matched_db_row, dict) and matched_db_row.get("answer_conflict"):
+            raw_ans_str = f"⚠️ {raw_ans_str} (库内验真: {matched_db_row.get('db_answer_display', '')})"
+        ans_str = _escape_md_cell(raw_ans_str)
         dups = diag.get("duplicate_candidates") or []
         dup_str = (
             ", ".join(
@@ -531,6 +536,10 @@ def render_batch_markdown_report(
                 f"（`{matched_db.get('verification_status')}`）不一致！库内标准答案为 **{matched_db.get('db_answer_display')}**，"
                 "请警惕单路视觉/建模偏差并以库内验真结果为准。"
             )
+        for w_msg in diag.get("warnings") or []:
+            w_str = str(w_msg).strip()
+            if w_str and not w_str.startswith("DUPLICATE_ANSWER_CONFLICT"):
+                lines.append(f"- **⚠️ 系统诊断/精裁告警**：{w_str}")
         if diag.get("method_summary"):
             lines.append(f"- **核心思路**：{diag['method_summary']}")
         if diag.get("trap_tags"):
@@ -632,6 +641,7 @@ async def diagnose_external_file_async(
     draft_root.mkdir(parents=True, exist_ok=True)
     _prune_expired_drafts(draft_root)
 
+    cur_diag_ver = _resolve_diagnose_prompt_version(config_dir, grade_subject)
     reusable_index = {} if force else _load_reusable_draft_index(draft_root, grade_subject)
     sem = asyncio.Semaphore(max(1, int(concurrency)))
     total = len(parsed_items)
@@ -653,12 +663,26 @@ async def diagnose_external_file_async(
 
                 chash = compute_diagnose_content_hash(grade_subject, norm_text, item.image_paths)
 
-                # 2. 断点续跑复用已有未过期草稿（若旧版草稿未走 rec_v2 推荐引擎则自动原位重算推荐）
+                # 2. 断点续跑复用已有未过期草稿（若旧版草稿 Prompt 版本落后或存在旧版答案冲突则重跑 VLM；推荐引擎落后或曾发生精裁超时降级则原位重算推荐）
+                can_reuse_draft = False
                 if not force and chash in reusable_index:
+                    _, cand_payload = reusable_index[chash]
+                    saved_pver = str(cand_payload.get("diagnose_prompt_version") or "").strip()
+                    has_old_conflict = bool((cand_payload.get("matched_db_question") or {}).get("answer_conflict"))
+                    if (not saved_pver or saved_pver == cur_diag_ver) and not (has_old_conflict and saved_pver != cur_diag_ver):
+                        can_reuse_draft = True
+
+                if can_reuse_draft:
                     df_path, payload = reusable_index[chash]
                     diag_dict = payload["diagnosis"]
                     eff_mock_reuse = settings.pipeline.use_mock_llm if use_mock is None else bool(use_mock)
-                    if payload.get("recommendation_engine_version") != RECOMMENDATION_ENGINE_VERSION:
+                    had_rerank_degraded = any(
+                        str(w).startswith("DIAGNOSE_RERANK_DEGRADED") for w in (payload.get("warnings") or [])
+                    )
+                    if (
+                        payload.get("recommendation_engine_version") != RECOMMENDATION_ENGINE_VERSION
+                        or had_rerank_degraded
+                    ):
                         diag_model = ExternalDiagnosisOutput.model_validate(diag_dict)
                         diag_parts = normalize_answer_parts(diag_model.final_answers)
                         diff_res = difficulty.compute_difficulty(

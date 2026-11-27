@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator
@@ -567,6 +568,53 @@ def recompute(conn: sqlite3.Connection, question_uid: str) -> None:
                 eff_abstract_skeleton,
             ),
         )
+
+    # 7. 将标注类概念覆写（trap_tags_json / thinking_methods_json / classic_motifs_json）同步物化至 question_concepts(origin='HUMAN')
+    for ov_field, c_kind in (
+        ("thinking_methods_json", "METHOD"),
+        ("classic_motifs_json", "MOTIF"),
+        ("trap_tags_json", "TRAP"),
+    ):
+        conn.execute(
+            "DELETE FROM question_concepts WHERE question_uid = ? AND kind = ? AND origin = 'HUMAN';",
+            (question_uid, c_kind),
+        )
+        if ov_field not in active_overrides:
+            continue
+        try:
+            parsed_ov = json.loads(active_overrides[ov_field]["override_value"] or "[]")
+            if isinstance(parsed_ov, dict):
+                raw_items = parsed_ov.get("items") or parsed_ov.get("tags") or []
+            elif isinstance(parsed_ov, list):
+                raw_items = parsed_ov
+            else:
+                raw_items = []
+        except Exception:
+            raw_items = []
+        for item_val in raw_items:
+            cname = str(item_val or "").strip()
+            if not cname:
+                continue
+            c_row = conn.execute(
+                "SELECT concept_id FROM concepts WHERE kind = ? AND name = ? AND redirect_to_id IS NULL LIMIT 1;",
+                (c_kind, cname),
+            ).fetchone()
+            if c_row is not None:
+                cid = str(c_row["concept_id"])
+            else:
+                if c_kind == "TRAP":
+                    cid = f"TRAP:{cname}"
+                else:
+                    digest = hashlib.sha256(f"{c_kind}:{cname}".encode()).hexdigest()[:12]
+                    cid = f"{c_kind}:{digest}"
+                conn.execute(
+                    "INSERT OR IGNORE INTO concepts(concept_id, kind, name, is_seed) VALUES (?, ?, ?, 0);",
+                    (cid, c_kind, cname),
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO question_concepts(question_uid, concept_id, kind, origin) VALUES (?, ?, ?, 'HUMAN');",
+                (question_uid, cid, c_kind),
+            )
 
 
 def recompute_all(conn: sqlite3.Connection, grade_subject: str | None = None) -> int:

@@ -59,7 +59,7 @@ from shuati.verify.equivalence import compare_answer_parts
 from shuati.verify.sympy_sandbox import run_verify_script, split_top_level
 
 DIAGNOSE_PROMPT_VERSION = "diag_v3"
-RECOMMENDATION_ENGINE_VERSION = "rec_v2"
+RECOMMENDATION_ENGINE_VERSION = "rec_v3"
 
 _FIG_NOTE_STRIP_RE = re.compile(r"[（(]\s*(?:第\s*\d+\s*题|例\s*\d+)[^）)]*[）)]")
 _NUM_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?")
@@ -127,11 +127,16 @@ def _format_answer_parts_brief(parts: Sequence[AnswerPart]) -> str:
 
 
 def _scaffold_elo_ok(q_elo: int, ref_elo: int) -> bool:
+    if q_elo >= ref_elo:
+        return False
     if ref_elo <= 1250:
-        return q_elo <= 1185
+        return q_elo <= ref_elo - 80
+    if ref_elo <= 1450:
+        return q_elo <= ref_elo - 110
     if ref_elo <= 1650:
         return q_elo <= min(1450, ref_elo - 120)
-    return q_elo <= min(1620, ref_elo - 200)
+    lo = max(1110, ref_elo - 750)
+    return lo <= q_elo <= min(1620, ref_elo - 200)
 
 
 def _isomorphic_elo_ok(q_elo: int, ref_elo: int, *, high_struct_match: bool = False) -> bool:
@@ -161,19 +166,47 @@ def _contrastive_elo_ok(
     return lo <= q_elo <= hi
 
 
+def _extract_answers_brief_sig(raw_json: str | None) -> str:
+    if not raw_json:
+        return ""
+    try:
+        arr = json.loads(raw_json)
+    except ValueError:
+        return ""
+    if not isinstance(arr, list) or not arr:
+        return ""
+    segs: list[str] = []
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        lbl = str(it.get("label") or "主问").strip()
+        val = str(
+            it.get("sympy_expr")
+            or it.get("canonical")
+            or it.get("choice_label")
+            or it.get("answer")
+            or ""
+        ).strip()
+        if val:
+            segs.append(f"{lbl}={val}")
+    return ";".join(segs)
+
+
 def _load_servable_structural_catalog(
     conn: sqlite3.Connection,
     grade_subject: str,
     servable_uids: set[str],
+    servable_map: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[
     dict[str, dict[str, Any]],
     dict[str, str],
     dict[str, set[str]],
     dict[str, tuple[str, str, str]],
+    dict[str, set[str]],
 ]:
-    """批量加载可服务题的 L2/L3/概念特征、CLONE 连通分量、先修 L2 映射与活跃标准 L3 表。"""
+    """批量加载可服务题的 L2/L3/概念特征、CLONE 连通分量（排除同数异答伪克隆）、先修 L2 映射、活跃标准 L3 表与 SCAFFOLD 子题图。"""
     if not servable_uids:
-        return {}, {}, {}, {}
+        return {}, {}, {}, {}, {}
 
     uid_list = sorted(servable_uids)
     ph = ",".join("?" for _ in uid_list)
@@ -284,8 +317,9 @@ def _load_servable_structural_catalog(
         elif k == "TRAP" and cname != "TRAP_ARITHMETIC_SLIP":
             struct_by_uid[u]["traps"].add(cname)
 
-    # 5. CLONE 连通分量（用于推荐栏内去重，防止连推同母题）
+    # 5. CLONE 连通分量（用于推荐栏内去重，自动剔除“同参数异答案”的一字之差伪 CLONE 边）与既有 SCAFFOLD 子题索引
     parent: dict[str, str] = {u: u for u in uid_list}
+    sc_children_of: dict[str, set[str]] = {}
 
     def _find(x: str) -> str:
         while parent[x] != x:
@@ -295,16 +329,29 @@ def _load_servable_structural_catalog(
 
     for rel in conn.execute(
         f"""
-        SELECT source_question_uid, target_question_uid
+        SELECT relation_type, source_question_uid, target_question_uid
         FROM question_relations
-        WHERE relation_type = 'CLONE'
+        WHERE relation_type IN ('CLONE', 'SCAFFOLD')
           AND source_question_uid IN ({ph})
           AND target_question_uid IN ({ph});
         """,
         [*uid_list, *uid_list],
     ).fetchall():
-        ra = _find(str(rel["source_question_uid"]))
-        rb = _find(str(rel["target_question_uid"]))
+        su = str(rel["source_question_uid"])
+        tu = str(rel["target_question_uid"])
+        if rel["relation_type"] == "SCAFFOLD":
+            if su != tu:
+                sc_children_of.setdefault(tu, set()).add(su)
+            continue
+        if servable_map is not None and su in servable_map and tu in servable_map:
+            _, nums_a, _ = _extract_cmp_signature(str(servable_map[su].get("eff_question_text") or ""))
+            _, nums_b, _ = _extract_cmp_signature(str(servable_map[tu].get("eff_question_text") or ""))
+            ans_a = _extract_answers_brief_sig(servable_map[su].get("eff_final_answers_json"))
+            ans_b = _extract_answers_brief_sig(servable_map[tu].get("eff_final_answers_json"))
+            if nums_a and nums_a == nums_b and ans_a and ans_b and ans_a != ans_b:
+                continue
+        ra = _find(su)
+        rb = _find(tu)
         if ra != rb:
             if ra < rb:
                 parent[rb] = ra
@@ -312,7 +359,7 @@ def _load_servable_structural_catalog(
                 parent[ra] = rb
 
     clone_root = {u: _find(u) for u in uid_list}
-    return struct_by_uid, clone_root, prereq_of_l2, active_l3_meta
+    return struct_by_uid, clone_root, prereq_of_l2, active_l3_meta, sc_children_of
 
 
 def _resolve_diagnose_prompt_version(
@@ -818,7 +865,7 @@ async def build_diagnose_recommendations_async(
         """
         SELECT q.question_uid, r.source_id, q.eff_question_text, q.eff_options_json, q.has_images,
                q.eff_base_elo, q.eff_tier, q.eff_tier_rank, q.eff_c_score,
-               q.eff_primary_l1_module, q.eff_abstract_skeleton,
+               q.eff_primary_l1_module, q.eff_secondary_l1_modules_json, q.eff_abstract_skeleton,
                q.eff_verification_status, q.eff_final_answers_json
         FROM questions q
         JOIN raw_questions r ON r.question_uid = q.question_uid
@@ -830,8 +877,8 @@ async def build_diagnose_recommendations_async(
     servable_uids = set(servable_map.keys())
 
     # 1. 加载全量可服务题结构目录、CLONE 分量与本地 1 vs N 精确向量余弦
-    struct_by_uid, clone_root, prereq_of_l2, active_l3_meta = _load_servable_structural_catalog(
-        conn, grade_subject, servable_uids
+    struct_by_uid, clone_root, prereq_of_l2, active_l3_meta, sc_children_of = _load_servable_structural_catalog(
+        conn, grade_subject, servable_uids, servable_map
     )
     digit_fp_by_uid: dict[str, str] = {
         u: _extract_cmp_signature(str(meta.get("eff_question_text") or ""))[2]
@@ -841,6 +888,7 @@ async def build_diagnose_recommendations_async(
     store = VectorStore(vectors_dir)
     surf_sim_map: dict[str, float] = {}
     skel_sim_map: dict[str, float] = {}
+    step_skel_sim_map: dict[str, float] = {}
     surf_hits: list[tuple[str, float]] = []
     skel_hits: list[tuple[str, float]] = []
     l3_vec_hits: list[list[tuple[str, float]]] = []
@@ -874,6 +922,7 @@ async def build_diagnose_recommendations_async(
             all_l1_set.add(s_clean)
 
     primary_l2_pairs: set[str] = set()
+    explicit_diag_l2_pairs: set[str] = set()
     step_l2_pairs: set[str] = set()
     step_l3_queries: list[str] = []
 
@@ -887,12 +936,16 @@ async def build_diagnose_recommendations_async(
                 if cand_l1:
                     hit = tax_lookup.resolve_l2(cand_l1, m_clean)
                     if hit:
-                        primary_l2_pairs.add(f"{hit[0]}/{hit[1]}")
+                        pair_s = f"{hit[0]}/{hit[1]}"
+                        primary_l2_pairs.add(pair_s)
+                        explicit_diag_l2_pairs.add(pair_s)
                         all_l1_set.add(hit[0])
                         resolved = True
                         break
         if not resolved and norm_primary_l1:
-            primary_l2_pairs.add(f"{norm_primary_l1}/{m_clean}")
+            pair_s = f"{norm_primary_l1}/{m_clean}"
+            primary_l2_pairs.add(pair_s)
+            explicit_diag_l2_pairs.add(pair_s)
 
     for st in diag.steps:
         sl1 = st.raw_l1.strip() or norm_primary_l1
@@ -924,7 +977,7 @@ async def build_diagnose_recommendations_async(
 
     if servable_uids and (has_surf_npz or has_skel_npz):
         texts_to_embed = [surf_text, skel_text]
-        if has_l3_npz and step_l3_queries:
+        if (has_l3_npz or has_skel_npz) and step_l3_queries:
             texts_to_embed.extend(step_l3_queries)
         emb_client = EmbeddingClient(settings, conn=None, use_mock=use_mock)
         try:
@@ -949,8 +1002,14 @@ async def build_diagnose_recommendations_async(
                     if uid_i in servable_uids:
                         skel_sim_map[uid_i] = float(sc_i)
                 skel_hits = sorted(skel_sim_map.items(), key=lambda kv: (-kv[1], kv[0]))[:60]
+                if len(q_vecs) > 2:
+                    step_q_mat = np.asarray(q_vecs[2:], dtype=np.float32)
+                    max_step_scores = np.max(k_mat @ step_q_mat.T, axis=1)
+                    for uid_i, st_sc in zip(k_ids, max_step_scores.tolist(), strict=False):
+                        if uid_i in servable_uids:
+                            step_skel_sim_map[uid_i] = float(st_sc)
 
-        if has_l3_npz and step_l3_queries:
+        if has_l3_npz and step_l3_queries and len(q_vecs) >= 2 + len(step_l3_queries):
             for idx_q in range(len(step_l3_queries)):
                 l3_vec_hits.append(
                     store.query_top_k("l3_nodes", q_vecs[2 + idx_q], scope_slug=scope_slug, top_k=3)
@@ -1042,6 +1101,27 @@ async def build_diagnose_recommendations_async(
             ref_tier = orig_tier
             ref_tier_rank = orig_tier_rank
             elo_calibration_source = "DB_VERIFIED_MATCH"
+            # 同步继承库内已验真原题的权威 L1 / L2 分类（修复单路跨模块归入杂题导致零召回）
+            orig_l1 = str(orig_meta.get("eff_primary_l1_module") or "").strip()
+            if orig_l1:
+                all_l1_set.add(orig_l1)
+                norm_primary_l1 = orig_l1
+            try:
+                orig_sec_l1s = json.loads(orig_meta.get("eff_secondary_l1_modules_json") or "[]")
+                if isinstance(orig_sec_l1s, list):
+                    for sl in orig_sec_l1s:
+                        if str(sl).strip():
+                            all_l1_set.add(str(sl).strip())
+            except ValueError:
+                pass
+            orig_l2s = set(struct_by_uid.get(matched_orig_uid, {}).get("l2_pairs", set()))
+            if orig_l2s:
+                primary_l2_pairs |= {lp for lp in orig_l2s if not norm_primary_l1 or lp.startswith(f"{norm_primary_l1}/")} or orig_l2s
+                step_l2_pairs |= orig_l2s
+                for lp in orig_l2s:
+                    if "/" in lp:
+                        all_l1_set.add(lp.split("/", 1)[0])
+                    prereq_l2_pairs |= prereq_of_l2.get(lp, set())
             try:
                 raw_db_ans = json.loads(orig_meta.get("eff_final_answers_json") or "[]")
                 if isinstance(raw_db_ans, list) and raw_db_ans:
@@ -1117,13 +1197,22 @@ async def build_diagnose_recommendations_async(
         diag_motifs |= set(struct_by_uid[matched_orig_uid]["motifs"])
         diag_methods |= set(struct_by_uid[matched_orig_uid]["methods"])
 
+    # 跨模块经典母题结构先修桥接（扶梯守恒->牛吃草，比例行程倍数->和差倍）
+    if "扶梯问题" in diag_motifs or "扶梯" in norm_text:
+        prereq_l2_pairs.add("典型应用题/牛吃草问题")
+    if (
+        ("和差倍" in diag_motifs or "一半" in norm_text or "倍" in norm_text)
+        and any("比例与变速行程" in lp for lp in step_l2_pairs)
+    ):
+        prereq_l2_pairs.add("典型应用题/和差倍问题")
+
     # 计算细分模型匹配题库存（区分跨模块复合题、专属 MOTIF/L3 子模型与常规 L2）
     non_tool_l1s = {
         x.split("/", 1)[0]
         for x in step_l2_pairs
         if "/" in x and x.split("/", 1)[0] not in ("计算与代数巧算", "典型应用题")
     }
-    if len(non_tool_l1s) >= 2 and norm_primary_l1:
+    if len(non_tool_l1s) >= 2 and norm_primary_l1 and len({x.split("/", 1)[0] for x in (explicit_diag_l2_pairs | (struct_by_uid.get(matched_orig_uid, {}).get("l2_pairs", set()) if matched_orig_uid else set())) if "/" in x and x.split("/", 1)[0] not in ("计算与代数巧算", "典型应用题")}) >= 2:
         sec_l2s = {x for x in step_l2_pairs if not x.startswith(f"{norm_primary_l1}/") and x.split("/", 1)[0] in non_tool_l1s}
         prim_l2s = {x for x in step_l2_pairs if x.startswith(f"{norm_primary_l1}/")}
         submodel_uids = {
@@ -1135,8 +1224,8 @@ async def build_diagnose_recommendations_async(
         prim_short = "、".join(sorted({x.split("/", 1)[1] for x in prim_l2s}))
         submodel_label = f"{sec_short} × {prim_short}"
     elif matched_l3_nids:
-        # 取诊断命中的最具辨识度（优先主 L2 域内、最小 df）标准 L3 算子衡量细分模型题量
-        l3_doc_sets: list[tuple[int, int, str, set[str]]] = []
+        # 取诊断命中的最具辨识度（优先显式主 L2、排除泛化基础换算节点、再取较小 df）标准 L3 算子衡量细分模型题量
+        l3_doc_sets: list[tuple[int, int, int, int, str, set[str]]] = []
         for nid in matched_l3_nids:
             if nid not in active_l3_meta:
                 continue
@@ -1145,11 +1234,14 @@ async def build_diagnose_recommendations_async(
                 continue
             holders = {u for u, sm in struct_by_uid.items() if nid in sm["l3_nids"]}
             if holders:
-                in_prim_l2 = 0 if f"{nl1}/{nl2}" in primary_l2_pairs else 1
-                l3_doc_sets.append((in_prim_l2, len(holders), f"{nl2} · {nl3}", holders))
+                pair_k = f"{nl1}/{nl2}"
+                in_exp_l2 = 0 if (not explicit_diag_l2_pairs or pair_k in explicit_diag_l2_pairs) else 1
+                in_prim_l2 = 0 if pair_k in primary_l2_pairs else 1
+                is_generic_basic = 1 if "基本三量" in nl3 else 0
+                l3_doc_sets.append((is_generic_basic, in_exp_l2, in_prim_l2, len(holders), f"{nl2} · {nl3}", holders))
         if l3_doc_sets:
-            l3_doc_sets.sort(key=lambda x: (x[0], x[1], x[2]))
-            _, _, submodel_label, submodel_uids = l3_doc_sets[0]
+            l3_doc_sets.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+            _, _, _, _, submodel_label, submodel_uids = l3_doc_sets[0]
         else:
             submodel_uids = {u for u, sm in struct_by_uid.items() if sm["l2_pairs"] & primary_l2_pairs}
             submodel_label = "、".join(sorted({x.split("/", 1)[-1] for x in primary_l2_pairs})) or norm_primary_l1 or grade_subject
@@ -1218,6 +1310,7 @@ async def build_diagnose_recommendations_async(
         if prev is None or rank_score > prev[0]:
             pool_by_slot[slot][uid] = (rank_score, disp_sim, default_reason)
 
+    stage4_non_iso_peers: set[str] = set()
     if matched_orig_uid is not None:
         rel_rows = conn.execute(
             """
@@ -1236,6 +1329,8 @@ async def build_diagnose_recommendations_async(
             s_sim_r = float(rr["surface_sim"] or 0.0)
 
             if rtype == "SCAFFOLD":
+                peer_any = src_u if tgt_u == matched_orig_uid else tgt_u
+                stage4_non_iso_peers.add(peer_any)
                 if tgt_u != matched_orig_uid:
                     continue  # 仅取降阶前置子题（pre 方向：source -> orig）
                 peer = src_u
@@ -1249,11 +1344,18 @@ async def build_diagnose_recommendations_async(
                         (10.0 + k_sim_r, peer, k_sim_r, note or "库内已验证前置铺垫子题")
                     )
                 else:
-                    _push_pool("SCAFFOLD", peer, 1.15 + k_sim_r, k_sim_r, "同子模型前置铺垫题")
+                    _push_pool("SCAFFOLD", peer, 0.96 + k_sim_r * 0.25, k_sim_r, "同子模型前置铺垫题")
             elif rtype in ("ISOMORPHIC", "CLONE"):
                 peer = tgt_u if src_u == matched_orig_uid else src_u
                 if peer in excluded_uids or peer not in servable_map:
                     continue
+                if rtype == "CLONE":
+                    _, nums_o, _ = _extract_cmp_signature(norm_text)
+                    _, nums_p, _ = _extract_cmp_signature(str(servable_map[peer].get("eff_question_text") or ""))
+                    if nums_o and nums_o == nums_p:
+                        stage4_non_iso_peers.add(peer)
+                        _push_pool("CONTRASTIVE_TRAP", peer, 1.18 + s_sim_r, s_sim_r, "一词之差条件翻转辨析题")
+                        continue
                 p_elo = int(servable_map[peer]["eff_base_elo"] or 1500)
                 if not _isomorphic_elo_ok(p_elo, ref_elo, high_struct_match=True):
                     continue
@@ -1262,9 +1364,10 @@ async def build_diagnose_recommendations_async(
                         (10.0 + k_sim_r, peer, k_sim_r, note or "库内已验证同构变式题")
                     )
                 else:
-                    _push_pool("ISOMORPHIC", peer, 1.25 + k_sim_r, k_sim_r, "同核心模型变式巩固题")
+                    _push_pool("ISOMORPHIC", peer, 1.05 + k_sim_r * 0.25, k_sim_r, "同核心模型变式巩固题")
             elif rtype == "CONTRASTIVE":
                 peer = tgt_u if src_u == matched_orig_uid else src_u
+                stage4_non_iso_peers.add(peer)
                 if peer in excluded_uids or peer not in servable_map:
                     continue
                 p_elo = int(servable_map[peer]["eff_base_elo"] or 1500)
@@ -1316,7 +1419,7 @@ async def build_diagnose_recommendations_async(
         shared_rare_method = bool(cand_methods & rare_methods_hit)
         shared_traps = cand_traps & eff_traps
 
-        # (A) 前置铺垫候选（支持按各步骤 L2 分拆召回低阶子技能题）
+        # (A) 前置铺垫候选（支持按各步骤 L2 / 先修桥接与分步子算子向量独立召回低阶子技能题）
         if _scaffold_elo_ok(q_elo, ref_elo):
             sc_domain_ok = (
                 same_step_l2
@@ -1325,26 +1428,33 @@ async def build_diagnose_recommendations_async(
                 or (not has_vectors and bool(norm_primary_l1) and q_l1 == norm_primary_l1 and not shared_traps)
             )
             if sc_domain_ok:
-                is_cross_step_subskill = (len(non_tool_l1s) >= 2) and same_step_l2 and (q_l1 != norm_primary_l1)
-                min_k = 0.66 if is_cross_step_subskill else (0.78 if shared_l3_cnt > 0 else 0.82)
-                if (not has_vectors) or ksim >= min_k:
+                is_cross_step_subskill = ((len(non_tool_l1s) >= 2 and same_step_l2) or is_prereq_l2) and (q_l1 != norm_primary_l1)
+                step_ksim = step_skel_sim_map.get(uid, 0.0)
+                eff_sc_ksim = max(ksim, step_ksim * 0.96) if int(sm["step_count"]) <= 2 else ksim
+                min_k = (
+                    0.62
+                    if is_cross_step_subskill
+                    else (0.78 if shared_l3_cnt > 0 else (0.80 if (same_step_l2 or is_prereq_l2) else 0.82))
+                )
+                if (not has_vectors) or eff_sc_ksim >= min_k:
                     sc_score = (
-                        ksim
+                        eff_sc_ksim
                         + (0.22 if shared_l3_cnt > 0 else 0.0)
-                        + (0.16 if same_step_l2 else 0.08 if is_prereq_l2 else 0.0)
-                        + (0.14 if is_cross_step_subskill else 0.0)
+                        + (0.16 if same_step_l2 else 0.12 if is_prereq_l2 else 0.0)
+                        + (0.16 if is_cross_step_subskill else 0.0)
                         - 0.03 * max(0, int(sm["step_count"]) - 2)
+                        - 0.03 * max(0.0, (ref_elo - q_elo - 250) / 400.0)
                     )
                     reason_sc = (
                         "跨模块前置子技能铺垫题"
                         if is_cross_step_subskill
                         else ("同原子算子降阶铺垫题" if shared_l3_cnt > 0 else "同专题基础模型铺垫题")
                     )
-                    _push_pool("SCAFFOLD", uid, sc_score, ksim, reason_sc)
+                    _push_pool("SCAFFOLD", uid, sc_score, eff_sc_ksim, reason_sc)
 
         # (B) 同构变式候选（严格要求同核心 L2 或稀缺思维原型命中；跨模块题须同时覆盖副模块或同子模型）
         high_iso_struct = shared_l3_cnt > 0 or (same_prim_l2 and ksim >= 0.90)
-        if _isomorphic_elo_ok(q_elo, ref_elo, high_struct_match=high_iso_struct):
+        if uid not in stage4_non_iso_peers and _isomorphic_elo_ok(q_elo, ref_elo, high_struct_match=high_iso_struct):
             cross_mod_ok = True
             if len(non_tool_l1s) >= 2:
                 # 多模块融合原题（如几何周长×行程）：同构变式必须同样融合两模块或命中专属子算子
@@ -1396,7 +1506,7 @@ async def build_diagnose_recommendations_async(
                         max(ssim, ksim),
                         f"靶向排雷（共享易错点：{','.join(sorted(shared_traps))}）",
                     )
-            # 子通道 C2：同模块条件分叉辨析 或 稀缺极值/统筹思维跨场景呼应
+            # 子通道 C2：同模块条件分叉辨析（含高骨架异算子辨析） 或 稀缺极值/统筹思维跨场景呼应
             elif has_vectors:
                 has_divergent_kernel = (not matched_l3_nids) or (cand_l3s != matched_l3_nids) or bool(cand_traps)
                 same_domain_contrast = (
@@ -1405,11 +1515,12 @@ async def build_diagnose_recommendations_async(
                     and ksim >= 0.74
                     and has_divergent_kernel
                 )
-                mindset_contrast = shared_rare_method and (ssim >= 0.75 or ksim >= 0.78)
-                if same_domain_contrast or mindset_contrast:
+                high_skel_branch_contrast = same_prim_l2 and ksim >= 0.88 and has_divergent_kernel
+                mindset_contrast = shared_rare_method and (ssim >= 0.72 or ksim >= 0.78)
+                if same_domain_contrast or high_skel_branch_contrast or mindset_contrast:
                     ct_score = (
-                        0.55 * ssim
-                        + 0.30 * ksim
+                        0.45 * max(ssim, ksim)
+                        + 0.40 * min(ssim, ksim)
                         + (0.18 if bool(cand_traps) else 0.0)
                         + (0.20 if mindset_contrast else 0.0)
                     )
@@ -1418,20 +1529,38 @@ async def build_diagnose_recommendations_async(
                         if mindset_contrast
                         else "同场景易混条件对比辨析题"
                     )
-                    _push_pool("CONTRASTIVE_TRAP", uid, ct_score, ssim, reason_ct)
+                    _push_pool("CONTRASTIVE_TRAP", uid, ct_score, max(ssim, ksim), reason_ct)
 
-    # 6. 组装 Top-12 待精裁候选池，执行可选单次纯文本 judge_llm 批精裁
+    # 6. 组装 Top-15 待精裁候选池（含前置铺垫传递冗余剪枝），执行单次纯文本 judge_llm 批精裁
+    def _is_redundant_scaffold_cand(cand_u: str, chosen_sc: list[str], *, strict_same_l3: bool = False) -> bool:
+        c_elo = int(servable_map[cand_u].get("eff_base_elo") or 1500)
+        c_l3s: set[str] = struct_by_uid[cand_u]["l3_nids"]
+        for sel_u in chosen_sc:
+            s_elo = int(servable_map[sel_u].get("eff_base_elo") or 1500)
+            s_l3s: set[str] = struct_by_uid[sel_u]["l3_nids"]
+            # 若 cand_u 本身就是已入选更高阶铺垫题 sel_u 的下位子题，剪除远端冗余祖先
+            if cand_u in sc_children_of.get(sel_u, ()) and c_elo <= s_elo - 80:
+                return True
+            if c_l3s and s_l3s:
+                if strict_same_l3 and c_l3s == s_l3s and abs(c_elo - s_elo) <= 80:
+                    return True
+                if c_l3s < s_l3s and c_elo <= s_elo - 150:
+                    return True
+        return False
+
     trusted_uids = {u for grp in trusted_by_slot.values() for _, u, _, _ in grp}
+    trusted_sc_uids = [u for _, u, _, _ in sorted(trusted_by_slot["SCAFFOLD"], key=lambda x: -x[0])]
     rerank_entries: list[dict[str, Any]] = []
     seen_in_rerank: set[str] = set()
     seen_digit_fps_rerank: set[str] = set()
     seen_clone_roots_rerank: set[str] = {clone_root.get(u, u) for u in trusted_uids}
 
     slot_map_order = (
-        ("SCAFFOLD", 4),
-        ("ISOMORPHIC", 4),
-        ("CONTRASTIVE_TRAP", 4),
+        ("SCAFFOLD", 5),
+        ("ISOMORPHIC", 5),
+        ("CONTRASTIVE_TRAP", 5),
     )
+    picked_sc_rerank: list[str] = list(trusted_sc_uids)
     for slot_name, cap_k in slot_map_order:
         ranked_uids = sorted(
             pool_by_slot[slot_name].items(),
@@ -1439,9 +1568,11 @@ async def build_diagnose_recommendations_async(
         )
         picked_for_slot = 0
         for uid, (r_sc, d_sim, def_reason) in ranked_uids:
-            if picked_for_slot >= cap_k or len(rerank_entries) >= 12:
+            if picked_for_slot >= cap_k or len(rerank_entries) >= 15:
                 break
             if uid in trusted_uids or uid in seen_in_rerank:
+                continue
+            if slot_name == "SCAFFOLD" and _is_redundant_scaffold_cand(uid, picked_sc_rerank):
                 continue
             dfp = digit_fp_by_uid.get(uid, "")
             if dfp and dfp in seen_digit_fps_rerank:
@@ -1450,6 +1581,8 @@ async def build_diagnose_recommendations_async(
             if c_root_cand in seen_clone_roots_rerank:
                 continue
             seen_in_rerank.add(uid)
+            if slot_name == "SCAFFOLD":
+                picked_sc_rerank.append(uid)
             if dfp:
                 seen_digit_fps_rerank.add(dfp)
             seen_clone_roots_rerank.add(c_root_cand)
@@ -1581,7 +1714,7 @@ async def build_diagnose_recommendations_async(
                 )
             )
     else:
-        # 未启用或 Mock 默认空决策时：按各栏独立池执行纯确定性严格门槛过滤（避免跨栏前置占用饿死）
+        # 未启用、Mock 默认空决策或 judge_llm 超时降级时：执行严格同域与高余弦门槛过滤（严禁跨 L2 泛 Trap 噪音直出）
         for slot_name in ("SCAFFOLD", "ISOMORPHIC", "CONTRASTIVE_TRAP"):
             ranked_pool = sorted(
                 pool_by_slot[slot_name].items(),
@@ -1594,15 +1727,16 @@ async def build_diagnose_recommendations_async(
                 q_elo = int(meta.get("eff_base_elo") or 1500)
                 q_c = int(meta.get("eff_c_score") or 2)
                 same_l2 = bool(struct_by_uid[uid]["l2_pairs"] & primary_l2_pairs)
+                shared_l3_fb = len(struct_by_uid[uid]["l3_nids"] & matched_l3_nids) > 0
                 has_sh_trap = bool(struct_by_uid[uid]["traps"] & eff_traps)
                 ksim = skel_sim_map.get(uid, 0.0)
                 ssim = surf_sim_map.get(uid, 0.0)
                 if has_vectors:
-                    if slot_name == "SCAFFOLD" and ksim < 0.84 and len(non_tool_l1s) < 2:
+                    if slot_name == "SCAFFOLD" and ksim < 0.88 and len(non_tool_l1s) < 2:
                         continue
-                    if slot_name == "ISOMORPHIC" and ksim < 0.88:
+                    if slot_name == "ISOMORPHIC" and (ksim < 0.90 or not (same_l2 or shared_l3_fb)):
                         continue
-                    if slot_name == "CONTRASTIVE_TRAP" and not has_sh_trap and ssim < 0.85:
+                    if slot_name == "CONTRASTIVE_TRAP" and not (same_l2 and (ksim >= 0.86 or ssim >= 0.88)):
                         continue
                 if not _slot_elo_valid(slot_name, q_elo, q_c, same_l2, has_sh_trap):
                     continue
@@ -1620,10 +1754,13 @@ async def build_diagnose_recommendations_async(
     def _materialize_column(slot_key: str) -> list[dict[str, Any]]:
         ranked = sorted(final_by_slot[slot_key], key=lambda item: (-item[0], item[1]))
         out_cards: list[dict[str, Any]] = []
+        chosen_uids_in_col: list[str] = []
         for _, uid, sim_val, reason_txt in ranked:
             if len(out_cards) >= 3:
                 break
             if uid in used_uids_global:
+                continue
+            if slot_key == "SCAFFOLD" and _is_redundant_scaffold_cand(uid, chosen_uids_in_col, strict_same_l3=True):
                 continue
             dfp = digit_fp_by_uid.get(uid, "")
             if dfp and dfp in used_digit_fps_global:
@@ -1632,6 +1769,7 @@ async def build_diagnose_recommendations_async(
             if c_root in used_clone_roots_global:
                 continue
             used_uids_global.add(uid)
+            chosen_uids_in_col.append(uid)
             if dfp:
                 used_digit_fps_global.add(dfp)
             used_clone_roots_global.add(c_root)
@@ -1722,6 +1860,7 @@ async def diagnose_external_mistake_async(
     eff_mock = settings.pipeline.use_mock_llm if use_mock is None else bool(use_mock)
     gw_settings = settings.model_copy(deep=True)
     gw_settings.pipeline.use_mock_llm = eff_mock
+    eff_diag_ver = _resolve_diagnose_prompt_version(config_dir, grade_subject)
     if diagnosis_json is not None:
         raw_obj = json.loads(diagnosis_json) if isinstance(diagnosis_json, str) else diagnosis_json
         try:
@@ -1731,7 +1870,7 @@ async def diagnose_external_mistake_async(
     else:
         tax_enum = _build_taxonomy_enum_summary(conn, grade_subject)
         anchors_text = _build_anchors_prompt_text(conn, grade_subject, config_dir=config_dir)
-        diag_ver = _resolve_diagnose_prompt_version(config_dir, grade_subject)
+        diag_ver = eff_diag_ver
         msgs = build_external_diagnose_messages(
             grade_subject=grade_subject,
             question_text=norm_text,
@@ -1805,6 +1944,7 @@ async def diagnose_external_mistake_async(
 
     draft_payload = {
         "draft_id": draft_id,
+        "diagnose_prompt_version": eff_diag_ver,
         "recommendation_engine_version": RECOMMENDATION_ENGINE_VERSION,
         "rerank_applied": bool(rec_bundle["rerank_applied"]),
         "grade_subject": grade_subject,
@@ -1835,6 +1975,7 @@ async def diagnose_external_mistake_async(
     return {
         "draft_id": draft_id,
         "draft_file": str(draft_file.resolve()),
+        "diagnose_prompt_version": eff_diag_ver,
         "recommendation_engine_version": RECOMMENDATION_ENGINE_VERSION,
         "rerank_applied": bool(rec_bundle["rerank_applied"]),
         "unverified_single_pass": True,
@@ -1878,6 +2019,7 @@ async def ingest_external_mistake_async(
     log_wrong: bool = False,
     learner_id: str = "default",
     user_note: str = "",
+    allow_conflict_ingest: bool = False,
     dry_run: bool = False,
     assets_dir: Path | str = Path("data/assets/images"),
     config_dir: Path | str = Path("config"),
@@ -1894,6 +2036,19 @@ async def ingest_external_mistake_async(
         if not df.exists():
             raise repository.NotFoundError(f"未找到诊断草稿 '{draft_id}'")
         draft_data = json.loads(df.read_text(encoding="utf-8"))
+        matched_db_chk = draft_data.get("matched_db_question") if isinstance(draft_data, dict) else None
+        if (
+            isinstance(matched_db_chk, dict)
+            and matched_db_chk.get("answer_conflict")
+            and not allow_conflict_ingest
+            and known_answer is None
+            and diagnosis_json is None
+        ):
+            raise PreconditionError(
+                f"ANSWER_CONFLICT_BLOCKED: 草稿 '{draft_id}' 的单路参考答案与库内已验真原题 "
+                f"{matched_db_chk.get('source_id', '')} 标准答案（{matched_db_chk.get('db_answer_display', '')}）不一致！"
+                "请先核实并通过 --answer 传入确认后的标准答案，或显式加 --allow-conflict 强制入库。"
+            )
 
     eff_gs = grade_subject or (draft_data["grade_subject"] if draft_data else None)
     eff_text = normalize_text(

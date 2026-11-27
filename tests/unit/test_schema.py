@@ -60,12 +60,14 @@ def test_schema_bootstrap_order(tmp_path):
     assert gs["grade_subject"] == "小学奥数"
     assert gs["subject_family"] == "MATH"
 
-    # Step 2: 6 个预置 TRAP 概念
+    # Step 2: 10 个预置中粒度 STEM 认知 TRAP 概念（原 6 个 + 4 个行程/纯理科高频陷阱）
     traps = conn.execute("SELECT * FROM concepts WHERE kind = 'TRAP' AND is_seed = 1;").fetchall()
-    assert len(traps) == 6
+    assert len(traps) == 10
     trap_names = {t["name"] for t in traps}
     assert "TRAP_DOMAIN_BOUNDARY" in trap_names
     assert "TRAP_ARITHMETIC_SLIP" in trap_names
+    assert "TRAP_AVERAGE_HARMONIC" in trap_names
+    assert "TRAP_DIRECTION_REF_POINT" in trap_names
 
     # Step 3: learners 默认角色
     lrn = conn.execute("SELECT * FROM learners WHERE learner_id = 'default';").fetchone()
