@@ -31,7 +31,7 @@ llm:
     api_key: "${JUDGE_LLM_API_KEY:-}"
     model: "${JUDGE_LLM_MODEL:-}"
     temperature: 0.0
-    timeout_seconds: 60
+    timeout_seconds: 180
     max_concurrency: 8
     rpm_limit: 120
     max_retries: 3
@@ -106,6 +106,7 @@ topology:
       containment_min: 0.40
       reverse_containment_max: 0.60
       min_elo_diff: 200
+      max_elo_diff: 750
       skeleton_pct_min: 0.90
       boundary_band: 0.10
       in_degree_cap: 5

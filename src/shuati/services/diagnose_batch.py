@@ -31,9 +31,11 @@ from shuati.services.mistake import (
     _prune_expired_drafts,
     _resolve_diagnose_prompt_version,
     build_diagnose_recommendations_async,
+    build_servable_orig_match_index,
     compute_diagnose_content_hash,
     diagnose_external_mistake_async,
     find_duplicate_candidates,
+    find_fast_matched_orig_uid,
 )
 from shuati.verify.answer_parts import normalize_answer_parts
 
@@ -542,8 +544,9 @@ def render_batch_markdown_report(
                 lines.append(f"- **⚠️ 系统诊断/精裁告警**：{w_str}")
         if diag.get("method_summary"):
             lines.append(f"- **核心思路**：{diag['method_summary']}")
-        if diag.get("trap_tags"):
-            traps_cn = _format_trap_tags_cn(list(diag["trap_tags"]), trap_label_map)
+        eff_trap_list = diag.get("effective_trap_tags") or diag.get("trap_tags") or []
+        if eff_trap_list:
+            traps_cn = _format_trap_tags_cn(list(eff_trap_list), trap_label_map)
             if traps_cn:
                 lines.append(f"- **易错陷阱**：{traps_cn}")
 
@@ -646,10 +649,30 @@ async def diagnose_external_file_async(
     sem = asyncio.Semaphore(max(1, int(concurrency)))
     total = len(parsed_items)
 
+    # 预扫描整批题目对应的库内原题主键，为每道错题注入同批次其他原题互斥集合（消除同批错题互推自指循环）
+    servable_match_idx = build_servable_orig_match_index(conn, grade_subject)
+    batch_orig_by_index: dict[int, str] = {}
+    for p_it in parsed_items:
+        p_norm = normalize_text(p_it.question_text or "").normalized_text
+        if not p_norm:
+            continue
+        m_uid = find_fast_matched_orig_uid(
+            conn,
+            grade_subject=grade_subject,
+            norm_text=p_norm,
+            image_count=len(p_it.image_paths),
+            servable_index=servable_match_idx,
+        )
+        if m_uid:
+            batch_orig_by_index[p_it.index] = m_uid
+
     async def _run_one(item: ParsedQuestionItem) -> dict[str, Any]:
         async with sem:
             t_item = time.perf_counter()
             norm_text = item.question_text
+            peer_batch_uids = {
+                u for idx_other, u in batch_orig_by_index.items() if idx_other != item.index
+            }
             print(f"[diagnose {item.index}/{total}] 开始诊断: {item.title}", file=sys.stderr, flush=True)
             try:
                 # 1. 图片存在性预检（单题失败不阻断整批）
@@ -663,7 +686,7 @@ async def diagnose_external_file_async(
 
                 chash = compute_diagnose_content_hash(grade_subject, norm_text, item.image_paths)
 
-                # 2. 断点续跑复用已有未过期草稿（若旧版草稿 Prompt 版本落后或存在旧版答案冲突则重跑 VLM；推荐引擎落后或曾发生精裁超时降级则原位重算推荐）
+                # 2. 断点续跑复用已有未过期草稿（若旧版草稿 Prompt 版本落后或存在旧版答案冲突则重跑 VLM；推荐引擎落后、同批互斥集合变化或曾发生精裁超时降级则原位重算推荐）
                 can_reuse_draft = False
                 if not force and chash in reusable_index:
                     _, cand_payload = reusable_index[chash]
@@ -679,9 +702,15 @@ async def diagnose_external_file_async(
                     had_rerank_degraded = any(
                         str(w).startswith("DIAGNOSE_RERANK_DEGRADED") for w in (payload.get("warnings") or [])
                     )
+                    saved_batch_excl = payload.get("batch_excluded_uids")
+                    batch_excl_changed = (
+                        not isinstance(saved_batch_excl, list)
+                        or saved_batch_excl != sorted(peer_batch_uids)
+                    )
                     if (
                         payload.get("recommendation_engine_version") != RECOMMENDATION_ENGINE_VERSION
                         or had_rerank_degraded
+                        or batch_excl_changed
                     ):
                         diag_model = ExternalDiagnosisOutput.model_validate(diag_dict)
                         diag_parts = normalize_answer_parts(diag_model.final_answers)
@@ -703,10 +732,12 @@ async def diagnose_external_file_async(
                             diff_res=diff_res,
                             vectors_dir=vectors_dir,
                             use_mock=eff_mock_reuse,
+                            batch_excluded_uids=peer_batch_uids,
                         )
                         payload = {
                             **payload,
                             "recommendation_engine_version": RECOMMENDATION_ENGINE_VERSION,
+                            "rerank_applied": bool(rec_bundle["rerank_applied"]),
                             "base_elo": int(rec_bundle["effective_base_elo"]),
                             "tier": str(rec_bundle["effective_tier"]),
                             "tier_rank": int(rec_bundle["effective_tier_rank"]),
@@ -718,6 +749,8 @@ async def diagnose_external_file_async(
                             "duplicate_candidates": rec_bundle["duplicate_candidates"],
                             "recommendations": rec_bundle["recommendations"],
                             "recommendation_notes": rec_bundle["recommendation_notes"],
+                            "effective_trap_tags": rec_bundle["effective_trap_tags"],
+                            "batch_excluded_uids": rec_bundle["batch_excluded_uids"],
                             "warnings": rec_bundle["warnings"],
                         }
                         _atomic_write_text(df_path, json.dumps(payload, ensure_ascii=False, indent=2))
@@ -755,6 +788,8 @@ async def diagnose_external_file_async(
                         "thinking_methods": diag_dict.get("thinking_methods", []),
                         "classic_motifs": diag_dict.get("classic_motifs", []),
                         "trap_tags": diag_dict.get("trap_tags", []),
+                        "effective_trap_tags": payload.get("effective_trap_tags"),
+                        "batch_excluded_uids": payload.get("batch_excluded_uids", []),
                         "known_answer_match": payload.get("known_answer_match"),
                         "duplicate_candidates": dups,
                         "recommendations": payload.get(
@@ -790,6 +825,7 @@ async def diagnose_external_file_async(
                     vectors_dir=vectors_dir,
                     drafts_dir=drafts_dir,
                     use_mock=use_mock,
+                    batch_excluded_uids=peer_batch_uids,
                 )
                 print(
                     f"[diagnose {item.index}/{total}] 完成: {res['draft_id']} ({res['tier']} / {res['base_elo']} Elo)",

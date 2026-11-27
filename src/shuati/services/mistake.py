@@ -59,7 +59,7 @@ from shuati.verify.equivalence import compare_answer_parts
 from shuati.verify.sympy_sandbox import run_verify_script, split_top_level
 
 DIAGNOSE_PROMPT_VERSION = "diag_v3"
-RECOMMENDATION_ENGINE_VERSION = "rec_v3"
+RECOMMENDATION_ENGINE_VERSION = "rec_v4.1"
 
 _FIG_NOTE_STRIP_RE = re.compile(r"[（(]\s*(?:第\s*\d+\s*题|例\s*\d+)[^）)]*[）)]")
 _NUM_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?")
@@ -156,7 +156,12 @@ def _contrastive_elo_ok(
     cand_c_score: int = 2,
     has_shared_trap: bool = False,
 ) -> bool:
-    lo = 1120 if ref_elo <= 1450 else (ref_elo - 320)
+    if ref_elo <= 1450:
+        lo = 1120
+    elif same_l2 and has_shared_trap:
+        lo = max(1120, ref_elo - 540)
+    else:
+        lo = ref_elo - 320
     if ref_elo < 1600 and cand_c_score >= 3 and q_elo >= 1850:
         return False
     if same_l2 and has_shared_trap and cand_c_score <= 2:
@@ -164,6 +169,62 @@ def _contrastive_elo_ok(
     else:
         hi = max(1450, ref_elo + 300)
     return lo <= q_elo <= hi
+
+
+def build_servable_orig_match_index(
+    conn: sqlite3.Connection,
+    grade_subject: str,
+) -> list[tuple[str, str, list[str]]]:
+    """预构建当前学段可服务题的轻量题干与数值签名索引，用于批量诊断毫秒级预扫同批原题互斥集合。"""
+    rows = conn.execute(
+        """
+        SELECT q.question_uid, q.eff_question_text
+        FROM questions q
+        WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_excluded = 0 AND q.eff_is_servable = 1;
+        """,
+        (grade_subject,),
+    ).fetchall()
+    out: list[tuple[str, str, list[str]]] = []
+    for r in rows:
+        uid = str(r["question_uid"])
+        txt = str(r["eff_question_text"] or "")
+        _, nums, _ = _extract_cmp_signature(txt)
+        out.append((uid, txt, nums))
+    return out
+
+
+def find_fast_matched_orig_uid(
+    conn: sqlite3.Connection,
+    *,
+    grade_subject: str,
+    norm_text: str,
+    image_count: int,
+    servable_index: Sequence[tuple[str, str, list[str]]] | None = None,
+) -> str | None:
+    """快速定位外部题目对应的库内原题 question_uid（无需等待 VLM 或向量嵌入）。"""
+    plain_fp = compute_plain_fingerprint(norm_text, image_count)
+    fp_row = conn.execute(
+        """
+        SELECT q.question_uid
+        FROM raw_questions r
+        JOIN questions q ON q.question_uid = r.question_uid
+        WHERE q.grade_subject = ? AND q.is_retired = 0 AND q.eff_is_excluded = 0 AND q.eff_is_servable = 1
+          AND r.plain_fingerprint = ?
+        LIMIT 1;
+        """,
+        (grade_subject, plain_fp),
+    ).fetchone()
+    if fp_row is not None:
+        return str(fp_row["question_uid"])
+
+    idx_entries = servable_index if servable_index is not None else build_servable_orig_match_index(conn, grade_subject)
+    _, q_nums, _ = _extract_cmp_signature(norm_text)
+    for uid, cand_txt, c_nums in idx_entries:
+        if (q_nums or c_nums) and q_nums != c_nums:
+            continue
+        if _is_same_original_question(norm_text, cand_txt):
+            return uid
+    return None
 
 
 def _extract_answers_brief_sig(raw_json: str | None) -> str:
@@ -858,6 +919,7 @@ async def build_diagnose_recommendations_async(
     diff_res: difficulty.DifficultyResult,
     vectors_dir: Path | str = Path("data/vectors"),
     use_mock: bool = False,
+    batch_excluded_uids: set[str] | None = None,
 ) -> dict[str, Any]:
     """执行前置查重排除、库内验真答案/Elo 锚定、Stage 4 边复用、多特征召回与轻量 judge_llm 二级精裁。"""
     warnings: list[str] = []
@@ -1085,6 +1147,8 @@ async def build_diagnose_recommendations_async(
     ref_tier_rank = int(diff_res.tier_rank)
     elo_calibration_source = "SINGLE_PASS"
     matched_db_question: dict[str, Any] | None = None
+    orig_is_verified = False
+    orig_l2s: set[str] = set()
 
     if matched_orig_uid is not None and matched_orig_uid in servable_map:
         orig_meta = servable_map[matched_orig_uid]
@@ -1097,11 +1161,12 @@ async def build_diagnose_recommendations_async(
         answer_conflict = False
         db_ans_display = ""
         if orig_ver in ("VERIFIED_CONSENSUS", "HUMAN_VERIFIED"):
+            orig_is_verified = True
             ref_elo = orig_elo
             ref_tier = orig_tier
             ref_tier_rank = orig_tier_rank
             elo_calibration_source = "DB_VERIFIED_MATCH"
-            # 同步继承库内已验真原题的权威 L1 / L2 分类（修复单路跨模块归入杂题导致零召回）
+            # 同步继承库内已验真原题的权威 L1 / L2 分类（修复单路跨模块归入杂题导致零召回或细分标签漂移）
             orig_l1 = str(orig_meta.get("eff_primary_l1_module") or "").strip()
             if orig_l1:
                 all_l1_set.add(orig_l1)
@@ -1116,7 +1181,9 @@ async def build_diagnose_recommendations_async(
                 pass
             orig_l2s = set(struct_by_uid.get(matched_orig_uid, {}).get("l2_pairs", set()))
             if orig_l2s:
-                primary_l2_pairs |= {lp for lp in orig_l2s if not norm_primary_l1 or lp.startswith(f"{norm_primary_l1}/")} or orig_l2s
+                orig_prim_l2s = {lp for lp in orig_l2s if not norm_primary_l1 or lp.startswith(f"{norm_primary_l1}/")} or orig_l2s
+                explicit_diag_l2_pairs = set(orig_prim_l2s)
+                primary_l2_pairs |= orig_prim_l2s
                 step_l2_pairs |= orig_l2s
                 for lp in orig_l2s:
                     if "/" in lp:
@@ -1171,25 +1238,36 @@ async def build_diagnose_recommendations_async(
                 ref_elo = int(round(0.5 * ref_elo + 0.5 * med_elo))
                 elo_calibration_source = "KNN_ANCHOR_BLEND"
 
-    # 3. 映射标准 L3 算子并统计题库内细分模型真实库存数
-    matched_l3_nids: set[str] = set()
-    if matched_orig_uid and matched_orig_uid in struct_by_uid:
-        matched_l3_nids |= set(struct_by_uid[matched_orig_uid]["l3_nids"])
+    # 同批次错题互斥过滤：排除本批中其他尚未掌握的错题原题（不排除当前题对自身 matched_orig_uid 的判定）
+    if batch_excluded_uids:
+        for b_uid in batch_excluded_uids:
+            if b_uid and b_uid != matched_orig_uid:
+                excluded_uids.add(b_uid)
 
-    for st in diag.steps:
-        raw_op = st.raw_l3.strip()
-        if not raw_op:
-            continue
-        for nid, (nl1, nl2, nl3) in active_l3_meta.items():
-            if f"{nl1}/{nl2}" in step_l2_pairs and (raw_op == nl3 or raw_op in nl3 or nl3 in raw_op):
-                matched_l3_nids.add(nid)
-    for hit_group in l3_vec_hits:
-        for nid, lsim in hit_group:
-            if lsim >= 0.82 and nid in active_l3_meta:
-                nl1, nl2, _ = active_l3_meta[nid]
-                if f"{nl1}/{nl2}" in step_l2_pairs:
+    # 3. 映射标准 L3 算子并统计题库内细分模型真实库存数（命中已验真原题时严格隔离其权威 L3，杜绝向量模糊近邻篡改细分模型标签）
+    orig_l3_nids: set[str] = (
+        set(struct_by_uid[matched_orig_uid]["l3_nids"])
+        if (orig_is_verified and matched_orig_uid and matched_orig_uid in struct_by_uid)
+        else set()
+    )
+    matched_l3_nids: set[str] = set(orig_l3_nids)
+    if not orig_l3_nids:
+        if matched_orig_uid and matched_orig_uid in struct_by_uid:
+            matched_l3_nids |= set(struct_by_uid[matched_orig_uid]["l3_nids"])
+        for st in diag.steps:
+            raw_op = st.raw_l3.strip()
+            if not raw_op:
+                continue
+            for nid, (nl1, nl2, nl3) in active_l3_meta.items():
+                if f"{nl1}/{nl2}" in step_l2_pairs and (raw_op == nl3 or raw_op in nl3 or nl3 in raw_op):
                     matched_l3_nids.add(nid)
-                    break
+        for hit_group in l3_vec_hits:
+            for nid, lsim in hit_group:
+                if lsim >= 0.85 and nid in active_l3_meta:
+                    nl1, nl2, _ = active_l3_meta[nid]
+                    if f"{nl1}/{nl2}" in step_l2_pairs:
+                        matched_l3_nids.add(nid)
+                        break
 
     diag_motifs = {m.strip() for m in diag.classic_motifs if m.strip()}
     diag_methods = {m.strip() for m in diag.thinking_methods if m.strip()}
@@ -1197,13 +1275,8 @@ async def build_diagnose_recommendations_async(
         diag_motifs |= set(struct_by_uid[matched_orig_uid]["motifs"])
         diag_methods |= set(struct_by_uid[matched_orig_uid]["methods"])
 
-    # 跨模块经典母题结构先修桥接（扶梯守恒->牛吃草，比例行程倍数->和差倍）
-    if "扶梯问题" in diag_motifs or "扶梯" in norm_text:
-        prereq_l2_pairs.add("典型应用题/牛吃草问题")
-    if (
-        ("和差倍" in diag_motifs or "一半" in norm_text or "倍" in norm_text)
-        and any("比例与变速行程" in lp for lp in step_l2_pairs)
-    ):
+    # 跨模块结构先修桥接（仅当显式命中和差倍母题时桥接；移除顺行扶梯->牛吃草与泛“一半/倍”字面桥接，杜绝低龄糖果差倍题混入中档行程）
+    if "和差倍" in diag_motifs and any("比例与变速行程" in lp for lp in step_l2_pairs):
         prereq_l2_pairs.add("典型应用题/和差倍问题")
 
     # 计算细分模型匹配题库存（区分跨模块复合题、专属 MOTIF/L3 子模型与常规 L2）
@@ -1291,7 +1364,124 @@ async def build_diagnose_recommendations_async(
             "match_reason": rel_hint,
         }
 
-    # 4. 优先提取已命中原题的 Stage 4 关联边（LLM_VERIFIED / HUMAN_VERIFIED 直接受信，RULE_MATRIX 入精裁池）
+    # 4. 物理子模型与防退化确定性护栏 + 提取 Stage 4 关联边（仅 HUMAN_VERIFIED 免检直通，LLM_VERIFIED 统一进入候选池接受二级精裁与重分栏）
+    auth_l2_scope = orig_l2s if (orig_is_verified and orig_l2s) else explicit_diag_l2_pairs
+    ref_l3_ops = {active_l3_meta[nid][2] for nid in matched_l3_nids if nid in active_l3_meta}
+    ref_has_ext_body = (
+        ("TRAP_EXTENDED_BODY_LENGTH" in eff_traps)
+        or ("火车过桥" in diag_motifs)
+        or any("火车过桥与错车" in lp for lp in auth_l2_scope)
+    )
+    ref_has_escalator = (
+        ("扶梯" in norm_text)
+        or ("扶梯问题" in diag_motifs)
+        or any("扶梯" in op for op in ref_l3_ops)
+    )
+    ref_allows_dual_branch = (
+        ("相遇追及前后分类讨论" in ref_l3_ops)
+        or ("分类讨论" in diag_methods)
+        or ("TRAP_DOMAIN_BOUNDARY" in eff_traps)
+        or any(p.collection_mode == "UNORDERED_MULTISET" for p in diag_parts)
+        or (
+            matched_orig_uid is not None
+            and '"UNORDERED_MULTISET"' in str(servable_map[matched_orig_uid].get("eff_final_answers_json") or "")
+        )
+    )
+    ref_has_concrete_dist = ("米" in norm_text) or ("千米" in norm_text)
+    ref_is_pure_static_bridge = (
+        ref_has_ext_body
+        and bool(ref_l3_ops)
+        and all(
+            ("过桥" in op or "隧道" in op) and ("错车" not in op and "超车" not in op and "遇追" not in op)
+            for op in ref_l3_ops
+        )
+        and not any(w in norm_text for w in ("行人", "骑车", "老王", "两列", "两辆", "卡车", "相向", "同向"))
+    )
+    ref_is_same_dir_equal_speed = (
+        ("速度相同" in norm_text or "同速" in norm_text)
+        and ("相向" not in norm_text)
+        and ("迎面" not in norm_text)
+    )
+
+    def _is_esc_dir_time_flip(cand_u: str) -> bool:
+        if not ref_has_escalator or cand_u not in servable_map:
+            return False
+        c_txt = str(servable_map[cand_u].get("eff_question_text") or "")
+        c_sm = struct_by_uid[cand_u]
+        c_l3_ops = {active_l3_meta[nid][2] for nid in c_sm["l3_nids"] if nid in active_l3_meta}
+        c_has_esc = ("扶梯" in c_txt) or ("扶梯问题" in c_sm["motifs"]) or any("扶梯" in op for op in c_l3_ops)
+        if not c_has_esc:
+            return False
+        q_has_t = ("秒" in norm_text) or ("分钟" in norm_text) or ("小时" in norm_text)
+        c_has_t = ("秒" in c_txt) or ("分钟" in c_txt) or ("小时" in c_txt)
+        q_bidir = ("上下" in norm_text) or ("上电梯" in norm_text and "下电梯" in norm_text) or ("上扶梯" in norm_text and "下扶梯" in norm_text)
+        c_bidir = ("上下" in c_txt) or ("上电梯" in c_txt and "下电梯" in c_txt) or ("上扶梯" in c_txt and "下扶梯" in c_txt)
+        return (q_has_t != c_has_t) and (q_bidir != c_bidir)
+
+    def _slot_struct_compatible(slot_name: str, cand_u: str) -> bool:
+        if cand_u not in servable_map or cand_u not in struct_by_uid:
+            return False
+        c_meta = servable_map[cand_u]
+        c_sm = struct_by_uid[cand_u]
+        c_txt = str(c_meta.get("eff_question_text") or "")
+        c_c = int(c_meta.get("eff_c_score") or 2)
+        c_l2s: set[str] = c_sm["l2_pairs"]
+        c_traps: set[str] = c_sm["traps"]
+        c_motifs: set[str] = c_sm["motifs"]
+        c_l3_ops = {active_l3_meta[nid][2] for nid in c_sm["l3_nids"] if nid in active_l3_meta}
+        c_has_ext = (
+            ("TRAP_EXTENDED_BODY_LENGTH" in c_traps)
+            or ("火车过桥" in c_motifs)
+            or any(("火车过桥与错车" in lp or "矩形重叠区" in lp) for lp in c_l2s)
+        )
+        c_has_esc = ("扶梯" in c_txt) or ("扶梯问题" in c_motifs) or any("扶梯" in op for op in c_l3_ops)
+
+        if slot_name == "ISOMORPHIC":
+            if ref_has_ext_body != c_has_ext:
+                return False
+            if ref_has_escalator != c_has_esc:
+                return False
+            if _is_esc_dir_time_flip(cand_u):
+                return False
+            if (
+                ref_elo >= 1280
+                and "%" not in norm_text
+                and "％" not in norm_text
+                and c_c == 1
+                and any("分数与百分数应用题" in lp for lp in c_l2s)
+                and ("%" in c_txt or "％" in c_txt or "百分之" in c_txt)
+                and not any(u in c_txt for u in ("米", "千米", "小时", "分钟", "秒"))
+            ):
+                return False
+            return True
+
+        if slot_name == "SCAFFOLD":
+            if ref_has_escalator != c_has_esc:
+                return False
+            if c_has_ext and not ref_has_ext_body:
+                return False
+            if "相遇追及前后分类讨论" in c_l3_ops and not ref_allows_dual_branch:
+                return False
+            if "工程设单位一合作类比求解" in c_l3_ops and ref_has_concrete_dist:
+                return False
+            if ref_is_pure_static_bridge and c_has_ext and not any("过桥" in op for op in c_l3_ops):
+                return False
+            if ref_has_escalator and any("牛吃草" in lp for lp in c_l2s) and ("向下" in norm_text or "顺" in norm_text) and ("向上" not in norm_text):
+                return False
+            if (
+                ("TRAP_ASYNC_SYNC_CONFUSION" in eff_traps)
+                and ("提前" in norm_text or "晚" in norm_text)
+                and "两岸往返全程倍数转化" in c_l3_ops
+            ):
+                return False
+            return True
+
+        if slot_name == "CONTRASTIVE_TRAP":
+            if ref_is_same_dir_equal_speed and ("相向" in c_txt or "迎面" in c_txt) and "中点" in c_txt:
+                return False
+            return True
+        return True
+
     trusted_by_slot: dict[str, list[tuple[float, str, float, str]]] = {
         "SCAFFOLD": [],
         "ISOMORPHIC": [],
@@ -1302,9 +1492,12 @@ async def build_diagnose_recommendations_async(
         "ISOMORPHIC": {},
         "CONTRASTIVE_TRAP": {},
     }
+    s4_llm_verified_pairs: set[tuple[str, str]] = set()
 
     def _push_pool(slot: str, uid: str, rank_score: float, disp_sim: float, default_reason: str) -> None:
         if uid in excluded_uids or uid not in servable_map:
+            return
+        if not _slot_struct_compatible(slot, uid):
             return
         prev = pool_by_slot[slot].get(uid)
         if prev is None or rank_score > prev[0]:
@@ -1339,10 +1532,14 @@ async def build_diagnose_recommendations_async(
                 p_elo = int(servable_map[peer]["eff_base_elo"] or 1500)
                 if not _scaffold_elo_ok(p_elo, ref_elo):
                     continue
-                if conf in ("HUMAN_VERIFIED", "LLM_VERIFIED"):
+                if conf == "HUMAN_VERIFIED":
                     trusted_by_slot["SCAFFOLD"].append(
-                        (10.0 + k_sim_r, peer, k_sim_r, note or "库内已验证前置铺垫子题")
+                        (10.0 + k_sim_r, peer, k_sim_r, note or "人工核定前置铺垫子题")
                     )
+                elif conf == "LLM_VERIFIED":
+                    if _slot_struct_compatible("SCAFFOLD", peer):
+                        s4_llm_verified_pairs.add(("SCAFFOLD", peer))
+                        _push_pool("SCAFFOLD", peer, 1.22 + k_sim_r * 0.30, k_sim_r, note or "库内已验证前置铺垫子题")
                 else:
                     _push_pool("SCAFFOLD", peer, 0.96 + k_sim_r * 0.25, k_sim_r, "同子模型前置铺垫题")
             elif rtype in ("ISOMORPHIC", "CLONE"):
@@ -1356,13 +1553,27 @@ async def build_diagnose_recommendations_async(
                         stage4_non_iso_peers.add(peer)
                         _push_pool("CONTRASTIVE_TRAP", peer, 1.18 + s_sim_r, s_sim_r, "一词之差条件翻转辨析题")
                         continue
+                if _is_esc_dir_time_flip(peer):
+                    stage4_non_iso_peers.add(peer)
+                    _push_pool(
+                        "CONTRASTIVE_TRAP",
+                        peer,
+                        1.26 + max(s_sim_r, k_sim_r),
+                        max(s_sim_r, k_sim_r),
+                        "辨析扶梯同向显式时间与顺逆匀速步数比转时间比的条件翻转",
+                    )
+                    continue
                 p_elo = int(servable_map[peer]["eff_base_elo"] or 1500)
                 if not _isomorphic_elo_ok(p_elo, ref_elo, high_struct_match=True):
                     continue
-                if conf in ("HUMAN_VERIFIED", "LLM_VERIFIED"):
+                if conf == "HUMAN_VERIFIED":
                     trusted_by_slot["ISOMORPHIC"].append(
-                        (10.0 + k_sim_r, peer, k_sim_r, note or "库内已验证同构变式题")
+                        (10.0 + k_sim_r, peer, k_sim_r, note or "人工核定同构变式题")
                     )
+                elif conf == "LLM_VERIFIED":
+                    if _slot_struct_compatible("ISOMORPHIC", peer):
+                        s4_llm_verified_pairs.add(("ISOMORPHIC", peer))
+                        _push_pool("ISOMORPHIC", peer, 1.24 + k_sim_r * 0.30, k_sim_r, note or "库内已验证同构变式题")
                 else:
                     _push_pool("ISOMORPHIC", peer, 1.05 + k_sim_r * 0.25, k_sim_r, "同核心模型变式巩固题")
             elif rtype == "CONTRASTIVE":
@@ -1372,12 +1583,17 @@ async def build_diagnose_recommendations_async(
                     continue
                 p_elo = int(servable_map[peer]["eff_base_elo"] or 1500)
                 p_c = int(servable_map[peer].get("eff_c_score") or 2)
-                if not _contrastive_elo_ok(p_elo, ref_elo, same_l2=True, cand_c_score=p_c, has_shared_trap=False):
+                has_sh_tr = bool(struct_by_uid[peer]["traps"] & eff_traps)
+                if not _contrastive_elo_ok(p_elo, ref_elo, same_l2=True, cand_c_score=p_c, has_shared_trap=has_sh_tr):
                     continue
-                if conf in ("HUMAN_VERIFIED", "LLM_VERIFIED"):
+                if conf == "HUMAN_VERIFIED":
                     trusted_by_slot["CONTRASTIVE_TRAP"].append(
-                        (10.0 + s_sim_r, peer, s_sim_r, note or "库内已验证形似神异辨析题")
+                        (10.0 + s_sim_r, peer, s_sim_r, note or "人工核定形似神异辨析题")
                     )
+                elif conf == "LLM_VERIFIED":
+                    if _slot_struct_compatible("CONTRASTIVE_TRAP", peer):
+                        s4_llm_verified_pairs.add(("CONTRASTIVE_TRAP", peer))
+                        _push_pool("CONTRASTIVE_TRAP", peer, 1.26 + s_sim_r * 0.30, s_sim_r, note or "库内已验证形似神异辨析题")
                 else:
                     _push_pool("CONTRASTIVE_TRAP", peer, 1.10 + s_sim_r, s_sim_r, "易混条件对比辨析题")
             elif rtype == "SHARED_TRAP":
@@ -1434,7 +1650,7 @@ async def build_diagnose_recommendations_async(
                 min_k = (
                     0.62
                     if is_cross_step_subskill
-                    else (0.78 if shared_l3_cnt > 0 else (0.80 if (same_step_l2 or is_prereq_l2) else 0.82))
+                    else (0.74 if shared_l3_cnt > 0 else (0.80 if (same_step_l2 or is_prereq_l2) else 0.82))
                 )
                 if (not has_vectors) or eff_sc_ksim >= min_k:
                     sc_score = (
@@ -1489,8 +1705,16 @@ async def build_diagnose_recommendations_async(
             cand_c_score=q_c,
             has_shared_trap=bool(shared_traps),
         ):
+            if _is_esc_dir_time_flip(uid):
+                _push_pool(
+                    "CONTRASTIVE_TRAP",
+                    uid,
+                    1.24 + max(ssim, ksim),
+                    max(ssim, ksim),
+                    "辨析扶梯同向显式时间与顺逆匀速步数比转时间比的条件翻转",
+                )
             # 子通道 C1：显式同坑排雷（按同 L2 > 同 L1 > 跨 L1 + 骨架相关性排序）
-            if shared_traps:
+            elif shared_traps:
                 dom_ok = same_prim_l2 or (q_l1 == norm_primary_l1 and ksim >= 0.78) or (ksim >= 0.84)
                 if (not has_vectors) or dom_ok:
                     tr_score = (
@@ -1531,7 +1755,7 @@ async def build_diagnose_recommendations_async(
                     )
                     _push_pool("CONTRASTIVE_TRAP", uid, ct_score, max(ssim, ksim), reason_ct)
 
-    # 6. 组装 Top-15 待精裁候选池（含前置铺垫传递冗余剪枝），执行单次纯文本 judge_llm 批精裁
+    # 6. 组装 Top-15 待精裁候选池（含前置铺垫传递冗余与子算子覆盖度剪枝），执行单次纯文本 judge_llm 批精裁
     def _is_redundant_scaffold_cand(cand_u: str, chosen_sc: list[str], *, strict_same_l3: bool = False) -> bool:
         c_elo = int(servable_map[cand_u].get("eff_base_elo") or 1500)
         c_l3s: set[str] = struct_by_uid[cand_u]["l3_nids"]
@@ -1546,6 +1770,13 @@ async def build_diagnose_recommendations_async(
                     return True
                 if c_l3s < s_l3s and c_elo <= s_elo - 150:
                     return True
+        # 子模覆盖度配额：终选已录用满 2 道铺垫题后，第 3 道若未贡献任何新标准 L3 算子（零边际子技能增益），剪除同质重复题
+        if strict_same_l3 and len(chosen_sc) >= 2 and c_l3s:
+            covered_l3_union: set[str] = set()
+            for sel_u in chosen_sc:
+                covered_l3_union |= struct_by_uid[sel_u]["l3_nids"]
+            if c_l3s <= covered_l3_union:
+                return True
         return False
 
     trusted_uids = {u for grp in trusted_by_slot.values() for _, u, _, _ in grp}
@@ -1698,6 +1929,8 @@ async def build_diagnose_recommendations_async(
             q_c = int(entry["c_score"])
             same_l2 = bool(struct_by_uid[uid]["l2_pairs"] & primary_l2_pairs)
             has_sh_trap = bool(struct_by_uid[uid]["traps"] & eff_traps)
+            if not _slot_struct_compatible(target_slot, uid):
+                continue
             if not _slot_elo_valid(target_slot, q_elo, q_c, same_l2, has_sh_trap):
                 continue
             disp_sim = (
@@ -1731,12 +1964,17 @@ async def build_diagnose_recommendations_async(
                 has_sh_trap = bool(struct_by_uid[uid]["traps"] & eff_traps)
                 ksim = skel_sim_map.get(uid, 0.0)
                 ssim = surf_sim_map.get(uid, 0.0)
-                if has_vectors:
+                if not _slot_struct_compatible(slot_name, uid):
+                    continue
+                is_s4_ver = (slot_name, uid) in s4_llm_verified_pairs
+                if has_vectors and not is_s4_ver:
                     if slot_name == "SCAFFOLD" and ksim < 0.88 and len(non_tool_l1s) < 2:
                         continue
                     if slot_name == "ISOMORPHIC" and (ksim < 0.90 or not (same_l2 or shared_l3_fb)):
                         continue
-                    if slot_name == "CONTRASTIVE_TRAP" and not (same_l2 and (ksim >= 0.86 or ssim >= 0.88)):
+                    if slot_name == "CONTRASTIVE_TRAP" and not (
+                        _is_esc_dir_time_flip(uid) or (same_l2 and (ksim >= 0.86 or ssim >= 0.88))
+                    ):
                         continue
                 if not _slot_elo_valid(slot_name, q_elo, q_c, same_l2, has_sh_trap):
                     continue
@@ -1808,6 +2046,8 @@ async def build_diagnose_recommendations_async(
         "duplicate_candidates": duplicate_candidates,
         "recommendations": recommendations,
         "recommendation_notes": recommendation_notes,
+        "effective_trap_tags": sorted(eff_traps),
+        "batch_excluded_uids": sorted(batch_excluded_uids or ()),
         "warnings": warnings,
     }
 
@@ -1825,6 +2065,7 @@ async def diagnose_external_mistake_async(
     vectors_dir: Path | str = Path("data/vectors"),
     drafts_dir: Path | str = Path("data/drafts"),
     use_mock: bool | None = None,
+    batch_excluded_uids: set[str] | None = None,
 ) -> dict[str, Any]:
     """只读实时诊断外部新错题，生成 data/drafts/<draft_id>.json 并推荐关联题。"""
     gs_row = conn.execute(
@@ -1928,6 +2169,7 @@ async def diagnose_external_mistake_async(
         diff_res=diff_res,
         vectors_dir=vectors_dir,
         use_mock=eff_mock,
+        batch_excluded_uids=batch_excluded_uids,
     )
 
     eff_elo = int(rec_bundle["effective_base_elo"])
@@ -1965,6 +2207,8 @@ async def diagnose_external_mistake_async(
         "duplicate_candidates": duplicate_candidates,
         "recommendations": recommendations,
         "recommendation_notes": recommendation_notes,
+        "effective_trap_tags": rec_bundle["effective_trap_tags"],
+        "batch_excluded_uids": rec_bundle["batch_excluded_uids"],
         "warnings": diag_warnings,
         "unverified_single_pass": True,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1997,6 +2241,8 @@ async def diagnose_external_mistake_async(
         "thinking_methods": diag.thinking_methods,
         "classic_motifs": diag.classic_motifs,
         "trap_tags": diag.trap_tags,
+        "effective_trap_tags": rec_bundle["effective_trap_tags"],
+        "batch_excluded_uids": rec_bundle["batch_excluded_uids"],
         "known_answer_match": known_answer_match,
         "duplicate_candidates": duplicate_candidates,
         "recommendations": recommendations,
