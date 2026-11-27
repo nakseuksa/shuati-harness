@@ -1135,8 +1135,8 @@ async def build_diagnose_recommendations_async(
         prim_short = "、".join(sorted({x.split("/", 1)[1] for x in prim_l2s}))
         submodel_label = f"{sec_short} × {prim_short}"
     elif matched_l3_nids:
-        # 取诊断命中的最具辨识度（最小 df）标准 L3 算子衡量细分模型题量
-        l3_doc_sets: list[tuple[int, str, set[str]]] = []
+        # 取诊断命中的最具辨识度（优先主 L2 域内、最小 df）标准 L3 算子衡量细分模型题量
+        l3_doc_sets: list[tuple[int, int, str, set[str]]] = []
         for nid in matched_l3_nids:
             if nid not in active_l3_meta:
                 continue
@@ -1145,10 +1145,11 @@ async def build_diagnose_recommendations_async(
                 continue
             holders = {u for u, sm in struct_by_uid.items() if nid in sm["l3_nids"]}
             if holders:
-                l3_doc_sets.append((len(holders), f"{nl2} · {nl3}", holders))
+                in_prim_l2 = 0 if f"{nl1}/{nl2}" in primary_l2_pairs else 1
+                l3_doc_sets.append((in_prim_l2, len(holders), f"{nl2} · {nl3}", holders))
         if l3_doc_sets:
-            l3_doc_sets.sort(key=lambda x: (x[0], x[1]))
-            _, submodel_label, submodel_uids = l3_doc_sets[0]
+            l3_doc_sets.sort(key=lambda x: (x[0], x[1], x[2]))
+            _, _, submodel_label, submodel_uids = l3_doc_sets[0]
         else:
             submodel_uids = {u for u, sm in struct_by_uid.items() if sm["l2_pairs"] & primary_l2_pairs}
             submodel_label = "、".join(sorted({x.split("/", 1)[-1] for x in primary_l2_pairs})) or norm_primary_l1 or grade_subject
